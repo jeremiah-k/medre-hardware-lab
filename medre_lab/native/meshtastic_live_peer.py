@@ -10,7 +10,6 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-
 from medre_lab.native.live_peer_common import (
     PeerProcess,
     poll_packets_until,

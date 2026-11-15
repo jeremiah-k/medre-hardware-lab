@@ -1,7 +1,22 @@
 {
-  "medre": {"url": "https://github.com/jeremiah-k/medre.git", "ref": "fd2927d1a518c792f85bf8c31c297dbe6e7e7cb8"},
-  "medre-adapter-matrix": {"url": "https://github.com/jeremiah-k/medre-adapter-matrix.git", "ref": "d39212bc0c3c2e021c9427bc0e958870baaa1afa"},
-  "medre-adapter-meshtastic": {"url": "https://github.com/jeremiah-k/medre-adapter-meshtastic.git", "ref": "8e59552cd32bc43147d873c991ded7c5f082756f"},
-  "medre-adapter-lxmf": {"url": "https://github.com/jeremiah-k/medre-adapter-lxmf.git", "ref": "935faefd3d67be13a6fab445846338c8fc2f150d"},
-  "mmrelay": {"url": "https://github.com/jeremiah-k/meshtastic-matrix-relay.git", "ref": "427cd13fc5518f9ad0dd52f1c31964d3b5ce754c"}
+  "medre": {
+    "url": "https://github.com/jeremiah-k/medre.git",
+    "ref": "fd2927d1a518c792f85bf8c31c297dbe6e7e7cb8"
+  },
+  "medre-adapter-matrix": {
+    "url": "https://github.com/jeremiah-k/medre-adapter-matrix.git",
+    "ref": "d39212bc0c3c2e021c9427bc0e958870baaa1afa"
+  },
+  "medre-adapter-meshtastic": {
+    "url": "https://github.com/jeremiah-k/medre-adapter-meshtastic.git",
+    "ref": "8e59552cd32bc43147d873c991ded7c5f082756f"
+  },
+  "medre-adapter-lxmf": {
+    "url": "https://github.com/jeremiah-k/medre-adapter-lxmf.git",
+    "ref": "935faefd3d67be13a6fab445846338c8fc2f150d"
+  },
+  "mmrelay": {
+    "url": "https://github.com/jeremiah-k/meshtastic-matrix-relay.git",
+    "ref": "427cd13fc5518f9ad0dd52f1c31964d3b5ce754c"
+  }
 }

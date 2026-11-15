@@ -110,10 +110,12 @@ def _require_tables(conn: sqlite3.Connection) -> None:
         )
 
 
-def _event_rows(conn: sqlite3.Connection, where: str, args: tuple) -> list[dict[str, Any]]:
+def _event_rows(
+    conn: sqlite3.Connection, where: str, args: tuple
+) -> list[dict[str, Any]]:
     events = rows_to_dicts(
         conn.execute(
-            "SELECT e.*, "
+            "SELECT e.*, "  # nosec B608 # Fixed predicates; values bound.
             "e.source_native_adapter AS envelope_source_adapter, "
             "e.source_native_channel_id AS envelope_source_channel, "
             "e.source_native_message_id AS envelope_source_packet "
@@ -123,7 +125,7 @@ def _event_rows(conn: sqlite3.Connection, where: str, args: tuple) -> list[dict[
     )
     body_rows = rows_to_dicts(
         conn.execute(
-            "SELECT event_id, field, body FROM event_body_content"
+            "SELECT event_id, field, body FROM event_body_content"  # nosec B608 # Fixed predicates; values bound.
             f" WHERE event_id IN (SELECT event_id FROM canonical_events e WHERE {where})",
             args,
         )
@@ -133,7 +135,7 @@ def _event_rows(conn: sqlite3.Connection, where: str, args: tuple) -> list[dict[
         bodies.setdefault(row["event_id"], {})[row["field"]] = row["body"]
     refs = rows_to_dicts(
         conn.execute(
-            "SELECT r.* FROM native_message_refs r"
+            "SELECT r.* FROM native_message_refs r"  # nosec B608 # Fixed predicates; values bound.
             f" WHERE r.event_id IN (SELECT event_id FROM canonical_events e WHERE {where})"
             " ORDER BY r.created_at",
             args,
@@ -141,7 +143,7 @@ def _event_rows(conn: sqlite3.Connection, where: str, args: tuple) -> list[dict[
     )
     relations = rows_to_dicts(
         conn.execute(
-            "SELECT rel.* FROM event_relations rel"
+            "SELECT rel.* FROM event_relations rel"  # nosec B608 # Fixed predicates; values bound.
             f" WHERE rel.event_id IN (SELECT event_id FROM canonical_events e WHERE {where})"
             " ORDER BY rel.id",
             args,
@@ -211,15 +213,18 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+
     def db_arg(sub_parser: argparse.ArgumentParser) -> None:
         sub_parser.add_argument("db")
 
-    p = sub.add_parser("refs-for-native"); db_arg(p)
+    p = sub.add_parser("refs-for-native")
+    db_arg(p)
     p.add_argument("native_id")
     p.add_argument("adapter", nargs="?", default=None)
     p.add_argument("--wait", type=float, default=0.0)
 
-    p = sub.add_parser("events-for-native"); db_arg(p)
+    p = sub.add_parser("events-for-native")
+    db_arg(p)
     p.add_argument("native_id")
     p.add_argument("adapter", nargs="?", default=None)
     p.add_argument("--wait", type=float, default=0.0)
@@ -229,16 +234,21 @@ def main() -> int:
         help="keep polling until the event also holds an outbound numeric radio ref",
     )
 
-    p = sub.add_parser("refs-for-event"); db_arg(p)
+    p = sub.add_parser("refs-for-event")
+    db_arg(p)
     p.add_argument("event_id")
     p.add_argument("--wait", type=float, default=0.0)
 
-    p = sub.add_parser("events-for-text"); db_arg(p)
+    p = sub.add_parser("events-for-text")
+    db_arg(p)
     p.add_argument("substr")
     p.add_argument("--wait", type=float, default=0.0)
 
-    p = sub.add_parser("count"); db_arg(p)
-    p = sub.add_parser("dump"); db_arg(p); p.add_argument("--limit", type=int, default=10)
+    p = sub.add_parser("count")
+    db_arg(p)
+    p = sub.add_parser("dump")
+    db_arg(p)
+    p.add_argument("--limit", type=int, default=10)
 
     args = parser.parse_args()
 
@@ -247,12 +257,20 @@ def main() -> int:
             return "adapter = ? AND native_message_id = ?", (adapter, native_id)
         return "native_message_id = ?", (native_id,)
 
-    if args.command in {"refs-for-native", "events-for-native", "refs-for-event", "events-for-text"}:
-        refs_predicate, refs_params = refs_where(args.native_id, args.adapter) \
-            if args.command == "refs-for-native" else (None, None)
+    if args.command in {
+        "refs-for-native",
+        "events-for-native",
+        "refs-for-event",
+        "events-for-text",
+    }:
+        refs_predicate, refs_params = (
+            refs_where(args.native_id, args.adapter)
+            if args.command == "refs-for-native"
+            else (None, None)
+        )
         if args.command == "events-for-native":
             event_where, event_params = (
-                "e.event_id IN (SELECT event_id FROM native_message_refs r WHERE"
+                "e.event_id IN (SELECT event_id FROM native_message_refs r WHERE"  # nosec B608 # Fixed predicates; values bound.
                 f" {refs_where(args.native_id, args.adapter)[0]})",
                 refs_where(args.native_id, args.adapter)[1],
             )
@@ -266,7 +284,7 @@ def main() -> int:
             )
         else:  # refs-for-native: poll via the joined event predicate
             event_where, event_params = (
-                "e.event_id IN (SELECT event_id FROM native_message_refs r WHERE"
+                "e.event_id IN (SELECT event_id FROM native_message_refs r WHERE"  # nosec B608 # Fixed predicates; values bound.
                 f" {refs_predicate})",
                 refs_params,
             )
@@ -287,7 +305,8 @@ def main() -> int:
                             "events": [],
                             "waited": True,
                             "db": args.db,
-                            "error": last_error or "timed out waiting for medre state row",
+                            "error": last_error
+                            or "timed out waiting for medre state row",
                         },
                         ensure_ascii=False,
                     )
@@ -299,7 +318,7 @@ def main() -> int:
                 if args.command == "refs-for-native":
                     events = rows_to_dicts(
                         conn.execute(
-                            f"SELECT r.* FROM native_message_refs r WHERE {refs_predicate}"
+                            f"SELECT r.* FROM native_message_refs r WHERE {refs_predicate}"  # nosec B608 # Fixed predicates; values bound.
                             " ORDER BY r.created_at",
                             refs_params,
                         )
@@ -316,8 +335,12 @@ def main() -> int:
     if args.command == "count":
         with open_state(args.db) as conn:
             _require_tables(conn)
-            events = conn.execute("SELECT COUNT(*) AS n FROM canonical_events").fetchone()
-            refs = conn.execute("SELECT COUNT(*) AS n FROM native_message_refs").fetchone()
+            events = conn.execute(
+                "SELECT COUNT(*) AS n FROM canonical_events"
+            ).fetchone()
+            refs = conn.execute(
+                "SELECT COUNT(*) AS n FROM native_message_refs"
+            ).fetchone()
         print(
             json.dumps(
                 {

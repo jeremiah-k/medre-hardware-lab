@@ -76,7 +76,9 @@ def envelope_problems(envelope: dict[str, Any] | None, label: str) -> list[str]:
     problems: list[str] = []
     schema_version = envelope.get("schema_version")
     if type(schema_version) is not int or schema_version != 1:
-        problems.append(f"{label}: schema_version must be int 1, got {schema_version!r}")
+        problems.append(
+            f"{label}: schema_version must be int 1, got {schema_version!r}"
+        )
     canonical_event_id = envelope.get("canonical_event_id")
     if not (
         isinstance(canonical_event_id, str)
@@ -172,7 +174,9 @@ def main() -> int:
             ("medre", medre_event, medre_user),
         ):
             if event is None:
-                print(f"MEDRE SMOKE FAIL: no Matrix event from {user} containing {marker_a}")
+                print(
+                    f"MEDRE SMOKE FAIL: no Matrix event from {user} containing {marker_a}"
+                )
                 result["steps"][f"ingress_{label}"] = {"status": "TIMEOUT"}
                 write_result(result)
                 return 1
@@ -198,7 +202,9 @@ def main() -> int:
         # ---------------- Part B: human -> dual radio, no loop -------------
         # The injector PeerNode is already armed as the Alpha-side witness
         # (4s settle on construction, pubsub receive filter on its iface).
-        print(f"[B1] Alpha witness armed on meshtasticd-a-peer; @alice sends {marker_b}")
+        print(
+            f"[B1] Alpha witness armed on meshtasticd-a-peer; @alice sends {marker_b}"
+        )
         send_response = matrix_request(
             "PUT",
             f"/_matrix/client/v3/rooms/{alpha_ch0_room}/send/m.room.message/{int(time.time() * 1000)}",
@@ -206,8 +212,13 @@ def main() -> int:
             {"msgtype": "m.text", "body": marker_b},
         )
         if send_response.status_code >= 400:
-            print(f"MEDRE SMOKE FAIL: alice send failed: {send_response.status_code} {send_response.text}")
-            result["steps"]["alice_send"] = {"status": "ERROR", "code": send_response.status_code}
+            print(
+                f"MEDRE SMOKE FAIL: alice send failed: {send_response.status_code} {send_response.text}"
+            )
+            result["steps"]["alice_send"] = {
+                "status": "ERROR",
+                "code": send_response.status_code,
+            }
             write_result(result)
             return 1
         result["steps"]["alice_send"] = {"status": "OK"}
@@ -219,7 +230,9 @@ def main() -> int:
             MEDRE_SMOKE_TIMEOUT_DB,
         )
         if relay_row is None:
-            print("MEDRE SMOKE FAIL: relay-a did not map the human text into the Alpha mesh")
+            print(
+                "MEDRE SMOKE FAIL: relay-a did not map the human text into the Alpha mesh"
+            )
             result["steps"]["relay_a_dispatch"] = {"status": "TIMEOUT"}
             write_result(result)
             return 1

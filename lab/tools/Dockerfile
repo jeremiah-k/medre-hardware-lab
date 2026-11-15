@@ -1,3 +1,7 @@
+# checkov:skip=CKV_DOCKER_2:Compose and scenario probes own service health; tools are one-shot commands.
+# checkov:skip=CKV_DOCKER_3:One-shot lab tools require host device access; Compose selects the caller UID where supported.
+# Debian packages follow the pinned distribution security repository.
+# hadolint global ignore=DL3008
 # =============================================================================
 # lab-tools: administration and assertion utility container.
 #

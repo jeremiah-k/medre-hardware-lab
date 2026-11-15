@@ -57,7 +57,9 @@ def login(localpart: str, password: str) -> dict[str, str]:
         },
     )
     if response.status_code >= 400:
-        raise RuntimeError(f"login({localpart}) failed: {response.status_code} {response.text}")
+        raise RuntimeError(
+            f"login({localpart}) failed: {response.status_code} {response.text}"
+        )
     body = response.json()
     return {
         "access_token": body["access_token"],
@@ -75,7 +77,9 @@ def resolve_alias(alias: str, token: str) -> str | None:
         return response.json().get("room_id")
     if response.status_code == 404:
         return None
-    raise RuntimeError(f"alias resolve failed for {alias}: {response.status_code} {response.text}")
+    raise RuntimeError(
+        f"alias resolve failed for {alias}: {response.status_code} {response.text}"
+    )
 
 
 def wait_for_matrix_event(

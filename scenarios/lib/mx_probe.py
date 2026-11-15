@@ -55,8 +55,11 @@ def _send(
     if response.status_code // 100 != 2:
         print(
             json.dumps(
-                {"error": "send failed", "status": response.status_code,
-                 "body": response.text[:500]}
+                {
+                    "error": "send failed",
+                    "status": response.status_code,
+                    "body": response.text[:500],
+                }
             )
         )
         sys.exit(1)
@@ -85,8 +88,11 @@ def _redact(
     if response.status_code // 100 != 2:
         print(
             json.dumps(
-                {"error": "redact failed", "status": response.status_code,
-                 "body": response.text[:500]}
+                {
+                    "error": "redact failed",
+                    "status": response.status_code,
+                    "body": response.text[:500],
+                }
             )
         )
         sys.exit(1)

@@ -66,7 +66,7 @@ for event in data.get("events", []):
             print(ref["native_message_id"])
             raise SystemExit
 ')"
-[[ -n "${PACKET_C}" ]] || SC_FAIL "medre did not re-air the seed onto MeshC (probe precondition)" \
+[[ -n ${PACKET_C} ]] || SC_FAIL "medre did not re-air the seed onto MeshC (probe precondition)" \
 	"seed_event=${SEED_EVENT}"
 SC_PASS "seed bridged everywhere (probe precondition)" \
 	"seed_event=${SEED_EVENT} relay_a_packet=${PACKET_A} medre_packet=${PACKET_C}"

@@ -122,7 +122,7 @@ if emoji not in body:
 print(json.dumps({'problems': problems, 'body': body}, ensure_ascii=False))
 " "${MARKER}" "🦄")"
 problems="$(jq_get "${verdict}" problems)"
-if [ "${problems}" = "[]" ]; then
+if [[ ${problems} == "[]" ]]; then
 	SC_PASS "LIVE leg: ordinary reply stayed message.created, authored body preserved verbatim exactly once" \
 		"reply_packet=${REPLY_PACKET}" $'\n'"body=$(jq_get "${verdict}" body)"
 else
@@ -160,7 +160,7 @@ for event in events:
 print(json.dumps({'problems': problems}, ensure_ascii=False))
 " "${MARKER}")"
 state_problems="$(jq_get "${state_verdict}" problems)"
-if [ "${state_problems}" = "[]" ]; then
+if [[ ${state_problems} == "[]" ]]; then
 	SC_PASS "canonical state: message.created stored, authored body once, zero reaction relations" \
 		"reply_packet=${REPLY_PACKET} db=${MEDRE_NORMAL_DB}"
 else
@@ -239,7 +239,7 @@ import json, sys
 print(json.load(open(sys.argv[1]))["verdict"])
 ' "${OUT}")"
 echo "[probe] renderer ordinary-retention evidence: ${OUT}"
-if [ "${RENDER_VERDICT}" = "PASS" ]; then
+if [[ ${RENDER_VERDICT} == "PASS" ]]; then
 	RENDER_COUNTS="$(python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))

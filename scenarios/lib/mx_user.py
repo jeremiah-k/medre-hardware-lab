@@ -21,7 +21,6 @@ import os
 import sys
 import time
 import urllib.parse
-from typing import Any
 
 from lab_env import matrix_request
 
@@ -32,7 +31,10 @@ def user_token(localpart: str) -> str:
     if token:
         return token
     try:
-        with open(os.environ.get("LAB_RUNTIME_JSON", "/lab-state/runtime.json"), encoding="utf-8") as handle:
+        with open(
+            os.environ.get("LAB_RUNTIME_JSON", "/lab-state/runtime.json"),
+            encoding="utf-8",
+        ) as handle:
             account = json.load(handle).get("users", {}).get(localpart, {})
     except FileNotFoundError:
         account = {}
@@ -55,7 +57,13 @@ def _send(token: str, room_id: str, content: dict, kind: str) -> dict:
         content,
     )
     if response.status_code >= 400:
-        print(json.dumps({"error": f"{kind} send failed: {response.status_code} {response.text[:300]}"}))
+        print(
+            json.dumps(
+                {
+                    "error": f"{kind} send failed: {response.status_code} {response.text[:300]}"
+                }
+            )
+        )
         raise SystemExit(1)
     event_id = response.json().get("event_id")
     if not isinstance(event_id, str) or not event_id:
@@ -93,7 +101,13 @@ def send_reaction(token: str, room_id: str, target: str, key: str) -> dict:
         content,
     )
     if response.status_code >= 400:
-        print(json.dumps({"error": f"reaction send failed: {response.status_code} {response.text[:300]}"}))
+        print(
+            json.dumps(
+                {
+                    "error": f"reaction send failed: {response.status_code} {response.text[:300]}"
+                }
+            )
+        )
         raise SystemExit(1)
     event_id = response.json().get("event_id")
     if not isinstance(event_id, str) or not event_id:
@@ -106,11 +120,23 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("token"); p.add_argument("localpart")
-    p = sub.add_parser("send"); p.add_argument("localpart"); p.add_argument("room_id"); p.add_argument("body")
+    p = sub.add_parser("token")
+    p.add_argument("localpart")
+    p = sub.add_parser("send")
+    p.add_argument("localpart")
+    p.add_argument("room_id")
+    p.add_argument("body")
     p.add_argument("--emote", action="store_true")
-    p = sub.add_parser("reply"); p.add_argument("localpart"); p.add_argument("room_id"); p.add_argument("target"); p.add_argument("body")
-    p = sub.add_parser("react"); p.add_argument("localpart"); p.add_argument("room_id"); p.add_argument("target"); p.add_argument("key")
+    p = sub.add_parser("reply")
+    p.add_argument("localpart")
+    p.add_argument("room_id")
+    p.add_argument("target")
+    p.add_argument("body")
+    p = sub.add_parser("react")
+    p.add_argument("localpart")
+    p.add_argument("room_id")
+    p.add_argument("target")
+    p.add_argument("key")
 
     args = parser.parse_args()
     if args.command == "token":
@@ -119,13 +145,28 @@ def main() -> int:
 
     token = user_token(args.localpart)
     if args.command == "send":
-        print(json.dumps(send_message(token, args.room_id, args.body, args.emote), ensure_ascii=False))
+        print(
+            json.dumps(
+                send_message(token, args.room_id, args.body, args.emote),
+                ensure_ascii=False,
+            )
+        )
         return 0
     if args.command == "reply":
-        print(json.dumps(send_reply(token, args.room_id, args.target, args.body), ensure_ascii=False))
+        print(
+            json.dumps(
+                send_reply(token, args.room_id, args.target, args.body),
+                ensure_ascii=False,
+            )
+        )
         return 0
     if args.command == "react":
-        print(json.dumps(send_reaction(token, args.room_id, args.target, args.key), ensure_ascii=False))
+        print(
+            json.dumps(
+                send_reaction(token, args.room_id, args.target, args.key),
+                ensure_ascii=False,
+            )
+        )
         return 0
     return 2
 

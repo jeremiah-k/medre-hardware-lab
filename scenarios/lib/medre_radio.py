@@ -39,7 +39,9 @@ import time
 import radio  # same scenarios/lib directory: connection + packet-view helpers
 
 
-def collect(host: str, port: int, timeout: float, contains: str | None, tag: str | None) -> int:
+def collect(
+    host: str, port: int, timeout: float, contains: str | None, tag: str | None
+) -> int:
     from pubsub import pub
 
     # radio.TransportDropCapture (reachable as medre_radio.TransportDropCapture
@@ -105,7 +107,9 @@ def main() -> int:
     p.add_argument("--contains", default=None)
     p.add_argument("--tag", default=None)
 
-    p = sub.add_parser("info"); p.add_argument("host"); p.add_argument("port", type=int)
+    p = sub.add_parser("info")
+    p.add_argument("host")
+    p.add_argument("port", type=int)
 
     args = parser.parse_args()
     if args.command == "info":

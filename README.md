@@ -9,13 +9,13 @@ continue to own routing, rendering, encoding and transport behavior.
 
 ## Choose a mode
 
-| Mode | What it proves | Requirements |
-| --- | --- | --- |
-| Docker `base` | Two MMRelays, independent virtual meshnets and Matrix | Docker Compose with BuildKit additional contexts |
-| Docker `normal` | MEDRE/MMRelay shared-room interop, virtual Meshtastic, LXMF counterpart | Same, plus exact source locks |
-| Docker `stress` | Deliberate shared-mesh loop topology | Same; a separate diagnostic profile |
-| Hardware | Two-way ordinary-text routing between two physical transport pairs | Linux, Python 3.12+, two boards per selected transport |
-| Mixed | Docker relay with an explicitly mapped physical serial radio | [Generic serial overlay](examples/hybrid/README.md); live qualification required |
+| Mode            | What it proves                                                          | Requirements                                                                     |
+| --------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Docker `base`   | Two MMRelays, independent virtual meshnets and Matrix                   | Docker Compose with BuildKit additional contexts                                 |
+| Docker `normal` | MEDRE/MMRelay shared-room interop, virtual Meshtastic, LXMF counterpart | Same, plus exact source locks                                                    |
+| Docker `stress` | Deliberate shared-mesh loop topology                                    | Same; a separate diagnostic profile                                              |
+| Hardware        | Two-way ordinary-text routing between two physical transport pairs      | Linux, Python 3.12+, two boards per selected transport                           |
+| Mixed           | Docker relay with an explicitly mapped physical serial radio            | [Generic serial overlay](examples/hybrid/README.md); live qualification required |
 
 Hardware checks support any two of Meshtastic, MeshCore and LXMF. A role selects
 which endpoint in each configured pair MEDRE owns; the other endpoints are
@@ -32,10 +32,9 @@ with `--root`. Docker files and scenarios stay in the checkout; they are not
 bundled into a separately published Python distribution.
 
 ```sh
-python3.12 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
-.venv/bin/medre-lab init
-.venv/bin/medre-lab doctor
+uv sync --locked --extra dev --python 3.12
+uv run --no-sync medre-lab init
+uv run --no-sync medre-lab doctor
 ```
 
 `lab.toml` is local and ignored. Configure only the transports you own. The
@@ -47,10 +46,10 @@ mode does not require privileged Docker containers.
 ## Docker interop
 
 ```sh
-.venv/bin/medre-lab sources fetch
-.venv/bin/medre-lab docker up --profile normal
-.venv/bin/medre-lab docker test normal-fanout normal-parity normal-replies normal-reactions normal-lxmf normal-untrusted
-.venv/bin/medre-lab docker down
+uv run --no-sync medre-lab sources fetch
+uv run --no-sync medre-lab docker up --profile normal
+uv run --no-sync medre-lab docker test normal-fanout normal-parity normal-replies normal-reactions normal-lxmf normal-untrusted
+uv run --no-sync medre-lab docker down
 ```
 
 `sources.lock.json` selects exact full commits. Fetch clones into ignored
@@ -79,11 +78,11 @@ Install the released transport packages, or editable source revisions when
 qualifying an unpublished provider:
 
 ```sh
-.venv/bin/pip install -e '.[hardware]'
+uv sync --locked --extra dev --extra hardware
 # Once available as a distribution:
-.venv/bin/pip install -e '.[meshcore]'
+uv sync --locked --extra dev --extra hardware --extra meshcore
 # Or use a checkout at the exact candidate commit:
-# .venv/bin/pip install -e /path/to/medre-adapter-meshcore
+# uv pip install --python .venv/bin/python --no-deps -e /path/to/medre-adapter-meshcore
 ```
 
 Fill in `lab.toml`: stable serial by-id paths; MeshCore BLE addresses, channel and
@@ -93,13 +92,13 @@ physical radios, with no enabled IP/shared-instance alternative if the claim is
 RF-only. Keep profiles and identity material outside Git.
 
 ```sh
-.venv/bin/medre-lab doctor
-.venv/bin/medre-lab hardware run --pair meshtastic:meshcore --role a
-.venv/bin/medre-lab hardware run --pair meshtastic:meshcore --role b
-.venv/bin/medre-lab hardware run --pair meshcore:lxmf --role a
-.venv/bin/medre-lab hardware run --pair meshcore:lxmf --role b
-.venv/bin/medre-lab hardware run --pair meshtastic:lxmf --role a
-.venv/bin/medre-lab hardware run --pair meshtastic:lxmf --role b
+uv run --no-sync medre-lab doctor
+uv run --no-sync medre-lab hardware run --pair meshtastic:meshcore --role a
+uv run --no-sync medre-lab hardware run --pair meshtastic:meshcore --role b
+uv run --no-sync medre-lab hardware run --pair meshcore:lxmf --role a
+uv run --no-sync medre-lab hardware run --pair meshcore:lxmf --role b
+uv run --no-sync medre-lab hardware run --pair meshtastic:lxmf --role a
+uv run --no-sync medre-lab hardware run --pair meshtastic:lxmf --role b
 ```
 
 Each command runs one bounded startup and one message per direction, stops after
@@ -124,8 +123,8 @@ states and maximum event-loop heartbeat delay. Keep raw reports private: they ca
 contain native identifiers. Publish a sanitized summary separately.
 
 ```sh
-.venv/bin/pytest -q
-.venv/bin/ruff check medre_lab tests lab/tests
+uv run --no-sync pytest -q
+.trunk/trunk check --all --no-fix --ci
 ```
 
 CI runs Docker-free tests and validates Compose/shell/Python structure. It does
@@ -133,3 +132,38 @@ not assert that physical radios or a full Docker campaign were qualified.
 
 See [provenance and migration](docs/provenance.md) for what was imported, what
 remains local and the distinction between historical and current evidence.
+
+## Development tooling
+
+Use the committed Trunk launcher; local work and CI share its tool versions:
+
+```bash
+.trunk/trunk upgrade
+.trunk/trunk check --fix --all
+.trunk/trunk check --all --no-fix --ci
+uv sync --locked --extra dev
+uv run --no-sync pytest -q
+```
+
+uv owns `.venv` and `uv.lock`; rerun sync after dependency changes. Select every
+needed extra on each sync. CI selects only `dev`, so offline tests do not start
+radios or install optional hardware SDKs. Black targets Python 3.12.
+
+Core, Matrix, Meshtastic and LXMF have published 0.1.0 packages. MeshCore's
+adapter is not published yet, so the `meshcore` extra uses an exact merged Git
+revision in `tool.uv.sources`; the lock records its resolved commit. Qualify a
+source update before changing that pin. Local editable overrides are development
+experiments and do not qualify the committed lock. A later exact sync restores
+the locked environment.
+
+The deployment source manifest and `medre-lab sources` continue to control Docker
+checkouts and bake provenance independently of the host uv environment. Report
+both when qualifying a mixed Docker/hardware run. Keep local profiles, identities,
+`.zcode/`, state and evidence outside Git. See the core
+[installation-source plan](https://github.com/jeremiah-k/medre/blob/main/docs/ops/package-management.md).
+
+`scenarios/config.env` is sourced Bash. Its parameter expansions and overrides
+are checked by ShellCheck and a defaults/overrides regression; dotenv formatting
+is excluded for that file. Renovate tracks the inline upstream-source metadata
+on Trunk pins. Routine history belongs in PR descriptions; release notes are
+optional and descriptively named.

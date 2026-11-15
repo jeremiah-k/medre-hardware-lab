@@ -31,7 +31,7 @@ resolve_bridge_rooms
 SCENARIO="probe-r2-matrix-edit"
 ROOM_ID="${ROOM_BRIDGE_CH0_ID}"
 BOB_TOKEN="$(lib_py mx_user.py token "${HUMAN_BOB_LOCALPART}" | tr -d '"')"
-[[ -n "${BOB_TOKEN}" && "${BOB_TOKEN}" != "null" ]] ||
+[[ -n ${BOB_TOKEN} && ${BOB_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_BOB_LOCALPART}" "the rig must provision @bob (scenarios/README.md)"
 
 radio_ingest_ready "${NODE_C_PEER_HOST}" "${NODE_C_PEER_PORT}" \
@@ -106,7 +106,7 @@ capture out lib_py mx_user.py send "${HUMAN_ALICE_LOCALPART}" "${ROOM_ID}" "${SE
 ((SC_STATUS == 0)) || SC_FAIL "seed send failed" "${out}"
 SEED_EVENT="$(jq_get "${out}" event_id | tr -d '"')"
 PACKET_C="$(medre_outbound_packet "${SEED_EVENT}")"
-[[ -n "${PACKET_C}" ]] || SC_FAIL "medre did not re-air the seed onto MeshC (probe precondition)" \
+[[ -n ${PACKET_C} ]] || SC_FAIL "medre did not re-air the seed onto MeshC (probe precondition)" \
 	"seed_event=${SEED_EVENT} db=${MEDRE_NORMAL_DB}"
 SC_PASS "seed bridged end to end (probe precondition)" \
 	"seed_event=${SEED_EVENT} medre_packet=${PACKET_C}"
@@ -128,7 +128,7 @@ SC_PASS "matched intent: canonical message.edited + one edit relation + designed
 	"edit_event=${EDIT_EVENT}"
 
 SNIFF_MATCH="$(grep -o '{"match":.*}' "${SNIFF_C}" 2>/dev/null | head -1 || true)"
-[[ -z "${SNIFF_MATCH}" ]] ||
+[[ -z ${SNIFF_MATCH} ]] ||
 	SC_FAIL "the matrix edit aired on MeshC (designed skip violated)" "${SNIFF_MATCH}"
 
 capture room_scan lib_py mx_events.py scan "${ROOM_ID}" --since-ms "${SINCE_EDIT}" \
@@ -142,7 +142,7 @@ except Exception:
     rows = []
 print(len(rows) if isinstance(rows, list) else 0)
 ')"
-[[ "${medre_room_events}" == "0" ]] ||
+[[ ${medre_room_events} == "0" ]] ||
 	SC_FAIL "medre authored room events after the matched edit (malformed mutation echo)" \
 		"scan since=${SINCE_EDIT}: ${room_scan}"
 SC_PASS "matched intent: room clean (no malformed native mutation reaches the room)" \
@@ -203,7 +203,7 @@ for event in data.get("events", []):
             refs.append(ref["native_message_id"])
 print(refs[0] if refs else "")
 ')"
-[[ -n "${outbound_radio}" ]] || SC_FAIL "denied intent: the ordinary message was not bridged to MeshC (message.created must deliver normally)" \
+[[ -n ${outbound_radio} ]] || SC_FAIL "denied intent: the ordinary message was not bridged to MeshC (message.created must deliver normally)" \
 	"event=${FORGED_EVENT}" $'\n'"state: ${forged_radio}"
 SC_PASS "denied intent: the ordinary message bridged to MeshC normally (outbound radio ref present)" \
 	"event=${FORGED_EVENT} packet=${outbound_radio}"
@@ -263,7 +263,7 @@ except Exception:
     rows = []
 print(len(rows) if isinstance(rows, list) else 0)
 ')"
-[[ "${medre_room_events2}" == "0" ]] ||
+[[ ${medre_room_events2} == "0" ]] ||
 	SC_FAIL "medre authored room events after the malformed edit (malformed mutation echo)" \
 		"scan since=${SINCE_MALFORMED}: ${room_scan2}"
 SC_PASS "malformed edit: room clean" "since_ms=${SINCE_MALFORMED}"
@@ -274,7 +274,7 @@ SC_PASS "malformed edit: room clean" "since_ms=${SINCE_MALFORMED}"
 # (message.created, outbound ref asserted), the malformed act has zero
 # outbound refs (designed skip).
 SNIFF_MATCH="$(grep -o '{"match":.*}' "${SNIFF_C}" 2>/dev/null | grep -F "${NEW_BODY}" | head -1 || true)"
-[[ -z "${SNIFF_MATCH}" ]] ||
+[[ -z ${SNIFF_MATCH} ]] ||
 	SC_FAIL "the matched-intent edit body aired on MeshC (designed skip violated)" "${SNIFF_MATCH}"
 
 stop_sniffer "${SNIFF_C_PID}" "${SNIFF_C}"

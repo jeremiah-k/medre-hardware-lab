@@ -122,4 +122,4 @@ FINAL_B=$(jq_get "${count_b}" count | tr -d '"')
 SC_PASS "message_map row counts unchanged (no radio traffic for those event ids)" \
 	"A: ${BASELINE_A} -> ${FINAL_A}, B: ${BASELINE_B} -> ${FINAL_B}"
 
-SC_LOG "[$SCENARIO] complete"
+SC_LOG "[${SCENARIO}] complete"

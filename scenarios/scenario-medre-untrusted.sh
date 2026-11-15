@@ -38,12 +38,12 @@ resolve_rooms
 
 SCENARIO="medre-untrusted"
 UNTRUSTED_TOKEN="$(lib_py lab_env_probe.py untrusted_token | tr -d '"')"
-[[ -n "${UNTRUSTED_TOKEN}" && "${UNTRUSTED_TOKEN}" != "null" ]] ||
+[[ -n ${UNTRUSTED_TOKEN} && ${UNTRUSTED_TOKEN} != "null" ]] ||
 	SC_SKIP "untrusted account token missing from runtime.json" \
 		"the rig must provision @untrusted (scenarios/README.md scenario list)"
 
 ALICE_TOKEN="$(lib_py mx_user.py token "${HUMAN_ALICE_LOCALPART}" | tr -d '"')"
-[[ -n "${ALICE_TOKEN}" && "${ALICE_TOKEN}" != "null" ]] ||
+[[ -n ${ALICE_TOKEN} && ${ALICE_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_ALICE_LOCALPART}" \
 		"the rig must provision @alice and publish LAB_TOKEN_ALICE (scenarios/README.md)"
 
@@ -147,10 +147,10 @@ print(",".join(sorted({str(r.get("meshtastic_meshnet")) for r in rows})))')"
 import json, sys
 rows = json.load(sys.stdin)["rows"]
 print(",".join(str(r.get("meshtastic_id")) for r in rows))')"
-	[[ "${meshnet_a}" == "${MESHNET_A}" ]] ||
+	[[ ${meshnet_a} == "${MESHNET_A}" ]] ||
 		SC_FAIL "mmrelay adopted the forged meshnet label" \
 			"expected=${MESHNET_A} found=${meshnet_a} rows=${rows_a}"
-	[[ "${ids_a}" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
+	[[ ${ids_a} =~ ^[0-9]+(,[0-9]+)*$ ]] ||
 		SC_FAIL "mmrelay map meshtastic_id is not its own radio packet id" \
 			"meshtastic_id=${ids_a}"
 	SC_PASS "mmrelay relayed only the visible text with local attribution" \

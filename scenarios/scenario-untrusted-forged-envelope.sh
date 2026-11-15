@@ -34,7 +34,7 @@ SCENARIO="untrusted-forged-envelope"
 # Preflight: the untrusted account must be provisioned (mx_forge.py sends as
 # @untrusted; its token is fetched inside that helper).
 UNTRUSTED_TOKEN="$(lib_py lab_env_probe.py untrusted_token | tr -d '"')"
-[[ -n "${UNTRUSTED_TOKEN}" && "${UNTRUSTED_TOKEN}" != "null" ]] ||
+[[ -n ${UNTRUSTED_TOKEN} && ${UNTRUSTED_TOKEN} != "null" ]] ||
 	SC_FAIL "untrusted account token missing from runtime.json"
 
 # --- Act 1: obtain a REAL relay-authored event to clone the envelope from ----
@@ -79,7 +79,7 @@ import json, sys
 rows = json.load(sys.stdin)["rows"]
 meshnets = {str(r.get("meshtastic_meshnet")) for r in rows}
 print(",".join(sorted(meshnets)))')
-	[[ "${meshnet}" == "${local_meshnet}" ]] ||
+	[[ ${meshnet} == "${local_meshnet}" ]] ||
 		SC_FAIL "[${side}] forged meshnet label leaked into the map" \
 			"expected_only=${local_meshnet} found=${meshnet}"
 	packet_id=$(printf '%s' "${rows}" | tools_exec python3 -c '
@@ -87,7 +87,7 @@ import json, sys
 rows = json.load(sys.stdin)["rows"]
 ids = [str(r.get("meshtastic_id")) for r in rows]
 print(",".join(ids))')
-	[[ "${packet_id}" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
+	[[ ${packet_id} =~ ^[0-9]+(,[0-9]+)*$ ]] ||
 		SC_FAIL "[${side}] forged packet id entered the map (meshtastic_id must be the relay's own radio packet)" \
 			"meshtastic_id=${packet_id}"
 	text_ok=$(printf '%s' "${rows}" | grep -c "${FORGED_BODY}" || true)
@@ -124,4 +124,4 @@ done
 SC_PASS "no forged metadata in either relay's message map" \
 	"checked=${FORGED_CANONICAL_ID},${FORGED_MESHNET},${FORGED_SENDER_NAME},${FORGED_TRANSPORT}"
 
-SC_LOG "[$SCENARIO] complete"
+SC_LOG "[${SCENARIO}] complete"

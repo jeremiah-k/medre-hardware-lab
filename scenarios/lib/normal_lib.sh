@@ -226,11 +226,12 @@ queue_snapshot() {
 			# exec/awk stage (f5d9424's class) or an empty grep match would
 			# kill the whole snapshot; a zero in-generation count is a valid
 			# result and the last stage (queue-parse) never fails on it.
-			out="$( { tools_exec awk -v cutoff="${cutoff}" '$1 " " $2 >= cutoff' "${log}" 2>/dev/null || true; } |
+			# shellcheck disable=SC2016 # Child-language syntax or named output, not a host-shell read.
+			out="$({ tools_exec awk -v cutoff="${cutoff}" '$1 " " $2 >= cutoff' "${log}" 2>/dev/null || true; } |
 				{ tools_exec grep "Queued message (" 2>/dev/null || true; } |
 				medre_lib_py normal_checks.py queue-parse)"
 		else
-			out="$( { tools_exec grep "Queued message (" "${log}" 2>/dev/null || true; } |
+			out="$({ tools_exec grep "Queued message (" "${log}" 2>/dev/null || true; } |
 				medre_lib_py normal_checks.py queue-parse)"
 		fi
 	else
@@ -246,8 +247,8 @@ queue_assert_flat() {
 	local label="$1" before_a="$2" before_b="$3" after_a="$4" after_b="$5"
 	local max_new="$6" max_pos="$7"
 	local delta_a delta_b pos_a pos_b
-	delta_a=$(( $(jq_get "${after_a}" count | tr -d '"') - $(jq_get "${before_a}" count | tr -d '"') ))
-	delta_b=$(( $(jq_get "${after_b}" count | tr -d '"') - $(jq_get "${before_b}" count | tr -d '"') ))
+	delta_a=$(($(jq_get "${after_a}" count | tr -d '"') - $(jq_get "${before_a}" count | tr -d '"')))
+	delta_b=$(($(jq_get "${after_b}" count | tr -d '"') - $(jq_get "${before_b}" count | tr -d '"')))
 	pos_a="$(jq_get "${after_a}" max_pos | tr -d '"')"
 	pos_b="$(jq_get "${after_b}" max_pos | tr -d '"')"
 	if ((delta_a > max_new || delta_b > max_new)); then
@@ -280,7 +281,7 @@ table_snapshot() {
 # table_assert_flat LABEL BEFORE AFTER
 table_assert_flat() {
 	local label="$1" before="$2" after="$3"
-	[[ "${before}" == "${after}" ]] ||
+	[[ ${before} == "${after}" ]] ||
 		SC_FAIL "${label}: state tables grew across the settle window (re-bridge cascade)" \
 			"before: ${before}" $'\n'"after: ${after}"
 	SC_PASS "${label}: all map/state tables flat across the settle window" \
@@ -295,7 +296,7 @@ peer_node_id() {
 	capture out medre_lib_py medre_radio.py info "${host}" "${port}"
 	((SC_STATUS == 0)) || SC_FAIL "cannot read peer node identity (${host}:${port})" "${out}"
 	printf -v "${__var}" '%s' "$(jq_get "${out}" node_id | tr -d '"')"
-	[[ "${!__var}" =~ ^![0-9a-f]{8}$ ]] ||
+	[[ ${!__var} =~ ^![0-9a-f]{8}$ ]] ||
 		SC_FAIL "peer node identity unusable (${host}:${port})" "${out}"
 }
 

@@ -44,7 +44,6 @@ import time
 from typing import Any
 
 import requests
-
 from lab_lib import (
     SERVER_NAME,
     SYNAPSE_URL,
@@ -120,9 +119,7 @@ ROOM_MEMBERS: dict[str, list[str]] = {
 }
 
 
-def shared_secret_mac(
-    nonce: str, localpart: str, password: str, admin: bool
-) -> str:
+def shared_secret_mac(nonce: str, localpart: str, password: str, admin: bool) -> str:
     """Synapse shared-secret registration MAC (see register_new_matrix_user)."""
     mac = hmac.new(key=SHARED_SECRET.encode("utf-8"), digestmod=hashlib.sha1)
     mac.update(nonce.encode("utf-8"))
@@ -141,7 +138,9 @@ def shared_secret_register(
     """Register via the Synapse shared-secret admin API; None if user exists."""
     nonce_resp = requests.get(f"{SYNAPSE_URL}/_synapse/admin/v1/register", timeout=20)
     if nonce_resp.status_code >= 400:
-        raise RuntimeError(f"nonce fetch failed: {nonce_resp.status_code} {nonce_resp.text}")
+        raise RuntimeError(
+            f"nonce fetch failed: {nonce_resp.status_code} {nonce_resp.text}"
+        )
     nonce = nonce_resp.json()["nonce"]
     response = requests.post(
         f"{SYNAPSE_URL}/_synapse/admin/v1/register",
@@ -196,16 +195,24 @@ def create_room(
                 "content": {"algorithm": "m.megolm.v1.aes-sha2"},
             }
         ]
-    response = matrix_request("POST", "/_matrix/client/v3/createRoom", admin_token, payload)
+    response = matrix_request(
+        "POST", "/_matrix/client/v3/createRoom", admin_token, payload
+    )
     if response.status_code >= 400:
-        raise RuntimeError(f"createRoom({alias}) failed: {response.status_code} {response.text}")
+        raise RuntimeError(
+            f"createRoom({alias}) failed: {response.status_code} {response.text}"
+        )
     room_id = response.json()["room_id"]
     print(f"  created {alias} -> {room_id}")
     return room_id
 
 
 def request_with_429_retry(
-    method: str, path: str, token: str | None, payload: dict[str, Any], attempts: int = 6
+    method: str,
+    path: str,
+    token: str | None,
+    payload: dict[str, Any],
+    attempts: int = 6,
 ) -> requests.Response:
     """Send a Matrix request, honoring M_LIMIT_EXCEEDED retry_after_ms.
 
@@ -223,9 +230,7 @@ def request_with_429_retry(
     return response
 
 
-def ensure_membership(
-    admin_token: str, room_id: str, account: dict[str, str]
-) -> None:
+def ensure_membership(admin_token: str, room_id: str, account: dict[str, str]) -> None:
     quoted = room_id.replace("!", "%21").replace(":", "%3A")
     invite = request_with_429_retry(
         "POST",

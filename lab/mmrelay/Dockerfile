@@ -1,3 +1,6 @@
+# checkov:skip=CKV_DOCKER_2:Compose and scenario probes own service health; tools are one-shot commands.
+# BuildKit named contexts are validated by the source manifest guard.
+# hadolint global ignore=DL3022
 # =============================================================================
 # MMRelay DEV image for the interop lab.
 #

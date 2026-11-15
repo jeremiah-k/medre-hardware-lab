@@ -7,6 +7,8 @@
 # else = FAIL. Every assertion prints the evidence it checked.
 # =============================================================================
 # shellcheck shell=bash
+# SC_EVIDENCE accepts either stdin or optional arguments.
+# shellcheck disable=SC2119,SC2120
 
 SCENARIO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAB_ROOT="$(cd "${SCENARIO_DIR}/.." && pwd)"
@@ -208,6 +210,7 @@ start_sniffer() {
 		stop_sniffer "${old_pid}" "${!out:-}"
 	fi
 	tmp="$(mktemp "${LAB_ROOT}/lab/logs/scenarios/sniff-XXXXXX.log")"
+	# shellcheck disable=SC2094 # Child-language syntax or named output, not a host-shell read.
 	lib_py radio.py listen "$@" --tag "$(basename "${tmp}" .log)" >"${tmp}" 2>&1 &
 	pid=$!
 	printf -v "${out}" '%s' "${tmp}"

@@ -181,7 +181,7 @@ except Exception:
     rows = []
 print(len(rows) if isinstance(rows, list) else 0)
 ')"
-[[ "${medre_room_events}" == "0" ]] ||
+[[ ${medre_room_events} == "0" ]] ||
 	SC_FAIL "medre authored room events for a matrix-origin reaction (echo/loop)" \
 		"scan since=${SINCE_REACT}: ${room_scan}"
 SC_PASS "room clean: no medre-authored events for the matrix-origin reaction" \

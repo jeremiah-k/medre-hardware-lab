@@ -48,19 +48,19 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/normal_lib.sh"
 
 require_normal_rig
 resolve_bridge_rooms
-if [[ -z "${ROOM_OTHER_ID:-}" ]]; then
+if [[ -z ${ROOM_OTHER_ID:-} ]]; then
 	SC_SKIP "unmapped room unresolved (the unmapped-room negative needs it)" \
 		"publish ROOM_OTHER_ALIAS in lab/state/scenario.env (scenarios/config.env default: #lab-other:lab.test)"
 fi
 
 SCENARIO="normal-untrusted"
 UNTRUSTED_TOKEN="$(lib_py lab_env_probe.py untrusted_token | tr -d '"')"
-[[ -n "${UNTRUSTED_TOKEN}" && "${UNTRUSTED_TOKEN}" != "null" ]] ||
+[[ -n ${UNTRUSTED_TOKEN} && ${UNTRUSTED_TOKEN} != "null" ]] ||
 	SC_SKIP "untrusted account token missing from runtime.json" \
 		"the rig must provision @untrusted (scenarios/README.md scenario list)"
 
 ALICE_TOKEN="$(lib_py mx_user.py token "${HUMAN_ALICE_LOCALPART}" | tr -d '"')"
-[[ -n "${ALICE_TOKEN}" && "${ALICE_TOKEN}" != "null" ]] ||
+[[ -n ${ALICE_TOKEN} && ${ALICE_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_ALICE_LOCALPART}" \
 		"the rig must provision @alice and publish LAB_TOKEN_ALICE (scenarios/README.md)"
 
@@ -196,10 +196,10 @@ print(",".join(sorted({str(r.get("meshtastic_meshnet")) for r in rows})))')"
 import json, sys
 rows = json.load(sys.stdin)["rows"]
 print(",".join(str(r.get("meshtastic_id")) for r in rows))')"
-	[[ "${meshnet_a}" == "${MESHNET_A}" ]] ||
+	[[ ${meshnet_a} == "${MESHNET_A}" ]] ||
 		SC_FAIL "relay-a adopted the forged meshnet label" \
 			"expected=${MESHNET_A} found=${meshnet_a} rows=${rows_a}"
-	[[ "${ids_a}" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
+	[[ ${ids_a} =~ ^[0-9]+(,[0-9]+)*$ ]] ||
 		SC_FAIL "relay-a map meshtastic_id is not its own radio packet id" \
 			"meshtastic_id=${ids_a}"
 	SC_PASS "relay-a relayed only the visible text with local attribution" \
@@ -337,7 +337,7 @@ MEDRE_NODE_ID="$(printf '%s' "${DM_MATCH}" | tools_exec python3 -c '
 import json, sys
 match = json.load(sys.stdin)["match"]
 print(match.get("from_id") or "")')"
-[[ "${MEDRE_NODE_ID}" =~ ^![0-9a-f]{8}$ ]] ||
+[[ ${MEDRE_NODE_ID} =~ ^![0-9a-f]{8}$ ]] ||
 	SC_FAIL "DM-act control capture carries no usable medre node id" "match: ${DM_MATCH}"
 stop_sniffer "${SNIFF_DM_PID}" "${SNIFF_DM}"
 trap - EXIT

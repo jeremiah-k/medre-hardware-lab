@@ -295,7 +295,7 @@ async def test_native_meshcore_peer_uses_discovered_device_and_owned_reconnect(
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "_connect"
     )
     namespace = {"asyncio": asyncio, "ADDRESS": "owned-peer"}
-    exec(
+    exec(  # nosec B102 # Repository-owned peer function under test.
         compile(ast.Module(body=[function], type_ignores=[]), "<native-peer>", "exec"),
         namespace,
     )

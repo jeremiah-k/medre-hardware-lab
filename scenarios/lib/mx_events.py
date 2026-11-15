@@ -27,7 +27,7 @@ import time
 import urllib.parse
 from typing import Any
 
-from lab_env import matrix_request, driver_token
+from lab_env import driver_token, matrix_request
 
 
 def _envelope(content: dict[str, Any]) -> dict[str, Any]:
@@ -90,20 +90,29 @@ def event_matches(event: dict[str, Any], filters: dict[str, Any]) -> bool:
         return False
 
     envelope = _envelope(content)
-    if filters.get("envelope_kind") and envelope.get("event_kind") != filters["envelope_kind"]:
+    if (
+        filters.get("envelope_kind")
+        and envelope.get("event_kind") != filters["envelope_kind"]
+    ):
         return False
-    if filters.get("relation_info") is not None and envelope.get("relation_info") != filters["relation_info"]:
+    if (
+        filters.get("relation_info") is not None
+        and envelope.get("relation_info") != filters["relation_info"]
+    ):
         return False
-    if filters.get("source_channel") is not None and envelope.get("source_channel") != filters["source_channel"]:
+    if (
+        filters.get("source_channel") is not None
+        and envelope.get("source_channel") != filters["source_channel"]
+    ):
         return False
     if filters.get("require_envelope"):
         if not envelope:
             return False
         source_ref = envelope.get("source_native_ref")
         if filters.get("native_ref_msg_id") is not None:
-            if not isinstance(source_ref, dict) or str(source_ref.get("native_message_id")) != str(
-                filters["native_ref_msg_id"]
-            ):
+            if not isinstance(source_ref, dict) or str(
+                source_ref.get("native_message_id")
+            ) != str(filters["native_ref_msg_id"]):
                 return False
         if filters.get("native_ref_channel") is not None:
             if not isinstance(source_ref, dict) or str(
@@ -145,7 +154,9 @@ def _recent_events(token: str, room_id: str, limit: int) -> list[dict[str, Any]]
         timeout=30,
     )
     if response.status_code >= 400:
-        raise SystemExit(f"/messages failed: {response.status_code} {response.text[:300]}")
+        raise SystemExit(
+            f"/messages failed: {response.status_code} {response.text[:300]}"
+        )
     chunk = response.json().get("chunk", [])
     return [event for event in chunk if isinstance(event, dict)]
 
@@ -164,10 +175,14 @@ def _summarize(event: dict[str, Any]) -> dict[str, Any]:
         "source_channel": envelope.get("source_channel"),
         "relation_info": envelope.get("relation_info"),
         "source_native_ref_native_message_id": (
-            source_ref.get("native_message_id") if isinstance(source_ref, dict) else None
+            source_ref.get("native_message_id")
+            if isinstance(source_ref, dict)
+            else None
         ),
         "source_native_ref_native_channel_id": (
-            source_ref.get("native_channel_id") if isinstance(source_ref, dict) else None
+            source_ref.get("native_channel_id")
+            if isinstance(source_ref, dict)
+            else None
         ),
         "origin_server_ts": event.get("origin_server_ts"),
     }
@@ -197,7 +212,11 @@ def main() -> int:
 
     wait = sub.add_parser("wait")
     wait.add_argument("room_id")
-    wait.add_argument("--timeout", type=float, default=float(__import__("os").environ.get("MATRIX_WAIT_SECONDS", "90")))
+    wait.add_argument(
+        "--timeout",
+        type=float,
+        default=float(__import__("os").environ.get("MATRIX_WAIT_SECONDS", "90")),
+    )
     wait.add_argument("--since-ms", type=int, default=0)
     _add_filters(wait)
 
@@ -246,11 +265,15 @@ def main() -> int:
         recent: list[dict[str, Any]] = []
         while time.monotonic() < deadline:
             for event in _recent_events(token, args.room_id, 200):
-                if args.since_ms and (event.get("origin_server_ts") or 0) < args.since_ms:
+                if (
+                    args.since_ms
+                    and (event.get("origin_server_ts") or 0) < args.since_ms
+                ):
                     continue
                 summary = _summarize(event)
                 if summary["event_id"] and all(
-                    candidate.get("event_id") != summary["event_id"] for candidate in recent
+                    candidate.get("event_id") != summary["event_id"]
+                    for candidate in recent
                 ):
                     recent.append(summary)
                     recent = recent[-12:]

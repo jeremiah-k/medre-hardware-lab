@@ -160,7 +160,9 @@ def send_reaction(token: str, room_id_value: str, target: str, key: str) -> str:
         content,
     )
     if response.status_code >= 400:
-        raise SystemExit(f"send_reaction failed: {response.status_code} {response.text}")
+        raise SystemExit(
+            f"send_reaction failed: {response.status_code} {response.text}"
+        )
     event_id = response.json().get("event_id")
     if not isinstance(event_id, str):
         raise SystemExit("send_reaction: response missing event_id")

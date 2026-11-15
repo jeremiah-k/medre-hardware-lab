@@ -238,7 +238,7 @@ data = json.load(open(sys.argv[1]))
 print(data['verdict'])
 " "${OUT}")"
 echo "[probe] renderer fail-close evidence: ${OUT}"
-if [[ "${VERDICT}" == "PASS" ]]; then
+if [[ ${VERDICT} == "PASS" ]]; then
 	SC_PASS "renderer fail-close: all denied/mismatched mutation shapes raise MatrixNativeMutationError and construct nothing; authorized edit renders m.replace with synced fallback styling; neutral kind markers verified at the mounted R2 revisions" \
 		"evidence=${OUT}"
 else

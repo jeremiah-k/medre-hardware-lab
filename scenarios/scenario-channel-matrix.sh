@@ -52,7 +52,7 @@ run_case() {
 
 	# --- Act 1: origin-mesh message from its PEER node on the channel ---------
 	local radio_args=(send-text "${inject_host}" "${inject_port}" "${marker}")
-	if [[ "${channel_arg}" != "-" ]]; then
+	if [[ ${channel_arg} != "-" ]]; then
 		radio_args+=(--channel "${channel_arg}")
 	fi
 	capture out lib_py radio.py "${radio_args[@]}"
@@ -79,7 +79,7 @@ run_case() {
 	local since_reply since_react
 	since_reply="$(date +%s%3N)"
 	local reply_args=(send-text "${reply_host}" "${reply_port}" "${reply_marker}" --reply-id "${b_packet}")
-	if [[ "${channel_arg}" != "-" ]]; then
+	if [[ ${channel_arg} != "-" ]]; then
 		reply_args+=(--channel "${channel_arg}")
 	fi
 	capture out lib_py radio.py "${reply_args[@]}"
@@ -98,7 +98,7 @@ run_case() {
 
 	since_react="$(date +%s%3N)"
 	local react_args=(send-reaction "${reply_host}" "${reply_port}" "${react_key}" "${b_packet}")
-	if [[ "${channel_arg}" != "-" ]]; then
+	if [[ ${channel_arg} != "-" ]]; then
 		react_args+=(--channel "${channel_arg}")
 	fi
 	capture out lib_py radio.py "${react_args[@]}"
@@ -114,7 +114,7 @@ run_case() {
 		SC_FAIL "[${variant}] far-mesh reaction missing exact key / channel ${expected} target" "${react_json}"
 
 	# --- Same channel id both sides --------------------------------------------
-	[[ "${orig_channel}" == "${expected}" && "${reply_channel}" == "${expected}" ]] ||
+	[[ ${orig_channel} == "${expected}" && ${reply_channel} == "${expected}" ]] ||
 		SC_FAIL "[${variant}] channel identity disagreement between original and reply" \
 			"orig=${orig_channel} reply=${reply_channel} expected=${expected}"
 	SC_PASS "[${variant}] reply+reaction carry the SAME channel id on both sides" \
@@ -151,4 +151,4 @@ fi
 # live. Record the limitation and finish with the injectable sub-cases' result.
 SC_LOG "NOTE: malformed-channel sub-case skipped (not injectable over the radio API;"
 SC_LOG "NOTE: parsing branches covered by mmrelay unit tests: test_on_meshtastic_message_text_app_malformed_channel_defaults_to_zero)"
-SC_LOG "[$SCENARIO] complete"
+SC_LOG "[${SCENARIO}] complete"

@@ -50,10 +50,10 @@ resolve_rooms
 SCENARIO="medre-reactions"
 ALICE_TOKEN="$(lib_py mx_user.py token "${HUMAN_ALICE_LOCALPART}" | tr -d '"')"
 BOB_TOKEN="$(lib_py mx_user.py token "${HUMAN_BOB_LOCALPART}" | tr -d '"')"
-[[ -n "${ALICE_TOKEN}" && "${ALICE_TOKEN}" != "null" ]] ||
+[[ -n ${ALICE_TOKEN} && ${ALICE_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_ALICE_LOCALPART}" \
 		"the rig must provision @alice and publish LAB_TOKEN_ALICE (scenarios/README.md)"
-[[ -n "${BOB_TOKEN}" && "${BOB_TOKEN}" != "null" ]] ||
+[[ -n ${BOB_TOKEN} && ${BOB_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_BOB_LOCALPART}" \
 		"the rig must provision @bob and publish LAB_TOKEN_BOB (scenarios/README.md)"
 
@@ -92,7 +92,7 @@ for event in data.get("events", []):
 print(packets[0] if packets else "")
 ')"
 	fi
-	[[ -n "${medre_packet}" ]] ||
+	[[ -n ${medre_packet} ]] ||
 		SC_FAIL "[${variant}] medre state holds no outbound radio packet for the seed text (medre did not bridge it)" \
 			"db=${mesh_db} matrix_event=${event_id} events=${out}"
 	SC_PASS "[${variant}] seed text bridged; medre packet known from medre state" \
@@ -125,7 +125,7 @@ print(packets[0] if packets else "")
 	medre_assert_valid "${react_json}" "[${variant}] medre reacted event"
 	local msgtype
 	msgtype="$(jq_get "${react_json}" event.content.msgtype | tr -d '"')"
-	[[ "${msgtype}" == "m.emote" ]] ||
+	[[ ${msgtype} == "m.emote" ]] ||
 		SC_FAIL "[${variant}] medre radio-derived reaction must render as the m.emote fallback" "${react_json}"
 	SC_PASS "[${variant}] medre emitted the exact reaction key with a numeric radio-native target" \
 		"key=${key} target_packet=${medre_packet} event=${react_id}"
@@ -145,7 +145,7 @@ print(packets[0] if packets else "")
 	else
 		match_line=""
 	fi
-	[[ -n "${match_line}" ]] ||
+	[[ -n ${match_line} ]] ||
 		SC_FAIL "[${variant}] far relay never bridged the medre peer reaction to its mesh" \
 			"sniffer log: $(cat "${SNIFF}")" $'\n'"reacted_event=${react_id} key=${key}"
 

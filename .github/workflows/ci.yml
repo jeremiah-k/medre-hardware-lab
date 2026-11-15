@@ -1,19 +1,31 @@
 name: Lab checks
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 permissions:
   contents: read
 jobs:
   offline:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: '3.12'
-      - run: python -m pip install -e '.[dev]'
-      - run: pytest -q
-      - run: ruff check medre_lab tests lab/tests
-      - run: python -m compileall -q medre_lab lab/tools
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: .tool-versions
+          python-version: "3.12"
+      - name: Cache Trunk tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/trunk
+          key: trunk-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.trunk/trunk.yaml', '.trunk/trunk') }}
+      - run: uv sync --locked --extra dev
+      - run: uv run --no-sync pytest -q
+      - run: .trunk/trunk check --all --no-fix --ci
+      - run: uv run --no-sync python -m compileall -q medre_lab lab/tools
       - run: find lab scenarios -name '*.sh' -print0 | xargs -0 -n1 bash -n
       - name: Compose structure
         run: |

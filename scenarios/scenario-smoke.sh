@@ -34,7 +34,7 @@ start_sniffer SNIFF "${NODE_B_PEER_HOST}" "${NODE_B_PEER_PORT}" \
 	--timeout "$((MATRIX_WAIT_SECONDS + SNIFF_WAIT_SECONDS))" --expect-text "${MARKER}"
 trap 'stop_sniffer "${SNIFF_PID}" "${SNIFF}"' EXIT
 
-SC_LOG "[$SCENARIO] injecting AlphaLab radio text from peer node: $MARKER"
+SC_LOG "[${SCENARIO}] injecting AlphaLab radio text from peer node: ${MARKER}"
 capture RADIO_OUT lib_py radio.py send-text "${NODE_A_PEER_HOST}" "${NODE_A_PEER_PORT}" "${MARKER}"
 if ((SC_STATUS != 0)); then
 	SC_FAIL "radio injection on node A's peer failed" "${RADIO_OUT}"
@@ -59,17 +59,17 @@ SCHEMA_VERSION="$(jq_get "${EVENT_JSON}" event.content.medre.envelope.schema_ver
 EVIDENCE=$(printf 'event_id=%s\nsource_adapter=%s schema_version=%s\nsource_transport_id=%s source_native_ref.native_message_id=%s' \
 	"${EVENT_ID}" "${SOURCE_ADAPTER}" "${SCHEMA_VERSION}" "${SOURCE_TRANSPORT}" "${NATIVE_REF_MSG}")
 
-[[ "${SOURCE_ADAPTER}" == "mmrelay.meshtastic" ]] ||
+[[ ${SOURCE_ADAPTER} == "mmrelay.meshtastic" ]] ||
 	SC_FAIL "envelope source_adapter mismatch" "${EVIDENCE}"
-[[ "${SCHEMA_VERSION}" == "1" ]] ||
+[[ ${SCHEMA_VERSION} == "1" ]] ||
 	SC_FAIL "envelope schema_version must be the integer 1" "${EVIDENCE}"
-[[ "${SOURCE_TRANSPORT}" == \!* ]] ||
+[[ ${SOURCE_TRANSPORT} == \!* ]] ||
 	SC_FAIL "envelope source_transport_id must be a native node id" "${EVIDENCE}"
-[[ -n "${NATIVE_REF_MSG}" && "${NATIVE_REF_MSG}" != "null" ]] ||
+[[ -n ${NATIVE_REF_MSG} && ${NATIVE_REF_MSG} != "null" ]] ||
 	SC_FAIL "envelope source_native_ref.native_message_id missing" "${EVIDENCE}"
 
 BODY_HAS_MARKER=$(jq_get "${EVENT_JSON}" 'event.content.body' | grep -c "${MARKER}" || true)
-[[ "${BODY_HAS_MARKER}" -ge 1 ]] ||
+[[ ${BODY_HAS_MARKER} -ge 1 ]] ||
 	SC_FAIL "authored body not carried verbatim in the room event" "${EVENT_JSON}"
 SC_PASS "canonical envelope v1 present on the Matrix event" "${EVIDENCE}"
 
@@ -89,9 +89,9 @@ if ((SC_STATUS != 0)); then
 	SC_FAIL "relay B map has no row for the AlphaLab-origin event (Beta radio never received the authored body)" "${MAP_JSON}"
 fi
 MAP_TEXT_HAS=$(printf '%s' "${MAP_JSON}" | grep -c "${MARKER}" || true)
-[[ "${MAP_TEXT_HAS}" -ge 1 ]] ||
+[[ ${MAP_TEXT_HAS} -ge 1 ]] ||
 	SC_FAIL "relay B map row text does not carry the authored marker" "${MAP_JSON}"
 SC_PASS "Beta's radio bridge state written (relay B map row)" \
 	"db=${MAP_DB_B} event_id=${EVENT_ID} rows=${MAP_JSON}"
 
-SC_LOG "[$SCENARIO] complete"
+SC_LOG "[${SCENARIO}] complete"

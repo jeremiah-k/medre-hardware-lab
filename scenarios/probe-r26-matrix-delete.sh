@@ -62,7 +62,7 @@ capture out lib_py mx_user.py send "${HUMAN_ALICE_LOCALPART}" "${ROOM_ID}" "${SE
 SEED_EVENT="$(jq_get "${out}" event_id | tr -d '"')"
 
 PACKET_C="$(medre_outbound_packet "${SEED_EVENT}")"
-[[ -n "${PACKET_C}" ]] || SC_FAIL "medre did not re-air the seed onto MeshC (probe precondition)" \
+[[ -n ${PACKET_C} ]] || SC_FAIL "medre did not re-air the seed onto MeshC (probe precondition)" \
 	"seed_event=${SEED_EVENT} db=${MEDRE_NORMAL_DB}"
 SC_PASS "seed bridged end to end (probe precondition)" \
 	"seed_event=${SEED_EVENT} medre_packet=${PACKET_C}"
@@ -129,7 +129,7 @@ except Exception:
     rows = []
 print(len(rows) if isinstance(rows, list) else 0)
 ')"
-[[ "${medre_room_events}" == "0" ]] ||
+[[ ${medre_room_events} == "0" ]] ||
 	SC_FAIL "medre authored room events after the redaction (malformed mutation echo)" \
 		"scan since=${SINCE_REDACT}: ${room_scan}"
 SC_PASS "room clean: no medre-authored events after the redaction (no native mutation echo)" \
@@ -156,7 +156,7 @@ for line in sys.stdin:
         leaks.append(view)
 print(json.dumps(leaks))
 ' "${PACKET_C}")"
-[[ "${leak}" == "[]" ]] ||
+[[ ${leak} == "[]" ]] ||
 	SC_FAIL "the matrix redaction aired on MeshC (radio declares deletes unsupported: designed skip violated)" \
 		"non-precondition matches: ${leak}"
 SC_PASS "MeshC radio silent across the redaction window (designed capability skip, absence proven with armed sniffer)" \

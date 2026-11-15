@@ -75,7 +75,7 @@ WINDOW=$((MATRIX_WAIT_SECONDS + SNIFF_WAIT_SECONDS + 60))
 capture info_out medre_lib_py medre_radio.py info "${NODE_A_PEER_HOST}" "${NODE_A_PEER_PORT}"
 ((SC_STATUS == 0)) || SC_FAIL "cannot read peer node identity" "${info_out}"
 PEER_NODE_NUM="$(jq_get "${info_out}" my_node_num)"
-[[ "${PEER_NODE_NUM}" =~ ^[0-9]+$ ]] ||
+[[ ${PEER_NODE_NUM} =~ ^[0-9]+$ ]] ||
 	SC_FAIL "peer node identity unusable" "${info_out}"
 
 # --- Act: inject the radio text (no collector armed yet), then arm ------------
@@ -158,7 +158,7 @@ SC_LOG "[${SCENARIO}] marker row snapshot (pre-settle): ${BEFORE_COUNTS}"
 sleep "${SETTLE_SECONDS}"
 sleep "${SETTLE_SECONDS}"
 AFTER_COUNTS="$(marker_counts)"
-[[ "${BEFORE_COUNTS}" == "${AFTER_COUNTS}" ]] ||
+[[ ${BEFORE_COUNTS} == "${AFTER_COUNTS}" ]] ||
 	SC_FAIL "map growth storm: marker-referencing rows grew after settle" \
 		"before: ${BEFORE_COUNTS}" $'\n'"after: ${AFTER_COUNTS}" $'\n'"a re-bridge cascade keeps writing rows"
 SC_PASS "no map growth storm across the settle window" \
@@ -176,11 +176,12 @@ queue_state() { # LOG CONTAINER -> JSON
 		cutoff="$(docker inspect --format '{{.State.StartedAt}}' "${container}" 2>/dev/null |
 			cut -c1-19 | tr 'T' ' ')"
 		if [[ -n ${cutoff} ]]; then
-			out="$( { tools_exec awk -v cutoff="${cutoff}" '$1 " " $2 >= cutoff' "${log}" 2>/dev/null || true; } |
+			# shellcheck disable=SC2016 # Child-language syntax or named output, not a host-shell read.
+			out="$({ tools_exec awk -v cutoff="${cutoff}" '$1 " " $2 >= cutoff' "${log}" 2>/dev/null || true; } |
 				{ tools_exec grep "Queued message (" 2>/dev/null || true; } |
 				medre_lib_py normal_checks.py queue-parse)"
 		else
-			out="$( { tools_exec grep "Queued message (" "${log}" 2>/dev/null || true; } |
+			out="$({ tools_exec grep "Queued message (" "${log}" 2>/dev/null || true; } |
 				medre_lib_py normal_checks.py queue-parse)"
 		fi
 	else

@@ -75,7 +75,7 @@ run_variant() {
 	capture radio_out lib_py radio.py "${radio_args[@]}"
 	((SC_STATUS == 0)) || SC_FAIL "[${variant}] radio injection failed" "${radio_out}"
 	packet_id="$(jq_get "${radio_out}" packet_id | tr -d '"')"
-	[[ "${packet_id}" =~ ^[0-9]+$ ]] ||
+	[[ ${packet_id} =~ ^[0-9]+$ ]] ||
 		SC_FAIL "[${variant}] radio injection did not report a packet id" "${radio_out}"
 	SC_PASS "[${variant}] radio text injected on channel ${expected_channel}" \
 		"packet_id=${packet_id} marker=${marker}"
@@ -110,10 +110,10 @@ run_variant() {
 	medre_sender="$(jq_get "${medre_json}" event.content.medre.metadata.bridge_context.source.sender_id | tr -d '"')"
 	# A missing sender attribution makes the parity claim VACUOUS: hard-fail
 	# on it (same discipline as normal-parity), never skip silently.
-	[[ -n "${relay_sender}" && "${relay_sender}" != "null" ]] ||
+	[[ -n ${relay_sender} && ${relay_sender} != "null" ]] ||
 		SC_FAIL "[${variant}] @relay-a envelope carries no sender attribution (the parity claim is vacuous without it)" \
 			"${relay_json}"
-	[[ "${relay_sender}" == "${medre_sender}" ]] ||
+	[[ ${relay_sender} == "${medre_sender}" ]] ||
 		SC_FAIL "[${variant}] sender attribution disagreement (native node id)" \
 			"relay_a=${relay_sender}" $'\n'"medre=${medre_sender}" $'\n'"packet=${packet_id} events=${relay_event_id}/${medre_event_id}"
 	SC_PASS "[${variant}] sender attribution agrees on the native node id" \
@@ -121,9 +121,9 @@ run_variant() {
 
 	relay_name="$(jq_get "${relay_json}" event.content.medre.metadata.bridge_context.source.sender_name | tr -d '"')"
 	medre_name="$(jq_get "${medre_json}" event.content.medre.metadata.bridge_context.source.sender_name | tr -d '"')"
-	if [[ -n "${relay_name}" && "${relay_name}" != "null" \
-		&& -n "${medre_name}" && "${medre_name}" != "null" ]]; then
-		[[ "${relay_name}" == "${medre_name}" ]] ||
+	if [[ -n ${relay_name} && ${relay_name} != "null" &&
+		-n ${medre_name} && ${medre_name} != "null" ]]; then
+		[[ ${relay_name} == "${medre_name}" ]] ||
 			SC_FAIL "[${variant}] sender_name disagreement (node-db attribution)" \
 				"relay_a=${relay_name} medre=${medre_name} events=${relay_event_id}/${medre_event_id}"
 		SC_PASS "[${variant}] sender_name (longname attribution) agrees" "sender_name=${relay_name}"
@@ -134,7 +134,7 @@ run_variant() {
 	# --- Same authored text, once per rendering ---------------------------------
 	for ev in "${relay_json}" "${medre_json}"; do
 		count="$(body_count "${ev}" event.content.body "${marker}")"
-		[[ "${count}" == "1" ]] ||
+		[[ ${count} == "1" ]] ||
 			SC_FAIL "[${variant}] authored text not carried exactly once in the body" \
 				"occurrences=${count} event_json=${ev}"
 	done

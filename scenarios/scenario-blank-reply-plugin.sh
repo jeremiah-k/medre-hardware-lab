@@ -98,9 +98,11 @@ else
 	evidence_b="${obs_b}"
 fi
 echo "DIAGNOSTIC (owner-accepted behavior, 2026-11-10): relay A blank-reply gate: ${gate_a}"
+# shellcheck disable=SC2119 # SC_EVIDENCE intentionally consumes stdin.
 printf '%s\n' "${evidence_a}" | SC_EVIDENCE
 echo "DIAGNOSTIC (owner-accepted behavior, 2026-11-10): relay B blank-reply gate: ${gate_b}"
+# shellcheck disable=SC2119 # SC_EVIDENCE intentionally consumes stdin.
 printf '%s\n' "${evidence_b}" | SC_EVIDENCE
 SC_PASS "blank-reply routing reported (radio-side guarantee held; see DIAGNOSTIC lines above for the gate each relay used)"
 
-SC_LOG "[$SCENARIO] complete"
+SC_LOG "[${SCENARIO}] complete"

@@ -63,7 +63,8 @@ run_reaction() {
 	fi
 
 	# --- Act 2: radio tapback from the BETA PEER -------------------------------
-	local since_react; since_react="$(date +%s%3N)"
+	local since_react
+	since_react="$(date +%s%3N)"
 	capture out lib_py radio.py send-reaction "${NODE_B_PEER_HOST}" "${NODE_B_PEER_PORT}" "${key}" "${target_packet}"
 	((SC_STATUS == 0)) || SC_FAIL "[${variant}] tapback injection failed" "${out}"
 
@@ -79,8 +80,9 @@ run_reaction() {
 	((SC_STATUS == 0)) ||
 		SC_FAIL "[${variant}] no reacted event carrying the exact key ${key} and target packet ${target_packet}" "${react_json}"
 	react_id="$(jq_get "${react_json}" event.event_id | tr -d '"')"
-	local msgtype; msgtype="$(jq_get "${react_json}" event.content.msgtype | tr -d '"')"
-	[[ "${msgtype}" == "m.emote" ]] ||
+	local msgtype
+	msgtype="$(jq_get "${react_json}" event.content.msgtype | tr -d '"')"
+	[[ ${msgtype} == "m.emote" ]] ||
 		SC_FAIL "[${variant}] radio reaction must render as the m.emote fallback" "${react_json}"
 	SC_PASS "[${variant}] exact reaction key relayed with radio-native target" \
 		"key=${key} target_packet=${target_packet} event=${react_id}" $'\n'"${react_json}"
@@ -92,4 +94,4 @@ run_reaction "emoji" "🦄" "" ""
 # --- Case 2: symbol with skin-tone modifier (byte-exact key requirement) -------
 run_reaction "modifier" "👍🏽" "" ""
 
-SC_LOG "[$SCENARIO] complete"
+SC_LOG "[${SCENARIO}] complete"

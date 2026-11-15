@@ -239,8 +239,12 @@ def _validate_native_ref(
                 f" the delivery destination hash ({source_channel!r})"
             )
         thread = ref.get("native_thread_id")
-        if thread is not None and not _bounded_str(thread, contract["max_bridge_string"]):
-            violations.append(f"{label}.native_thread_id: must be a bounded string or null")
+        if thread is not None and not _bounded_str(
+            thread, contract["max_bridge_string"]
+        ):
+            violations.append(
+                f"{label}.native_thread_id: must be a bounded string or null"
+            )
         return
     if is_matrix_target:
         if not (isinstance(channel, str) and channel.startswith("!")):
@@ -265,7 +269,9 @@ def _validate_native_ref(
                 f" ({source_channel!r}): every native ref on one event carries"
                 " the SAME numeric channel id"
             )
-    elif channel is not None and not _bounded_str(channel, contract["max_bridge_string"]):
+    elif channel is not None and not _bounded_str(
+        channel, contract["max_bridge_string"]
+    ):
         violations.append(f"{label}.native_channel_id: must be a bounded string")
     if (
         require_numeric_channel
@@ -352,7 +358,9 @@ def _validate_native_facts(
                 f"native_facts.fields.{key}: only bounded strings, booleans and"
                 " integers may cross the transport boundary"
             )
-    if meshnet_label is not None and not _bounded_str(meshnet_label, contract["max_fact_value"]):
+    if meshnet_label is not None and not _bounded_str(
+        meshnet_label, contract["max_fact_value"]
+    ):
         violations.append(
             "native_facts.fields.meshnet_label: must be a non-empty bounded string"
         )
@@ -371,9 +379,7 @@ def _validate_source_attribution(
             f"bridge_context.source.sender_id ({sender_id!r}): sender"
             " attribution requires a non-empty bounded sender id"
         )
-    labels = [
-        name for name in contract["attribution"]["any_of"] if source.get(name)
-    ]
+    labels = [name for name in contract["attribution"]["any_of"] if source.get(name)]
     if not labels:
         violations.append(
             "bridge_context.source: at least one of "
@@ -381,9 +387,7 @@ def _validate_source_attribution(
         )
     for name in ("sender_name", "sender_short_name", "sender_verification", "platform"):
         value = source.get(name)
-        if value is not None and not _bounded_str(
-            value, contract["max_bridge_string"]
-        ):
+        if value is not None and not _bounded_str(value, contract["max_bridge_string"]):
             violations.append(
                 f"bridge_context.source.{name}: must be a bounded string or null"
             )
@@ -423,8 +427,10 @@ def validate_event(
     medre = content.get("medre")
     if not isinstance(medre, dict):
         return (
-            ["content.medre: missing - the corpus only judges canonical"
-             " bridge emissions carrying the medre envelope"],
+            [
+                "content.medre: missing - the corpus only judges canonical"
+                " bridge emissions carrying the medre envelope"
+            ],
             None,
         )
     envelope = medre.get("envelope")
@@ -435,18 +441,29 @@ def validate_event(
             violations.append(f"envelope.{key}: required key missing")
 
     schema_version = envelope.get("schema_version")
-    if not _is_int(schema_version) or schema_version != contract["envelope_schema_version"]:
+    if (
+        not _is_int(schema_version)
+        or schema_version != contract["envelope_schema_version"]
+    ):
         violations.append(
             f"envelope.schema_version ({schema_version!r}): must be the integer"
             f" {contract['envelope_schema_version']} (booleans are not integers)"
         )
 
     canonical_event_id = envelope.get("canonical_event_id")
-    if not _bounded_str(canonical_event_id, contract["max_bridge_string"]) or not canonical_event_id:
-        violations.append("envelope.canonical_event_id: must be a non-empty bounded string")
+    if (
+        not _bounded_str(canonical_event_id, contract["max_bridge_string"])
+        or not canonical_event_id
+    ):
+        violations.append(
+            "envelope.canonical_event_id: must be a non-empty bounded string"
+        )
 
     source_adapter = envelope.get("source_adapter")
-    if not _bounded_str(source_adapter, contract["max_bridge_string"]) or not source_adapter:
+    if (
+        not _bounded_str(source_adapter, contract["max_bridge_string"])
+        or not source_adapter
+    ):
         violations.append("envelope.source_adapter: must be a non-empty bounded string")
     # Adapter ids are OPERATOR-CONFIGURED (mmrelay.meshtastic vs medre's
     # radio-a/radio-b), so no name suffix is enforced; the radio-origin class
@@ -454,7 +471,10 @@ def validate_event(
     # adapter's room-id channels and $event ids cannot satisfy them).
 
     source_transport_id = envelope.get("source_transport_id")
-    if not _bounded_str(source_transport_id, contract["max_bridge_string"]) or not source_transport_id:
+    if (
+        not _bounded_str(source_transport_id, contract["max_bridge_string"])
+        or not source_transport_id
+    ):
         violations.append(
             "envelope.source_transport_id: must be a non-empty bounded"
             " transport identity (native node id)"
@@ -604,17 +624,19 @@ def validate_event(
                         " non-empty relation key"
                     )
                 if kind == "reply" and key is not None:
-                    violations.append(
-                        f"relations[{index}]: reply hints carry no key"
-                    )
+                    violations.append(f"relations[{index}]: reply hints carry no key")
                 _validate_native_ref(
                     hint.get("target_native_ref"),
                     label=f"relations[{index}].target_native_ref",
                     violations=violations,
                     contract=contract,
                     require_numeric_channel=True,
-                    source_channel=source_channel if isinstance(source_channel, str) else None,
-                    radio_adapter=source_adapter if isinstance(source_adapter, str) else None,
+                    source_channel=(
+                        source_channel if isinstance(source_channel, str) else None
+                    ),
+                    radio_adapter=(
+                        source_adapter if isinstance(source_adapter, str) else None
+                    ),
                     addressed=addressed,
                     allow_matrix_target=True,
                 )
@@ -622,7 +644,13 @@ def validate_event(
 
             # Coherence: relation_info <-> hints, kind <-> event_kind, and the
             # one-relation bound both bridges enforce on radio peer events.
-            hint_kinds = sorted({h["relation_type"] for h in hints if isinstance(h, dict) and h.get("relation_type")})
+            hint_kinds = sorted(
+                {
+                    h["relation_type"]
+                    for h in hints
+                    if isinstance(h, dict) and h.get("relation_type")
+                }
+            )
             if relation_info != ",".join(hint_kinds):
                 violations.append(
                     f"envelope.relation_info ({relation_info!r}) != sorted hint"
@@ -727,9 +755,7 @@ def validate_event(
     # wire keys are never emitted on outbound events (all radio facts travel
     # inside content.medre.metadata.bridge_context.source.native_facts).
     flat_fields = sorted(
-        key
-        for key in content
-        if isinstance(key, str) and key.startswith("meshtastic_")
+        key for key in content if isinstance(key, str) and key.startswith("meshtastic_")
     )
     if flat_fields:
         violations.append(
@@ -742,7 +768,11 @@ def validate_event(
         leaks = []
         if "TEXT_MESSAGE_APP" in body:
             leaks.append("TEXT_MESSAGE_APP")
-        if isinstance(transport_id, str) and transport_id.startswith("!") and transport_id in body:
+        if (
+            isinstance(transport_id, str)
+            and transport_id.startswith("!")
+            and transport_id in body
+        ):
             leaks.append(f"transport id {transport_id}")
         if (
             isinstance(packet_id, str)
@@ -751,9 +781,7 @@ def validate_event(
         ):
             leaks.append(f"packet id {packet_id}")
         if leaks:
-            violations.append(
-                "content.body leaks internal fields: " + ", ".join(leaks)
-            )
+            violations.append("content.body leaks internal fields: " + ", ".join(leaks))
 
     # --- corpus coverage ------------------------------------------------------
     matched_case = None
@@ -764,7 +792,10 @@ def validate_event(
                 continue
             if match.get("relation_info") != relation_info:
                 continue
-            if match.get("channel") is not None and match.get("channel") != source_channel:
+            if (
+                match.get("channel") is not None
+                and match.get("channel") != source_channel
+            ):
                 continue
             wanted_class = match.get("channel_class")
             if wanted_class == "addressed" and not addressed:
@@ -776,9 +807,7 @@ def validate_event(
                 if not hints:
                     actual = "none"
                 elif str(
-                    (hints[0].get("target_native_ref") or {}).get(
-                        "native_message_id"
-                    )
+                    (hints[0].get("target_native_ref") or {}).get("native_message_id")
                     or ""
                 ).startswith("$"):
                     actual = "matrix"
@@ -1004,9 +1033,7 @@ def _mutate(event: dict[str, Any], mutation: str) -> dict[str, Any]:
         # The honest-degradation defect class (renderer 614372e): an
         # unresolvable-target described reaction quoting an EMPTY string
         # instead of the honest wording.
-        mutated["body"] = mutated["body"].replace(
-            "to an earlier message", 'to ""'
-        )
+        mutated["body"] = mutated["body"].replace("to an earlier message", 'to ""')
     elif mutation == "reaction-flat-meshtastic-field":
         mutated["meshtastic_portnum"] = 1
     elif mutation == "leading-newline-body":
@@ -1030,7 +1057,9 @@ def _mutate(event: dict[str, Any], mutation: str) -> dict[str, Any]:
     elif mutation == "relation-info-incoherent":
         envelope["relation_info"] = "reply"
         envelope["event_kind"] = "message.created"
-        medre["metadata"]["bridge_context"]["relations"][0]["relation_type"] = "reaction"
+        medre["metadata"]["bridge_context"]["relations"][0][
+            "relation_type"
+        ] = "reaction"
     elif mutation == "no-native-facts":
         source.pop("native_facts")
     elif mutation == "two-relations":

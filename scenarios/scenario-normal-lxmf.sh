@@ -60,14 +60,14 @@ resolve_bridge_rooms
 SCENARIO="normal-lxmf"
 ROOM_ID="${ROOM_BRIDGE_CH0_ID}"
 
-if [[ "${MEDRE_NORMAL_LXMF}" != "1" && -z "${LXMF_PEER_DESTINATION_HASH:-}" ]]; then
+if [[ ${MEDRE_NORMAL_LXMF} != "1" && -z ${LXMF_PEER_DESTINATION_HASH:-} ]]; then
 	SC_SKIP "lxmf leg not published by the rig (no MEDRE_NORMAL_LXMF=1 and no LXMF_PEER_DESTINATION_HASH)" \
 		"REQUIREMENT FOR THE RIG: publish the lxmf counterpart surfaces in lab/state/scenario.env (LXMF_PEER_DESTINATION_HASH + LXMF_PEER_IDENTITY, plus the counterpart driver volumes) once the medre-normal LXMF loopback adapter is live"
 fi
 SC_LOG "lxmf leg live (adapter=${MEDRE_NORMAL_LXMF_ADAPTER} peer_dest=${LXMF_PEER_DESTINATION_HASH:-unpublished})"
 
 ALICE_TOKEN="$(lib_py mx_user.py token "${HUMAN_ALICE_LOCALPART}" | tr -d '"')"
-[[ -n "${ALICE_TOKEN}" && "${ALICE_TOKEN}" != "null" ]] ||
+[[ -n ${ALICE_TOKEN} && ${ALICE_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_ALICE_LOCALPART}" \
 		"the rig must provision @alice and publish LAB_TOKEN_ALICE (scenarios/README.md)"
 
@@ -84,10 +84,10 @@ lxmf_originate() {
 		--reticulum-config "${LXMF_COUNTERPART_RNS_CONFIG:-/data-lxmf/reticulum-peer}"
 		--storage "${LXMF_COUNTERPART_STORAGE:-/data-lxmf/peer-router}"
 		--display-name lab-counterpart)
-	if [[ -n "${MEDRE_NORMAL_LXMF_ORIGINATE:-}" ]]; then
+	if [[ -n ${MEDRE_NORMAL_LXMF_ORIGINATE:-} ]]; then
 		tools_exec bash -c "${MEDRE_NORMAL_LXMF_ORIGINATE}" lxmf-originate "${tx_marker}" >"${log_path}" 2>&1 &
 	else
-		if [[ -n "${rx_marker}" ]]; then
+		if [[ -n ${rx_marker} ]]; then
 			cmd+=(--expect-text "${rx_marker}")
 		fi
 		cmd+=(--send-text "${tx_marker}" --timeout "${timeout}")
@@ -141,19 +141,19 @@ print(json.dumps({
 ")"
 adapter="$(jq_get "${lxmf_event_json}" source_adapter | tr -d '"')"
 sender_id="$(jq_get "${lxmf_event_json}" sender_id | tr -d '"')"
-if [[ "${adapter}" != "${MEDRE_NORMAL_LXMF_ADAPTER}" ]]; then
+if [[ ${adapter} != "${MEDRE_NORMAL_LXMF_ADAPTER}" ]]; then
 	SC_FAIL "the originated marker matched a NON-lxmf canonical event (adapter=${adapter:-none})" \
 		"the lxmf0 origin must surface as source_adapter=${MEDRE_NORMAL_LXMF_ADAPTER}; a non-lxmf attribution on the originated marker contradicts the no-laundering promise in this scenario's header" $'\n'"matched event: ${lxmf_event_json}"
 fi
 
 medre_assert_valid "${lxmf_event_json}" "lxmf-origin canonical event"
 ORIGIN_EVENT_ID="$(jq_get "${lxmf_event_json}" origin_event_id | tr -d '"')"
-[[ -n "${sender_id}" && "${sender_id}" != "null" ]] ||
+[[ -n ${sender_id} && ${sender_id} != "null" ]] ||
 	SC_FAIL "lxmf-origin event carries no sender attribution" "${lxmf_event_json}"
 SC_PASS "lxmf-origin message reached the room with attribution and bounded native facts" \
 	"event=${ORIGIN_EVENT_ID} source_adapter=${adapter} sender_id=${sender_id}"
 
-wait "$LXMF_PID" 2>/dev/null || true
+wait "${LXMF_PID}" 2>/dev/null || true
 ORIGIN_RESULT="$(lxmf_result "${LOG_ORIGIN}")"
 SC_LOG "counterpart origin result: ${ORIGIN_RESULT:-none}"
 
@@ -161,7 +161,7 @@ SC_LOG "counterpart origin result: ${ORIGIN_RESULT:-none}"
 # Re-air: the lxmf-origin room text re-airs once per mmrelay mesh.
 # ---------------------------------------------------------------------------
 for far_name in A B; do
-	if [[ "${far_name}" == "A" ]]; then
+	if [[ ${far_name} == "A" ]]; then
 		map_db="${MAP_DB_A}"
 	else
 		map_db="${MAP_DB_B}"
@@ -172,7 +172,7 @@ for far_name in A B; do
 import json, sys
 rows = json.load(sys.stdin)["rows"]
 print(len(rows))')"
-		[[ "${count}" == "1" ]] ||
+		[[ ${count} == "1" ]] ||
 			SC_FAIL "lxmf-origin text re-aired ${count}x on Mesh${far_name} (expected exactly once)" "${rows}"
 		SC_PASS "lxmf-origin text re-aired once on Mesh${far_name}" \
 			"db=${map_db} origin_event=${ORIGIN_EVENT_ID} rows=$(printf '%s' "${rows}" | tools_exec python3 -c '
