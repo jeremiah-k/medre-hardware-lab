@@ -2,7 +2,18 @@
 # The serial API is owned by mmrelay-a; keep its independent RF peer unmounted.
 services:
   mmrelay-a:
-    command: ["python", "-m", "mmrelay.cli", "--config", "/config/mmrelay-physical.yaml", "--home", "/data", "--log-level", "debug"]
+    command:
+      [
+        "python",
+        "-m",
+        "mmrelay.cli",
+        "--config",
+        "/config/mmrelay-physical.yaml",
+        "--home",
+        "/data",
+        "--log-level",
+        "debug",
+      ]
     devices:
       - "${LAB_RADIO_SERIAL:?set the owned stable serial path}:/dev/medre-radio"
     group_add:

@@ -88,10 +88,10 @@ resolve_bridge_rooms
 SCENARIO="normal-reactions"
 ALICE_TOKEN="$(lib_py mx_user.py token "${HUMAN_ALICE_LOCALPART}" | tr -d '"')"
 BOB_TOKEN="$(lib_py mx_user.py token "${HUMAN_BOB_LOCALPART}" | tr -d '"')"
-[[ -n "${ALICE_TOKEN}" && "${ALICE_TOKEN}" != "null" ]] ||
+[[ -n ${ALICE_TOKEN} && ${ALICE_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_ALICE_LOCALPART}" \
 		"the rig must provision @alice and publish LAB_TOKEN_ALICE (scenarios/README.md)"
-[[ -n "${BOB_TOKEN}" && "${BOB_TOKEN}" != "null" ]] ||
+[[ -n ${BOB_TOKEN} && ${BOB_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_BOB_LOCALPART}" \
 		"the rig must provision @bob and publish LAB_TOKEN_BOB (scenarios/README.md)"
 
@@ -114,6 +114,7 @@ record_fail() {
 	FAILED_LEGS+=("${label}")
 	echo "FAIL: ${label}" >&2
 	if (($# > 0)); then
+		# shellcheck disable=SC2119 # SC_EVIDENCE intentionally consumes stdin.
 		printf '%s\n' "$*" | SC_EVIDENCE >&2
 	fi
 }
@@ -254,7 +255,7 @@ print(json.dumps({'problems': problems, 'msgtype': content.get('msgtype'), 'body
 	else
 		match_line=""
 	fi
-	if [[ -z "${match_line}" ]]; then
+	if [[ -z ${match_line} ]]; then
 		sniff_poison="no drop signature; check relay-a logs for the confirmed send"
 		if grep -q "Dropped.*queued packet" "${SNIFF}"; then
 			sniff_poison="SNIFFER WINDOW POISONED: the peer's API connection was evicted mid-window (a second client connected - one-client-per-node violated by concurrent tooling) and the transport dropped queued packets; rerun the scenario"

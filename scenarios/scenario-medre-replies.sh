@@ -50,7 +50,7 @@ resolve_rooms
 
 SCENARIO="medre-replies"
 ALICE_TOKEN="$(lib_py mx_user.py token "${HUMAN_ALICE_LOCALPART}" | tr -d '"')"
-[[ -n "${ALICE_TOKEN}" && "${ALICE_TOKEN}" != "null" ]] ||
+[[ -n ${ALICE_TOKEN} && ${ALICE_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_ALICE_LOCALPART}" \
 		"the rig must provision @alice and publish LAB_TOKEN_ALICE (scenarios/README.md)"
 
@@ -143,7 +143,7 @@ import json, sys
 data = json.load(sys.stdin)
 print(data.get('count', -1))
 ")"
-[[ "${echo_count}" == "0" ]] ||
+[[ ${echo_count} == "0" ]] ||
 	SC_FAIL "(a) radio echo detected on Alpha: a bridge re-emitted the reply text" \
 		"collector: ${COLLECT_RESULT}" $'\n'"medre_event=${MEDRE_REPLY_EVENT_A}"
 SC_PASS "(a) no radio echo on Alpha for the medre peer copy (collector window clean)" \
@@ -206,7 +206,7 @@ if wait_until "$((MATRIX_WAIT_SECONDS + SNIFF_WAIT_SECONDS))" grep -q '"match"' 
 else
 	MATCH_LINE=""
 fi
-[[ -n "${MATCH_LINE}" ]] ||
+[[ -n ${MATCH_LINE} ]] ||
 	SC_FAIL "(b) medre did not transmit a structured radio reply for the human Matrix reply" \
 		"sniffer log: $(cat "${SNIFF}")" $'\n'"human_reply_event=${HUMAN_REPLY_EVENT_B} expected_target=${PACKET_B}"
 

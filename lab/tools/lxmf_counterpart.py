@@ -193,10 +193,12 @@ def main() -> int:
 
     print(
         READY_PREFIX
-        + json.dumps({
-            "own_destination_hash": own_hash.hex(),
-            "at": utcnow(),
-        }),
+        + json.dumps(
+            {
+                "own_destination_hash": own_hash.hex(),
+                "at": utcnow(),
+            }
+        ),
         flush=True,
     )
 
@@ -208,9 +210,7 @@ def main() -> int:
         result["medre_announce_seen"] = True
         result["medre_announces"] = collector.announces
         # The medre peer is whichever announced destination is not our own.
-        peer_hash = next(
-            (h for h in collector.announces if h != own_hash.hex()), None
-        )
+        peer_hash = next((h for h in collector.announces if h != own_hash.hex()), None)
         result["medre_destination_hash"] = peer_hash
     else:
         result["errors"].append("no lxmf.delivery announce seen before deadline")
@@ -241,11 +241,16 @@ def main() -> int:
                 result["errors"].append("medre identity not recalled from announce")
             else:
                 dest = RNS.Destination(
-                    peer_identity, RNS.Destination.OUT,
-                    RNS.Destination.SINGLE, APP_NAME, ASPECT,
+                    peer_identity,
+                    RNS.Destination.OUT,
+                    RNS.Destination.SINGLE,
+                    APP_NAME,
+                    ASPECT,
                 )
                 lxmsg = LXMF.LXMessage(
-                    dest, delivery_destination, args.send_text,
+                    dest,
+                    delivery_destination,
+                    args.send_text,
                     title="interop-lab counterpart",
                     desired_method=LXMF.LXMessage.OPPORTUNISTIC,
                 )

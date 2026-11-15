@@ -37,10 +37,10 @@ for arg in "$@"; do
 	esac
 done
 
-	if ((WITH_MEDRE)) && ((WITH_NORMAL)); then
-		echo "ERROR: --with-medre and --normal are mutually exclusive" >&2
-		exit 2
-	fi
+if ((WITH_MEDRE)) && ((WITH_NORMAL)); then
+	echo "ERROR: --with-medre and --normal are mutually exclusive" >&2
+	exit 2
+fi
 
 EXPECTED_BRANCH=""
 MMRELAY_SRC="${MMRELAY_SRC:-${LAB_ROOT}/sources/mmrelay}"
@@ -49,7 +49,10 @@ TS="$(date +%Y%m%d-%H%M%S)"
 LOG_DIR="lab/logs"
 
 log() { printf '\n=== %s ===\n' "$*"; }
-die() { echo "ERROR: $*" >&2; exit 1; }
+die() {
+	echo "ERROR: $*" >&2
+	exit 1
+}
 
 # Topology modes are mutually exclusive: BOTH run a medre instance as
 # @medre:lab.test, and a simultaneous pair would double-book the bot account
@@ -222,7 +225,7 @@ if ((DO_RESET)); then
 fi
 
 # --- Build -------------------------------------------------------------------
-if ((!SKIP_BUILD)); then
+if ((! SKIP_BUILD)); then
 	log "Building images (mmrelay dev + lab-tools)"
 	"${COMPOSE[@]}" build mmrelay-a mmrelay-b lab-tools
 	if ((WITH_MEDRE)); then
@@ -359,6 +362,7 @@ if ! "${COMPOSE[@]}" run --rm --entrypoint sh synapse -c 'test -f /data/homeserv
 	echo "  generated homeserver.yaml"
 fi
 log "Synapse: applying lab overrides (idempotent, version-aware)"
+# shellcheck disable=SC2016 # Child-language syntax or named output, not a host-shell read.
 OVERRIDES_OUT="$("${COMPOSE[@]}" run --rm --entrypoint sh \
 	--volume "${PWD}/lab/config/synapse-overrides.yaml:/overrides.yaml:ro" \
 	synapse -c 'grep -q "interop-lab Synapse overrides v3" /data/homeserver.yaml 2>/dev/null || { sed -i "/# interop-lab Synapse overrides/,\$d" /data/homeserver.yaml; cat /overrides.yaml >> /data/homeserver.yaml; echo "overrides reapplied"; }')"
@@ -811,16 +815,16 @@ fi
 echo "  lab/state/scenario.env written"
 
 # --- Smoke ----------------------------------------------------------------------------
-	if ((!SKIP_SMOKE)); then
-		if ((WITH_NORMAL)); then
-			# The base 2-relay smoke exercises the four per-meshnet room mapping,
-			# which the normal profile deliberately maps NOWHERE — the normal
-			# contract has its own smoke instead.
-			log "Generation-consistency gate (bridge containers must postdate their generated configs)"
-			require_config_fresh medre-lab-mmrelay-a lab/state/config/mmrelay-a.yaml
-			require_config_fresh medre-lab-mmrelay-b lab/state/config/mmrelay-b.yaml
-			require_config_fresh medre-lab-medre-normal lab/state/config/medre-normal.yaml
-			log "Running normal-profile smoke (fan-out x3 meshes, loop-freedom settle, radio->room)"
+if ((! SKIP_SMOKE)); then
+	if ((WITH_NORMAL)); then
+		# The base 2-relay smoke exercises the four per-meshnet room mapping,
+		# which the normal profile deliberately maps NOWHERE — the normal
+		# contract has its own smoke instead.
+		log "Generation-consistency gate (bridge containers must postdate their generated configs)"
+		require_config_fresh medre-lab-mmrelay-a lab/state/config/mmrelay-a.yaml
+		require_config_fresh medre-lab-mmrelay-b lab/state/config/mmrelay-b.yaml
+		require_config_fresh medre-lab-medre-normal lab/state/config/medre-normal.yaml
+		log "Running normal-profile smoke (fan-out x3 meshes, loop-freedom settle, radio->room)"
 		"${COMPOSE[@]}" exec -T lab-tools python /opt/lab-tools/normal_smoke.py
 		log "LXMF counterpart exchange (loopback Reticulum leg, inside medre-normal)"
 		LXMF_LOG="${LOG_DIR}/lxmf-counterpart-${TS}.log"

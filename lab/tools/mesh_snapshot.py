@@ -97,7 +97,11 @@ def main() -> int:
             if host in visibility and visibility[host]:
                 continue
             expected = [node_ids[p] for p in peer_hosts if p in node_ids]
-            seen = [p for p, pid in zip(peer_hosts, expected, strict=False) if pid in node_db_cache.get(host, [])]
+            seen = [
+                p
+                for p, pid in zip(peer_hosts, expected, strict=False)
+                if pid in node_db_cache.get(host, [])
+            ]
             visibility.setdefault(host, seen)
         if all(visibility.get(h) for h in NODE_PEERS) or time.monotonic() > deadline:
             break

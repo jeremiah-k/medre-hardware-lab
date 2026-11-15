@@ -61,7 +61,7 @@ resolve_bridge_rooms
 
 SCENARIO="normal-replies"
 ALICE_TOKEN="$(lib_py mx_user.py token "${HUMAN_ALICE_LOCALPART}" | tr -d '"')"
-[[ -n "${ALICE_TOKEN}" && "${ALICE_TOKEN}" != "null" ]] ||
+[[ -n ${ALICE_TOKEN} && ${ALICE_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_ALICE_LOCALPART}" \
 		"the rig must provision @alice and publish LAB_TOKEN_ALICE (scenarios/README.md)"
 
@@ -161,7 +161,7 @@ PACKET_A="$(printf '%s' "${rows}" | tools_exec python3 -c 'import json,sys; prin
 SC_PASS "(a) relay-a bridged the seed text" "matrix_event=${SEED_EVENT_A} relay_a_packet=${PACKET_A}"
 
 PACKET_C="$(medre_outbound_packet "${SEED_EVENT_A}")"
-if [[ -z "${PACKET_C}" ]]; then
+if [[ -z ${PACKET_C} ]]; then
 	capture _mo_out medre_state_py events-for-native "${MEDRE_NORMAL_DB}" "${SEED_EVENT_A}"
 	SC_FAIL "(a) medre-normal never re-aired the MeshA origin text onto MeshC (no outbound radio ref)" \
 		"db=${MEDRE_NORMAL_DB} origin_event=${SEED_EVENT_A} waited=${RADIO_WAIT_SECONDS}s" $'\n'"state output: ${_mo_out}"
@@ -196,7 +196,7 @@ SC_PASS "(a) medre emitted the replied event for the MeshC radio reply" \
 	"event=${MEDRE_REPLY_EVENT_A} relations=${relation_summary}"
 
 sniff_match MATCH_A "${SNIFF_A}"
-if [[ -z "${MATCH_A}" ]]; then
+if [[ -z ${MATCH_A} ]]; then
 	SC_FAIL "(a) relay-a did not re-bridge the medre replied event onto MeshA as a structured reply targeting the ORIGINAL packet ${PACKET_A}" \
 		"sniffer log: $(cat "${SNIFF_A}")" $'\n'"medre event=${MEDRE_REPLY_EVENT_A} relation surfaces=${relation_summary}" $'\n'"classification hint: a medre event whose hint target is radio-form (medre MeshC adapter) or absent gives relay-a no resolvable target - PRODUCT (cross-implementation correlation); if the medre event carries a Matrix-native target the resolution must go through relay-a's own map"
 fi
@@ -251,7 +251,7 @@ if wait_until "$((MATRIX_WAIT_SECONDS + SNIFF_WAIT_SECONDS))" grep -q '"match"' 
 else
 	MATCH_B=""
 fi
-if [[ -z "${MATCH_B}" ]]; then
+if [[ -z ${MATCH_B} ]]; then
 	capture out medre_state_py events-for-native "${MEDRE_NORMAL_DB}" "${HUMAN_REPLY_EVENT_B}"
 	SC_FAIL "(b) medre did not transmit a structured radio reply on MeshC for the human Matrix reply" \
 		"sniffer log: $(cat "${SNIFF_B}")" $'\n'"human_reply_event=${HUMAN_REPLY_EVENT_B} expected_target=${PACKET_B}" $'\n'"medre state for the reply event: ${out}"
@@ -309,7 +309,7 @@ RELAY_REPLY_EVENT_C="$(jq_get "${reply_json}" event.event_id | tr -d '"')"
 medre_assert_valid "${reply_json}" "(c) relay-a replied event"
 
 sniff_match MATCH_C "${SNIFF_C}"
-[[ -n "${MATCH_C}" ]] ||
+[[ -n ${MATCH_C} ]] ||
 	SC_FAIL "(c) relay-b did not send a structured radio reply on MeshB targeting its own packet ${PACKET_B2}" \
 		"sniffer log: $(cat "${SNIFF_C}")" $'\n'"relay_a_reply_event=${RELAY_REPLY_EVENT_C}"
 assert_reply_capture "${MATCH_C}" "${PACKET_B2}" "${REPLY_C}" "(c) relay-b structured reply"

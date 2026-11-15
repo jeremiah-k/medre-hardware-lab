@@ -44,7 +44,7 @@ capture event_json lib_py mx_events.py wait "${ROOM_BETA_CH0_ID}" \
 	SC_FAIL "unresolved emote was not relayed as an ordinary authored message" "${event_json}"
 EVENT_ID="$(jq_get "${event_json}" event.event_id | tr -d '"')"
 BODY="$(jq_get "${event_json}" event.content.body | tr -d '"')"
-[[ "${#BODY}" -ge "${#MARKER}" ]] ||
+[[ ${#BODY} -ge ${#MARKER} ]] ||
 	SC_FAIL "authored body unexpectedly empty" "${event_json}"
 SC_PASS "unresolved reply relayed as ordinary authored text (no relation, non-empty body)" \
 	"event=${EVENT_ID} body_length=${#BODY}" $'\n'"${event_json}"
@@ -54,4 +54,4 @@ capture out lib_py maps.py rows-for-event "${MAP_DB_A}" "${EVENT_ID}" --wait "${
 ((SC_STATUS == 0)) ||
 	SC_FAIL "relay A did not relay the authored text to AlphaLab (no map row for B's event)" "${out}"
 SC_PASS "authored text bridged onward to the peer mesh" "A_rows=${out}"
-SC_LOG "[$SCENARIO] complete"
+SC_LOG "[${SCENARIO}] complete"

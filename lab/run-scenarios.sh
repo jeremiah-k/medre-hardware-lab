@@ -49,7 +49,7 @@ ALL_SCENARIOS=(
 
 # Scenarios deliberately NOT run (policy decisions recorded with reasons).
 declare -A DEFERRED_SCENARIOS=(
-	[threenode-same-mesh]="DEFERRED by owner (2026-11-10): same-mesh multi-relay loop handling is a later work item; scenario kept in scenarios/deferred/"
+	["threenode-same-mesh"]="DEFERRED by owner (2026-11-10): same-mesh multi-relay loop handling is a later work item; scenario kept in scenarios/deferred/"
 )
 
 if (($# > 0)); then
@@ -61,14 +61,14 @@ fi
 # Normal qualification requires independently recorded full source pins. Missing
 # mounts must fail before a scenario can accidentally use the baked distribution.
 for name in "${SELECTED[@]}"; do
-    if [[ ${name} == normal-* ]]; then
-        if [[ -z ${LAB_SOURCE_MANIFEST:-} ]]; then
-            echo "ERROR: set LAB_SOURCE_MANIFEST to the exact qualification source map" >&2
-            exit 1
-        fi
-        python3 "${LAB_ROOT}/lab/check_source_mounts.py" "${LAB_SOURCE_MANIFEST}" || exit 1
-        break
-    fi
+	if [[ ${name} == normal-* ]]; then
+		if [[ -z ${LAB_SOURCE_MANIFEST:-} ]]; then
+			echo "ERROR: set LAB_SOURCE_MANIFEST to the exact qualification source map" >&2
+			exit 1
+		fi
+		python3 "${LAB_ROOT}/lab/check_source_mounts.py" "${LAB_SOURCE_MANIFEST}" || exit 1
+		break
+	fi
 done
 
 declare -a RESULT_NAMES=()

@@ -43,10 +43,10 @@ SCENARIO="medre-rendering"
 
 ALICE_TOKEN="$(lib_py mx_user.py token "${HUMAN_ALICE_LOCALPART}" | tr -d '"')"
 BOB_TOKEN="$(lib_py mx_user.py token "${HUMAN_BOB_LOCALPART}" | tr -d '"')"
-[[ -n "${ALICE_TOKEN}" && "${ALICE_TOKEN}" != "null" ]] ||
+[[ -n ${ALICE_TOKEN} && ${ALICE_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_ALICE_LOCALPART}" \
 		"the rig must provision @alice and publish LAB_TOKEN_ALICE (scenarios/README.md)"
-[[ -n "${BOB_TOKEN}" && "${BOB_TOKEN}" != "null" ]] ||
+[[ -n ${BOB_TOKEN} && ${BOB_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_BOB_LOCALPART}" \
 		"the rig must provision @bob and publish LAB_TOKEN_BOB (scenarios/README.md)"
 
@@ -80,7 +80,7 @@ if not body:
     problems.append('body missing')
 print('|'.join(problems))
 " "event.content.body" "${marker}" "$@")"
-	[[ -z "${findings}" ]] ||
+	[[ -z ${findings} ]] ||
 		SC_FAIL "${label}: body rendering violations" "${findings}" $'\n'"event: ${event_json}"
 }
 
@@ -112,7 +112,7 @@ payload = json.load(sys.stdin)
 body = payload.get('event', {}).get('content', {}).get('formatted_body') or ''
 print(body.count(sys.argv[1]))
 " "${marker}")"
-		[[ "${count}" -ge 1 ]] ||
+		[[ ${count} -ge 1 ]] ||
 			SC_FAIL "[forward ${variant}] ${bot} formatted_body lost the authored text" "${out}"
 		SC_PASS "[forward ${variant}] ${bot} renders the authored text once, no leaked internal fields" \
 			"event=$(jq_get "${out}" event.event_id | tr -d '"') meshnet_label_isolated_in_native_facts=true (corpus)"

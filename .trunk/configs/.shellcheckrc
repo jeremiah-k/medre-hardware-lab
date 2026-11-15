@@ -1,0 +1,4 @@
+# Standard ShellCheck checks; optional checks remain opt-in.
+source-path=SCRIPTDIR
+# Sourced libraries share state and output-variable bindings across scripts.
+disable=SC2154,SC2034

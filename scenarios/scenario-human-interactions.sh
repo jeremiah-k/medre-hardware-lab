@@ -65,10 +65,10 @@ resolve_rooms
 SCENARIO="human-interactions"
 ALICE_TOKEN="$(lib_py mx_user.py token "${HUMAN_ALICE_LOCALPART}" | tr -d '"')"
 BOB_TOKEN="$(lib_py mx_user.py token "${HUMAN_BOB_LOCALPART}" | tr -d '"')"
-[[ -n "${ALICE_TOKEN}" && "${ALICE_TOKEN}" != "null" ]] ||
+[[ -n ${ALICE_TOKEN} && ${ALICE_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_ALICE_LOCALPART}" \
 		"the rig must provision @alice and publish LAB_TOKEN_ALICE (scenarios/README.md)"
-[[ -n "${BOB_TOKEN}" && "${BOB_TOKEN}" != "null" ]] ||
+[[ -n ${BOB_TOKEN} && ${BOB_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_BOB_LOCALPART}" \
 		"the rig must provision @bob and publish LAB_TOKEN_BOB (scenarios/README.md)"
 
@@ -259,7 +259,8 @@ react_case_e() {
 		--expect-text "reacted ${key}" --expect-reply-id "${RADIO_PACKET}"
 	capture out lib_py mx_user.py react "${HUMAN_ALICE_LOCALPART}" "${ROOM_ALPHA_CH0_ID}" "${RADIO_EVENT_ID}" "${key}"
 	((SC_STATUS == 0)) || SC_FAIL "case e (${label}): alice reaction send failed" "${out}"
-	local react_event; react_event=$(jq_get "${out}" event_id | tr -d '"')
+	local react_event
+	react_event=$(jq_get "${out}" event_id | tr -d '"')
 	expect_sniffed "case e (${label}): exact-key radio reaction on packet ${RADIO_PACKET}" "${SNIFF_A}" "${RADIO_PACKET}"
 }
 react_case_e "emoji" "🦄"
@@ -379,4 +380,4 @@ FINAL_B=$(jq_get "${count_b}" count | tr -d '"')
 		"A: ${BASE_A} -> ${FINAL_A}, B: ${BASE_B} -> ${FINAL_B}"
 SC_PASS "case h: relay map counts unchanged" "A: ${BASE_A}, B: ${BASE_B}"
 
-SC_LOG "[$SCENARIO] complete"
+SC_LOG "[${SCENARIO}] complete"

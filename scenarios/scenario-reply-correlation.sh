@@ -98,7 +98,8 @@ run_variant() {
 	# The wait's lower bound must predate the injection: relay B can emit
 	# the Matrix reply while the blocking injection command is still
 	# settling, and events older than --since-ms are invisible to it.
-	local since_reply; since_reply="$(date +%s%3N)"
+	local since_reply
+	since_reply="$(date +%s%3N)"
 	capture out lib_py radio.py "${reply_args[@]}"
 	((SC_STATUS == 0)) || SC_FAIL "[${variant}] radio reply injection failed" "${out}"
 
@@ -114,7 +115,7 @@ run_variant() {
 	local reply_id reply_channel
 	reply_id="$(jq_get "${reply_json}" event.event_id | tr -d '"')"
 	reply_channel="$(jq_get "${reply_json}" event.content.medre.envelope.source_native_ref.native_channel_id | tr -d '"')"
-	[[ "${reply_channel}" == "${expected_channel}" ]] ||
+	[[ ${reply_channel} == "${expected_channel}" ]] ||
 		SC_FAIL "[${variant}] reply envelope source channel != original channel" \
 			"reply=${reply_id} reply_channel=${reply_channel} expected=${expected_channel}"
 	SC_PASS "[${variant}] reply relation targets the original with matching channel id" \
@@ -150,7 +151,7 @@ run_variant() {
 	recheck_canon="$(jq_get "${recheck}" content.medre.envelope.canonical_event_id | tr -d '"')"
 	recheck_ref="$(jq_get "${recheck}" content.medre.envelope.source_native_ref.native_message_id | tr -d '"')"
 	orig_canon="$(jq_get "${event_id_from_json}" event.content.medre.envelope.canonical_event_id | tr -d '"')"
-	[[ "${recheck_canon}" == "${orig_canon}" && "${recheck_ref}" == "${native_packet}" ]] ||
+	[[ ${recheck_canon} == "${orig_canon}" && ${recheck_ref} == "${native_packet}" ]] ||
 		SC_FAIL "[${variant}] original event evidence was rewritten by later activity" \
 			"before: canonical=${orig_canon} packet=${native_packet}" $'\n'"after: canonical=${recheck_canon} packet=${recheck_ref}"
 	capture out lib_py maps.py rows-for-event "${MAP_DB_A}" "${event_id}"
@@ -172,4 +173,4 @@ else
 		"publish ROOM_ALPHA_CH2_ALIAS in lab/state/scenario.env (scenarios/README.md)"
 fi
 
-SC_LOG "[$SCENARIO] complete"
+SC_LOG "[${SCENARIO}] complete"

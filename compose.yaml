@@ -125,7 +125,7 @@ x-meshtasticd-common: &meshtasticd-common
     test:
       [
         CMD-SHELL,
-        "bash -c 'for p in /proc/[0-9]*/comm; do grep -q meshtasticd \"$$p\" && exit 0; done; exit 1'",
+        'bash -c ''for p in /proc/[0-9]*/comm; do grep -q meshtasticd "$$p" && exit 0; done; exit 1''',
       ]
     interval: 5s
     timeout: 5s
@@ -152,7 +152,7 @@ services:
       test:
         [
           CMD-SHELL,
-          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8008/_matrix/client/versions', timeout=5)\"",
+          'python -c "import urllib.request; urllib.request.urlopen(''http://localhost:8008/_matrix/client/versions'', timeout=5)"',
         ]
       interval: 5s
       timeout: 5s

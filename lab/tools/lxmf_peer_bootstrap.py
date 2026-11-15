@@ -56,12 +56,17 @@ def main() -> int:
     # direction-independent, so computing it via the static hash is exact.
     destination_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT)
 
-    print(RESULT_PREFIX + json.dumps({
-        "created": created,
-        "identity_path": identity_path,
-        "identity_hash": identity.hash.hex(),
-        "destination_hash": destination_hash.hex(),
-    }))
+    print(
+        RESULT_PREFIX
+        + json.dumps(
+            {
+                "created": created,
+                "identity_path": identity_path,
+                "identity_hash": identity.hash.hex(),
+                "destination_hash": destination_hash.hex(),
+            }
+        )
+    )
     return 0
 
 

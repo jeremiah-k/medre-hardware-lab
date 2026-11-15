@@ -77,7 +77,13 @@ def node_info(interface) -> dict:
     return {"my_node_num": my_num, "node_id": node_id}
 
 
-def send_text(interface, text: str, channel: int | None, reply_id: int | None, dest: str | None = None) -> dict:
+def send_text(
+    interface,
+    text: str,
+    channel: int | None,
+    reply_id: int | None,
+    dest: str | None = None,
+) -> dict:
     kwargs: dict = {"destinationId": dest if dest is not None else BROADCAST_ADDR}
     if channel is not None:
         kwargs["channelIndex"] = channel
@@ -146,7 +152,14 @@ def _packet_view(packet: dict) -> dict | None:
     }
 
 
-def listen(host: str, port: int, timeout: float, expect_text: str | None, expect_reply_id: int | None, tag: str | None) -> int:
+def listen(
+    host: str,
+    port: int,
+    timeout: float,
+    expect_text: str | None,
+    expect_reply_id: int | None,
+    tag: str | None,
+) -> int:
     """Sniff fromRadio until a matching text packet arrives or timeout."""
     from pubsub import pub
 
@@ -165,7 +178,10 @@ def listen(host: str, port: int, timeout: float, expect_text: str | None, expect
     pub.subscribe(_on_packet, "meshtastic.receive")
     # Readiness marker: scenarios gate their act on this line so a packet
     # sent right after arming cannot slip through the subscribe window.
-    print(json.dumps({"listening": True, "host": host, "port": port, "tag": tag}), flush=True)
+    print(
+        json.dumps({"listening": True, "host": host, "port": port, "tag": tag}),
+        flush=True,
+    )
     deadline = time.monotonic() + timeout
     try:
         while True:
@@ -215,16 +231,30 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("info"); p.add_argument("host"); p.add_argument("port", type=int)
-    p = sub.add_parser("nodes"); p.add_argument("host"); p.add_argument("port", type=int)
-    p = sub.add_parser("send-text"); p.add_argument("host"); p.add_argument("port", type=int)
-    p.add_argument("text"); p.add_argument("--channel", type=int, default=None)
-    p.add_argument("--reply-id", type=int, default=None)
-    p.add_argument("--dest", default=None, help="destination node id (!hex) for a direct message")
-    p = sub.add_parser("send-reaction"); p.add_argument("host"); p.add_argument("port", type=int)
-    p.add_argument("key"); p.add_argument("reply_id", type=int)
+    p = sub.add_parser("info")
+    p.add_argument("host")
+    p.add_argument("port", type=int)
+    p = sub.add_parser("nodes")
+    p.add_argument("host")
+    p.add_argument("port", type=int)
+    p = sub.add_parser("send-text")
+    p.add_argument("host")
+    p.add_argument("port", type=int)
+    p.add_argument("text")
     p.add_argument("--channel", type=int, default=None)
-    p = sub.add_parser("listen"); p.add_argument("host"); p.add_argument("port", type=int)
+    p.add_argument("--reply-id", type=int, default=None)
+    p.add_argument(
+        "--dest", default=None, help="destination node id (!hex) for a direct message"
+    )
+    p = sub.add_parser("send-reaction")
+    p.add_argument("host")
+    p.add_argument("port", type=int)
+    p.add_argument("key")
+    p.add_argument("reply_id", type=int)
+    p.add_argument("--channel", type=int, default=None)
+    p = sub.add_parser("listen")
+    p.add_argument("host")
+    p.add_argument("port", type=int)
     p.add_argument("--timeout", type=float, default=45.0)
     p.add_argument("--expect-text", default=None)
     p.add_argument("--expect-reply-id", type=int, default=None)
@@ -234,7 +264,14 @@ def main() -> int:
 
     if args.command == "listen":
         try:
-            return listen(args.host, args.port, args.timeout, args.expect_text, args.expect_reply_id, args.tag)
+            return listen(
+                args.host,
+                args.port,
+                args.timeout,
+                args.expect_text,
+                args.expect_reply_id,
+                args.tag,
+            )
         except Exception as exc:  # noqa: BLE001 - report as JSON
             print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
             return 1
@@ -242,7 +279,9 @@ def main() -> int:
     try:
         interface = connect(args.host, args.port)
     except Exception as exc:  # noqa: BLE001 - report connection failures as JSON
-        print(json.dumps({"error": f"cannot connect to {args.host}:{args.port}: {exc}"}))
+        print(
+            json.dumps({"error": f"cannot connect to {args.host}:{args.port}: {exc}"})
+        )
         return 1
 
     try:
@@ -253,10 +292,20 @@ def main() -> int:
             print(json.dumps(node_list(interface)))
             return 0
         if args.command == "send-text":
-            print(json.dumps(send_text(interface, args.text, args.channel, args.reply_id, args.dest)))
+            print(
+                json.dumps(
+                    send_text(
+                        interface, args.text, args.channel, args.reply_id, args.dest
+                    )
+                )
+            )
             return 0
         if args.command == "send-reaction":
-            print(json.dumps(send_reaction(interface, args.key, args.reply_id, args.channel)))
+            print(
+                json.dumps(
+                    send_reaction(interface, args.key, args.reply_id, args.channel)
+                )
+            )
             return 0
         return 2
     except Exception as exc:  # noqa: BLE001

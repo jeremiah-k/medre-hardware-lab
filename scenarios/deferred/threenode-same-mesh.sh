@@ -26,8 +26,8 @@
 #      the packet id in A's map row).
 # =============================================================================
 set -euo pipefail
-# shellcheck source=lib/common.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+# shellcheck source=../lib/common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/common.sh"
 
 require_rig
 resolve_rooms
@@ -110,7 +110,7 @@ capture c_rows lib_py maps.py rows-for-text "${MAP_DB_C}" "${MARKER}" --wait "${
 ((SC_STATUS == 0)) || SC_FAIL "relay C map has no row for the marker" "${c_rows}"
 C_PACKET=$(exact_packet_id "${c_rows}")
 [[ -n ${C_PACKET} ]] || SC_FAIL "no exact-text radio row in relay C map for the original packet" "${c_rows}"
-[[ "${C_PACKET}" == "${A_PACKET}" ]] ||
+[[ ${C_PACKET} == "${A_PACKET}" ]] ||
 	SC_FAIL "relays A and C recorded different packet ids for the same radio packet" \
 		"A=${A_PACKET} C=${C_PACKET}"
 capture c_event_json lib_py mx_events.py scan "${ROOM_BRIDGE_ID}" \
@@ -118,7 +118,7 @@ capture c_event_json lib_py mx_events.py scan "${ROOM_BRIDGE_ID}" \
 	--require-envelope --envelope-kind message.created --native-ref-is-numeric \
 	--native-ref-msg-id "${C_PACKET}"
 C_RENDERING_EVENT_ID="$(jq_get "${c_event_json}" 'matches.0.event_id' | tr -d '"')"
-[[ -n "${C_RENDERING_EVENT_ID}" && "${C_RENDERING_EVENT_ID}" != "null" ]] ||
+[[ -n ${C_RENDERING_EVENT_ID} && ${C_RENDERING_EVENT_ID} != "null" ]] ||
 	SC_FAIL "cannot identify relay C's rendering event for the original packet" "${c_event_json}"
 SC_PASS "radio packet id agrees across A's map and C's rendering (shared mesh, end-to-end ids)" \
 	"packet=${A_PACKET} C_rendering_event=${C_RENDERING_EVENT_ID}"
@@ -145,4 +145,4 @@ REPLY_EVENT_ID="$(jq_get "${reply_json}" event.event_id | tr -d '"')"
 SC_PASS "C's reply correlates on A: relation resolves to the packet id recorded in A's map" \
 	"reply_event=${REPLY_EVENT_ID} in_reply_to=${C_RENDERING_EVENT_ID} packet=${A_PACKET}"
 
-SC_LOG "[$SCENARIO] complete"
+SC_LOG "[${SCENARIO}] complete"

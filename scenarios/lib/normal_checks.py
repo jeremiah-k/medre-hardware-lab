@@ -93,9 +93,11 @@ def _hints(content: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(context, dict):
         return []
     relations = context.get("relations")
-    return [hint for hint in relations if isinstance(hint, dict)] if isinstance(
-        relations, list
-    ) else []
+    return (
+        [hint for hint in relations if isinstance(hint, dict)]
+        if isinstance(relations, list)
+        else []
+    )
 
 
 def _nested_problems(text: str, labels: tuple[str, ...]) -> list[str]:
@@ -115,7 +117,10 @@ def _nested_problems(text: str, labels: tuple[str, ...]) -> list[str]:
 
 def cmd_nested_info(text: str) -> dict[str, Any]:
     tokens = _BRACKET_TOKEN.findall(text)
-    return {"tokens": tokens[:_LIMIT_TOKENS], "nested": bool(_nested_problems(text, ()))}
+    return {
+        "tokens": tokens[:_LIMIT_TOKENS],
+        "nested": bool(_nested_problems(text, ())),
+    }
 
 
 def cmd_fanout_packets(
@@ -127,8 +132,7 @@ def cmd_fanout_packets(
     problems: list[str] = []
     if expected_channel >= 0:
         wrong = [
-            p for p in marker_packets
-            if str(p.get("channel")) != str(expected_channel)
+            p for p in marker_packets if str(p.get("channel")) != str(expected_channel)
         ]
         if wrong:
             problems.append(
@@ -141,7 +145,9 @@ def cmd_fanout_packets(
         text = packet.get("text") or ""
         nested_problems = _nested_problems(text, ())
         if nested_problems:
-            nested.append({"packet_id": packet.get("packet_id"), "problems": nested_problems})
+            nested.append(
+                {"packet_id": packet.get("packet_id"), "problems": nested_problems}
+            )
         size = len(text.encode("utf-8"))
         if size > limit:
             overlimit.append({"packet_id": packet.get("packet_id"), "bytes": size})
@@ -237,15 +243,21 @@ def cmd_hint_summary(event_json: str) -> dict[str, Any]:
     hints = [
         {
             "relation_type": hint.get("relation_type"),
-            "target_adapter": (hint.get("target_native_ref") or {}).get("adapter")
-            if isinstance(hint.get("target_native_ref"), dict)
-            else None,
-            "target_channel": (hint.get("target_native_ref") or {}).get("native_channel_id")
-            if isinstance(hint.get("target_native_ref"), dict)
-            else None,
-            "target_msg_id": (hint.get("target_native_ref") or {}).get("native_message_id")
-            if isinstance(hint.get("target_native_ref"), dict)
-            else None,
+            "target_adapter": (
+                (hint.get("target_native_ref") or {}).get("adapter")
+                if isinstance(hint.get("target_native_ref"), dict)
+                else None
+            ),
+            "target_channel": (
+                (hint.get("target_native_ref") or {}).get("native_channel_id")
+                if isinstance(hint.get("target_native_ref"), dict)
+                else None
+            ),
+            "target_msg_id": (
+                (hint.get("target_native_ref") or {}).get("native_message_id")
+                if isinstance(hint.get("target_native_ref"), dict)
+                else None
+            ),
             "key": hint.get("key"),
         }
         for hint in _hints(content)
@@ -356,11 +368,27 @@ def _authoritative_blob(event: dict[str, Any]) -> str:
         "payload": event.get("payload"),
         "body_content": event.get("body_content"),
         "native_refs": [
-            {k: ref.get(k) for k in ("adapter", "native_channel_id", "native_message_id", "direction")}
+            {
+                k: ref.get(k)
+                for k in (
+                    "adapter",
+                    "native_channel_id",
+                    "native_message_id",
+                    "direction",
+                )
+            }
             for ref in event.get("native_refs", [])
         ],
         "relations": [
-            {k: rel.get(k) for k in ("relation_type", "target_native_adapter", "target_native_message_id", "key")}
+            {
+                k: rel.get(k)
+                for k in (
+                    "relation_type",
+                    "target_native_adapter",
+                    "target_native_message_id",
+                    "key",
+                )
+            }
             for rel in event.get("relations", [])
         ],
     }
@@ -375,7 +403,9 @@ def cmd_reaction_adoption(events_json: str, key: str) -> dict[str, Any]:
     if not events:
         return {
             "ok": False,
-            "problems": ["medre state holds no canonical event for the peer reacted event"],
+            "problems": [
+                "medre state holds no canonical event for the peer reacted event"
+            ],
             "count": 0,
         }
     for event in events:
@@ -392,12 +422,19 @@ def cmd_reaction_adoption(events_json: str, key: str) -> dict[str, Any]:
         # The key itself is legitimate in relations; nothing else about the
         # reaction may be adopted beyond the key and the real sender.
         for relation in event.get("relations", []):
-            if relation.get("relation_type") == "reaction" and relation.get("key") != key:
+            if (
+                relation.get("relation_type") == "reaction"
+                and relation.get("key") != key
+            ):
                 problems.append(
                     f"event {event_id}: authoritative reaction relation carries key"
                     f" {relation.get('key')!r} != {key!r}"
                 )
-        if "reacted" in authoritative and key not in authoritative and not relations_found:
+        if (
+            "reacted" in authoritative
+            and key not in authoritative
+            and not relations_found
+        ):
             problems.append(
                 f"event {event_id}: authoritative surfaces render a reaction without"
                 f" the exact key {key!r}"
@@ -448,7 +485,11 @@ def cmd_lxmf_ref(events_json: str, adapter: str) -> dict[str, Any]:
                 adapters.append(ref_adapter)
             if ref.get("direction") == "outbound" and ref_adapter == adapter:
                 found.append(ref)
-    return {"found": bool(found), "refs": found[:_LIMIT_TOKENS], "ref_adapters": adapters}
+    return {
+        "found": bool(found),
+        "refs": found[:_LIMIT_TOKENS],
+        "ref_adapters": adapters,
+    }
 
 
 def _event_core(payload: Any) -> dict[str, Any]:
@@ -468,9 +509,11 @@ def _event_core(payload: Any) -> dict[str, Any]:
         "packet_id": ref.get("native_message_id") if isinstance(ref, dict) else None,
         "sender_id": source.get("sender_id"),
         "origin_label": source.get("origin_label"),
-        "meshnet_label": (source.get("native_facts") or {}).get("fields", {}).get("meshnet_label")
-        if isinstance(source.get("native_facts"), dict)
-        else None,
+        "meshnet_label": (
+            (source.get("native_facts") or {}).get("fields", {}).get("meshnet_label")
+            if isinstance(source.get("native_facts"), dict)
+            else None
+        ),
     }
 
 
@@ -479,7 +522,9 @@ def cmd_parity_agree(event_a_json: str, event_b_json: str) -> dict[str, Any]:
     b = _event_core(_load(event_b_json))
     problems: list[str] = []
     if str(a.get("channel")) != str(b.get("channel")):
-        problems.append(f"channel disagreement: {a.get('channel')!r} != {b.get('channel')!r}")
+        problems.append(
+            f"channel disagreement: {a.get('channel')!r} != {b.get('channel')!r}"
+        )
     if str(a.get("packet_id")) != str(b.get("packet_id")):
         problems.append(
             f"packet id disagreement: {a.get('packet_id')!r} != {b.get('packet_id')!r}"
@@ -509,22 +554,35 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("nested-info"); p.add_argument("text")
+    p = sub.add_parser("nested-info")
+    p.add_argument("text")
     p = sub.add_parser("fanout-packets")
     p.add_argument("collector_json")
     p.add_argument("marker")
     p.add_argument("expected_channel", type=int)
     p.add_argument("limit", type=int)
-    p = sub.add_parser("room-scan"); p.add_argument("scan_json"); p.add_argument("marker")
-    p = sub.add_parser("hint-summary"); p.add_argument("event_json")
+    p = sub.add_parser("room-scan")
+    p.add_argument("scan_json")
+    p.add_argument("marker")
+    p = sub.add_parser("hint-summary")
+    p.add_argument("event_json")
     p = sub.add_parser("reaction-verdict")
-    p.add_argument("match_json"); p.add_argument("medre_body"); p.add_argument("key")
+    p.add_argument("match_json")
+    p.add_argument("medre_body")
+    p.add_argument("key")
     p.add_argument("limit", type=int)
-    p = sub.add_parser("reaction-adoption"); p.add_argument("events_json"); p.add_argument("key")
+    p = sub.add_parser("reaction-adoption")
+    p.add_argument("events_json")
+    p.add_argument("key")
     p = sub.add_parser("medre-claim-verdict")
-    p.add_argument("events_json"); p.add_argument("claims", nargs="+")
-    p = sub.add_parser("lxmf-ref"); p.add_argument("events_json"); p.add_argument("adapter")
-    p = sub.add_parser("parity-agree"); p.add_argument("event_a_json"); p.add_argument("event_b_json")
+    p.add_argument("events_json")
+    p.add_argument("claims", nargs="+")
+    p = sub.add_parser("lxmf-ref")
+    p.add_argument("events_json")
+    p.add_argument("adapter")
+    p = sub.add_parser("parity-agree")
+    p.add_argument("event_a_json")
+    p.add_argument("event_b_json")
     sub.add_parser("queue-parse")
 
     args = parser.parse_args()
@@ -532,28 +590,60 @@ def main() -> int:
         print(json.dumps(cmd_nested_info(args.text), ensure_ascii=False))
         return 0
     if args.command == "fanout-packets":
-        print(json.dumps(cmd_fanout_packets(args.collector_json, args.marker, args.expected_channel, args.limit), ensure_ascii=False))
+        print(
+            json.dumps(
+                cmd_fanout_packets(
+                    args.collector_json, args.marker, args.expected_channel, args.limit
+                ),
+                ensure_ascii=False,
+            )
+        )
         return 0
     if args.command == "room-scan":
-        print(json.dumps(cmd_room_scan(args.scan_json, args.marker), ensure_ascii=False))
+        print(
+            json.dumps(cmd_room_scan(args.scan_json, args.marker), ensure_ascii=False)
+        )
         return 0
     if args.command == "hint-summary":
         print(json.dumps(cmd_hint_summary(args.event_json), ensure_ascii=False))
         return 0
     if args.command == "reaction-verdict":
-        print(json.dumps(cmd_reaction_verdict(args.match_json, args.medre_body, args.key, args.limit), ensure_ascii=False))
+        print(
+            json.dumps(
+                cmd_reaction_verdict(
+                    args.match_json, args.medre_body, args.key, args.limit
+                ),
+                ensure_ascii=False,
+            )
+        )
         return 0
     if args.command == "reaction-adoption":
-        print(json.dumps(cmd_reaction_adoption(args.events_json, args.key), ensure_ascii=False))
+        print(
+            json.dumps(
+                cmd_reaction_adoption(args.events_json, args.key), ensure_ascii=False
+            )
+        )
         return 0
     if args.command == "medre-claim-verdict":
-        print(json.dumps(cmd_medre_claim_verdict(args.events_json, args.claims), ensure_ascii=False))
+        print(
+            json.dumps(
+                cmd_medre_claim_verdict(args.events_json, args.claims),
+                ensure_ascii=False,
+            )
+        )
         return 0
     if args.command == "lxmf-ref":
-        print(json.dumps(cmd_lxmf_ref(args.events_json, args.adapter), ensure_ascii=False))
+        print(
+            json.dumps(cmd_lxmf_ref(args.events_json, args.adapter), ensure_ascii=False)
+        )
         return 0
     if args.command == "parity-agree":
-        print(json.dumps(cmd_parity_agree(args.event_a_json, args.event_b_json), ensure_ascii=False))
+        print(
+            json.dumps(
+                cmd_parity_agree(args.event_a_json, args.event_b_json),
+                ensure_ascii=False,
+            )
+        )
         return 0
     if args.command == "queue-parse":
         print(json.dumps(cmd_queue_parse()))

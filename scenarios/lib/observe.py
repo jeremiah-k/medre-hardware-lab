@@ -64,7 +64,11 @@ def main() -> int:
     while True:
         for record in reversed(read_records(args.path)):
             if record.get("event_id") == args.event_id:
-                print(json.dumps({"record": record, "path": args.path}, ensure_ascii=False))
+                print(
+                    json.dumps(
+                        {"record": record, "path": args.path}, ensure_ascii=False
+                    )
+                )
                 return 0
         if time.monotonic() >= deadline:
             records = read_records(args.path)

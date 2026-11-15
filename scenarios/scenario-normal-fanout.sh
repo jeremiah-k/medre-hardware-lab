@@ -59,7 +59,7 @@ resolve_bridge_rooms
 
 SCENARIO="normal-fanout"
 ALICE_TOKEN="$(lib_py mx_user.py token "${HUMAN_ALICE_LOCALPART}" | tr -d '"')"
-[[ -n "${ALICE_TOKEN}" && "${ALICE_TOKEN}" != "null" ]] ||
+[[ -n ${ALICE_TOKEN} && ${ALICE_TOKEN} != "null" ]] ||
 	SC_SKIP "no token for ${HUMAN_ALICE_LOCALPART}" \
 		"the rig must provision @alice and publish LAB_TOKEN_ALICE (scenarios/README.md)"
 
@@ -106,6 +106,7 @@ run_variant() {
 	queue_snapshot AFTER_A "${MEDRE_QUEUE_LOG_A}" "${MEDRE_QUEUE_CONTAINER_A}"
 	queue_snapshot AFTER_B "${MEDRE_QUEUE_LOG_B}" "${MEDRE_QUEUE_CONTAINER_B}"
 	table_snapshot AFTER_TABLES
+	# shellcheck disable=SC2153 # Child-language syntax or named output, not a host-shell read.
 	queue_assert_flat "[${variant}] queue" "${BEFORE_A}" "${BEFORE_B}" "${AFTER_A}" "${AFTER_B}" 3 5
 	table_assert_flat "[${variant}] tables" "${BEFORE_TABLES}" "${AFTER_TABLES}"
 
@@ -149,7 +150,7 @@ run_variant() {
 	# hard assertion applies to the ch0 contract room (routes.lxmf-bridge
 	# .source_room); non-contract rooms REPORT (absence is the configured
 	# contract there, not a miss).
-	if [[ "${MEDRE_NORMAL_LXMF}" == "1" && "${room_id}" == "${ROOM_BRIDGE_CH0_ID}" ]]; then
+	if [[ ${MEDRE_NORMAL_LXMF} == "1" && ${room_id} == "${ROOM_BRIDGE_CH0_ID}" ]]; then
 		lxmf_found=0
 		lxmf_verdict=""
 		local lxmf_deadline=$((SECONDS + RADIO_WAIT_SECONDS))
@@ -167,7 +168,7 @@ run_variant() {
 				"verdict: ${lxmf_verdict}" $'\n'"ref adapters seen: $(jq_get "${lxmf_verdict}" ref_adapters)" $'\n'"origin event=${ORIGIN_EVENT_ID} waited=${RADIO_WAIT_SECONDS}s"
 		SC_PASS "[${variant}] human text reached the LXMF loopback (outbound ${MEDRE_NORMAL_LXMF_ADAPTER} ref)" \
 			"verdict: ${lxmf_verdict}"
-	elif [[ "${MEDRE_NORMAL_LXMF}" == "1" ]]; then
+	elif [[ ${MEDRE_NORMAL_LXMF} == "1" ]]; then
 		# Non-contract room: report, never fail (the lxmf-bridge route does
 		# not wire this room to the lxmf leg).
 		capture lxmf_json medre_state_py events-for-native "${MEDRE_NORMAL_DB}" "${ORIGIN_EVENT_ID}"

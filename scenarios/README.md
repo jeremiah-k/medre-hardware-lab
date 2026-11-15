@@ -42,7 +42,7 @@ ALREADY-UP rig and only read/write through the contract surfaces listed below.
 
 ## Running
 
-```
+```bash
 lab/run-scenarios.sh              # all scenarios (deferred ones reported, not run)
 lab/run-scenarios.sh smoke        # one scenario
 lab/run-scenarios.sh threenode-same-mesh   # reports the DEFERRED policy note
@@ -79,18 +79,18 @@ Provisioned accounts/rooms/tokens come from `lab/state/runtime.json`
 
 ## Scenario list
 
-| Scenario | Purpose |
-| --- | --- |
-| `smoke` | AlphaLab peer radio text → canonical Matrix event in #lab-alpha-ch0 (medre.envelope v1, source_channel "0") → Beta radio receives the authored body verbatim (relay B map row + peer sniffer on the far mesh). |
-| `reply-correlation` | Beta peer radio reply → Matrix reply event with native relation to the ORIGINAL event + matching channel id both sides + structured reply delivered on Alpha (map rows both sides + sniffer reply_id equality). Primary channel 0 and secondary channel 2 variants. |
-| `reaction-exact-key` | Beta peer tapback → `message.reacted` event with the EXACT symbol as relation key (incl. skin-tone modifier), radio-native target packet id; plus a tapback whose target packet id is 0 (seeded map row, removed in teardown). |
-| `untargeted-emote` | Beta peer radio text with an unresolvable reply id relays as ordinary authored text (no relation, non-empty body) and reaches the peer mesh. |
+| Scenario                    | Purpose                                                                                                                                                                                                                                                                        |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `smoke`                     | AlphaLab peer radio text → canonical Matrix event in #lab-alpha-ch0 (medre.envelope v1, source_channel "0") → Beta radio receives the authored body verbatim (relay B map row + peer sniffer on the far mesh).                                                                 |
+| `reply-correlation`         | Beta peer radio reply → Matrix reply event with native relation to the ORIGINAL event + matching channel id both sides + structured reply delivered on Alpha (map rows both sides + sniffer reply_id equality). Primary channel 0 and secondary channel 2 variants.            |
+| `reaction-exact-key`        | Beta peer tapback → `message.reacted` event with the EXACT symbol as relation key (incl. skin-tone modifier), radio-native target packet id; plus a tapback whose target packet id is 0 (seeded map row, removed in teardown).                                                 |
+| `untargeted-emote`          | Beta peer radio text with an unresolvable reply id relays as ordinary authored text (no relation, non-empty body) and reaches the peer mesh.                                                                                                                                   |
 | `untrusted-forged-envelope` | @untrusted sends an event with a real relay's medre envelope, adapted to fake claims; only the visible text may relay — provenance, meshnet label, sender name, packet id must appear in NO map row or relay event (exact UNTRUSTED_EVENT_ID assertions on both relays' maps). |
-| `blank-reply-plugin` | Blank Matrix reply never enters the structured reply branch (no map rows, no radio reply); reports as an owner-accepted diagnostic which gate handled it (plugin observation vs empty-text early return). |
-| `cross-room-rejection` | Events in #lab-other (mapped nowhere) — text, reply-to-mapped-event, reaction — produce no map rows and no radio traffic (map counts unchanged). |
-| `channel-matrix` | The r14 regression class: alpha-ch0 omitted/explicit, alpha-ch2, beta-ch2; every native ref (source + reply/reaction targets) carries the SAME numeric channel id; per-meshnet rooms make origin mesh+channel unambiguous. |
-| `human-interactions` | Simulated humans @alice/@bob (plus @untrusted contrast): text/reply/reaction/emote flows against radio-origin and human-origin messages, asserted through both relays' maps and peer-sniffer radio evidence (cases a-h in the script header). |
-| `threenode-same-mesh` | **DEFERRED** (scenarios/deferred/): same-mesh multi-relay loop handling is a later work item. |
+| `blank-reply-plugin`        | Blank Matrix reply never enters the structured reply branch (no map rows, no radio reply); reports as an owner-accepted diagnostic which gate handled it (plugin observation vs empty-text early return).                                                                      |
+| `cross-room-rejection`      | Events in #lab-other (mapped nowhere) — text, reply-to-mapped-event, reaction — produce no map rows and no radio traffic (map counts unchanged).                                                                                                                               |
+| `channel-matrix`            | The r14 regression class: alpha-ch0 omitted/explicit, alpha-ch2, beta-ch2; every native ref (source + reply/reaction targets) carries the SAME numeric channel id; per-meshnet rooms make origin mesh+channel unambiguous.                                                     |
+| `human-interactions`        | Simulated humans @alice/@bob (plus @untrusted contrast): text/reply/reaction/emote flows against radio-origin and human-origin messages, asserted through both relays' maps and peer-sniffer radio evidence (cases a-h in the script header).                                  |
+| `threenode-same-mesh`       | **DEFERRED** (scenarios/deferred/): same-mesh multi-relay loop handling is a later work item.                                                                                                                                                                                  |
 
 ## REQUIREMENTS FOR THE RIG
 

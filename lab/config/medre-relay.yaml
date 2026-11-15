@@ -54,7 +54,7 @@ adapters:
       adapter_kind: real
       homeserver: "http://synapse:8008"
       user_id: "@medre:lab.test"
-      access_token: "__MEDRE_ACCESS_TOKEN__" # substituted by lab/up.sh
+      access_token: "__MEDRE_ACCESS_TOKEN__" # substituted by lab/up.sh # checkov:skip=CKV_SECRET_6:Public deterministic fixture for the isolated lab service.
       encryption_mode: plaintext
       room_allowlist:
         - "__ROOM_ALPHA_CH0__" # substituted by lab/up.sh

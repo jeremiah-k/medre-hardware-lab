@@ -18,7 +18,9 @@ from lab_env import driver_token, matrix_request
 
 def main() -> int:
     if len(sys.argv) != 4:
-        print("usage: mx_blank_reply.py ROOM_ID TARGET_EVENT_ID MARKER", file=sys.stderr)
+        print(
+            "usage: mx_blank_reply.py ROOM_ID TARGET_EVENT_ID MARKER", file=sys.stderr
+        )
         return 2
     room_id_value, target, marker = sys.argv[1:4]
 
@@ -38,7 +40,9 @@ def main() -> int:
     if response.status_code >= 400:
         print(
             json.dumps(
-                {"error": f"blank reply send failed: {response.status_code} {response.text[:300]}"}
+                {
+                    "error": f"blank reply send failed: {response.status_code} {response.text[:300]}"
+                }
             )
         )
         return 1

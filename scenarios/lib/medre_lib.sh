@@ -134,7 +134,7 @@ medre_validate() {
 	status=${SC_STATUS}
 	MEDRE_VALIDATION="${out}"
 	authority="$(jq_get "${out}" schema_authority | tr -d '"')"
-	if [[ "${authority}" == unavailable* ]]; then
+	if [[ ${authority} == unavailable* ]]; then
 		container="$(medre_schema_container || true)"
 		if [[ -n ${container} ]]; then
 			capture fallback_json compose exec -T "${container}" python3 - \
@@ -146,9 +146,9 @@ medre_validate() {
 			fi
 		fi
 	fi
-	if [[ "${authority}" == unavailable* ]]; then
+	if [[ ${authority} == unavailable* ]]; then
 		authority="$(jq_get "${MEDRE_VALIDATION}" schema_authority | tr -d '"')"
-		if [[ "${authority}" == unavailable* && "${MEDRE_CORPUS_REQUIRE_SCHEMA}" == "1" ]]; then
+		if [[ ${authority} == unavailable* && ${MEDRE_CORPUS_REQUIRE_SCHEMA} == "1" ]]; then
 			SC_FAIL "corpus validation ran WITHOUT the medre schema authority" \
 				"contract verdict: ${MEDRE_VALIDATION}" $'\n'"no running container with medre installed" \
 				"(looked for: ${MEDRE_RELAY_SERVICES} mmrelay-a mmrelay-b)"
@@ -187,6 +187,7 @@ start_collector() {
 		stop_collector "${old_pid}" "${!out:-}"
 	fi
 	tmp="$(mktemp "${LAB_ROOT}/lab/logs/scenarios/medre-collect-XXXXXX.log")"
+	# shellcheck disable=SC2094 # Child-language syntax or named output, not a host-shell read.
 	medre_lib_py medre_radio.py collect "$@" --tag "medre-$(basename "${tmp}" .log)" \
 		>"${tmp}" 2>&1 &
 	pid=$!

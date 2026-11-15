@@ -117,7 +117,7 @@ run_variant() {
 		capture out lib_py radio.py "${radio_args[@]}"
 		((SC_STATUS == 0)) || SC_FAIL "[${variant}/${mesh}] radio injection failed" "${out}"
 		packet_id="$(jq_get "${out}" packet_id | tr -d '"')"
-		[[ "${packet_id}" =~ ^[0-9]+$ ]] ||
+		[[ ${packet_id} =~ ^[0-9]+$ ]] ||
 			SC_FAIL "[${variant}/${mesh}] radio injection did not report a packet id" "${out}"
 		SC_PASS "[${variant}/${mesh}] radio text injected on ${mesh_label:-Mesh} channel ${expected_channel}" \
 			"packet_id=${packet_id} marker=${marker}"
@@ -134,11 +134,11 @@ run_variant() {
 		medre_assert_valid "${owner_json}" "[${variant}/${mesh}] ${owner_bot} owner event"
 
 		owner_sender="$(jq_get "${owner_json}" event.content.medre.metadata.bridge_context.source.sender_id | tr -d '"')"
-		[[ "${owner_sender}" == "${peer_id}" ]] ||
+		[[ ${owner_sender} == "${peer_id}" ]] ||
 			SC_FAIL "[${variant}/${mesh}] sender attribution disagrees with the injecting peer node" \
 				"envelope sender_id=${owner_sender} peer_node=${peer_id}" $'\n'"event=${owner_event_id} packet=${packet_id}"
 		marker_count="$(body_count "${owner_json}" event.content.body "${marker}")"
-		[[ "${marker_count}" == "1" ]] ||
+		[[ ${marker_count} == "1" ]] ||
 			SC_FAIL "[${variant}/${mesh}] authored text not carried exactly once in the owner body" \
 				"occurrences=${marker_count} event_json=${owner_json}"
 		SC_PASS "[${variant}/${mesh}] owner event agrees on channel, packet id, and peer attribution" \
@@ -147,12 +147,14 @@ run_variant() {
 		# --- Far mmrelay re-bridge rows (required: cross-mesh delivery) ---------
 		local far_name map_db rows row_ids row_mesh far_relay_mxid
 		for far_name in A B; do
-			if [[ "${far_name}" == "A" ]]; then
-				far_relay_mxid="${BOT_A_MXID}"; map_db="${MAP_DB_A}"
+			if [[ ${far_name} == "A" ]]; then
+				far_relay_mxid="${BOT_A_MXID}"
+				map_db="${MAP_DB_A}"
 			else
-				far_relay_mxid="${BOT_B_MXID}"; map_db="${MAP_DB_B}"
+				far_relay_mxid="${BOT_B_MXID}"
+				map_db="${MAP_DB_B}"
 			fi
-			if [[ "${far_relay_mxid}" == "${owner_bot}" ]]; then
+			if [[ ${far_relay_mxid} == "${owner_bot}" ]]; then
 				continue
 			fi
 			capture rows lib_py maps.py rows-for-event "${map_db}" "${owner_event_id}" --wait "${RADIO_WAIT_SECONDS}"
@@ -165,7 +167,7 @@ print(",".join(str(r.get("meshtastic_id")) for r in rows))')"
 import json, sys
 rows = json.load(sys.stdin)["rows"]
 print(",".join(sorted({str(r.get("meshtastic_meshnet")) for r in rows})))')"
-				[[ "${row_ids}" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
+				[[ ${row_ids} =~ ^[0-9]+(,[0-9]+)*$ ]] ||
 					SC_FAIL "[${variant}/${mesh}] relay-${far_name} re-bridge row packet id is not numeric" \
 						"meshtastic_id=${row_ids} rows=${rows}"
 				printf '%s' "${rows}" | grep -q "${marker}" ||
@@ -179,7 +181,7 @@ print(",".join(sorted({str(r.get("meshtastic_meshnet")) for r in rows})))')"
 		done
 
 		# --- medre consumption ----------------------------------------------------
-		if [[ "${owner_bot}" == "${MEDRE_NORMAL_BOT_MXID}" ]]; then
+		if [[ ${owner_bot} == "${MEDRE_NORMAL_BOT_MXID}" ]]; then
 			# medre is the owner: its state must hold the inbound ref for its
 			# own mesh packet; the far relays' rows above are its delivery.
 			capture out medre_state_py events-for-native "${MEDRE_NORMAL_DB}" "${packet_id}" --wait "${RADIO_WAIT_SECONDS}"
@@ -223,7 +225,7 @@ for event in data.get("events", []):
             print(str(ref.get("native_message_id")))
             raise SystemExit
 ')"
-			[[ "${ref_channel}" == "${expected_channel}" ]] ||
+			[[ ${ref_channel} == "${expected_channel}" ]] ||
 				SC_FAIL "[${variant}/${mesh}] medre outbound ref channel disagrees with the origin envelope" \
 					"ref_channel=${ref_channel} expected=${expected_channel} origin_event=${owner_event_id}" $'\n'"state output: ${medre_out}"
 			SC_PASS "[${variant}/${mesh}] medre re-aired the ${mesh} origin onto MeshC (outbound ref agrees on channel)" \

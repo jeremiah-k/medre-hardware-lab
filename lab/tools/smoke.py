@@ -54,8 +54,8 @@ class PeerNode:
     """
 
     def __init__(self, host: str) -> None:
-        from pubsub import pub
         from meshtastic.tcp_interface import TCPInterface
+        from pubsub import pub
 
         self.host = host
         self._texts: list[str] = []
@@ -110,7 +110,9 @@ class PeerNode:
             pass
 
 
-def wait_message_map_row(db_path: str, matrix_event_id: str, timeout: float) -> dict | None:
+def wait_message_map_row(
+    db_path: str, matrix_event_id: str, timeout: float
+) -> dict | None:
     """Poll relay SQLite for a message_map row with a non-null meshtastic_id."""
     deadline = time.monotonic() + timeout
     last_error: str | None = None
@@ -203,7 +205,9 @@ def main() -> int:
             ),
         }
 
-        print("[3/4] Waiting for relay B message_map row (room -> Beta mesh dispatch)...")
+        print(
+            "[3/4] Waiting for relay B message_map row (room -> Beta mesh dispatch)..."
+        )
         row = wait_message_map_row(
             "/state/mmrelay-b/database/meshtastic.sqlite",
             event["event_id"],
@@ -214,7 +218,9 @@ def main() -> int:
             result["steps"]["relay_b_dispatch"] = {"status": "TIMEOUT"}
             write_result(result)
             return 1
-        print(f"  meshtastic_id={row['meshtastic_id']} meshnet={row['meshtastic_meshnet']}")
+        print(
+            f"  meshtastic_id={row['meshtastic_id']} meshnet={row['meshtastic_meshnet']}"
+        )
         result["steps"]["relay_b_dispatch"] = {"status": "OK", **row}
 
         print("[4/4] Waiting for Beta-side over-air witness on meshtasticd-b-peer...")
@@ -226,7 +232,9 @@ def main() -> int:
                 break
             time.sleep(1)
         if not seen:
-            print("SMOKE FAIL: Beta-side peer node never received the text over the air")
+            print(
+                "SMOKE FAIL: Beta-side peer node never received the text over the air"
+            )
             result["steps"]["beta_witness"] = {"status": "TIMEOUT"}
             write_result(result)
             return 1

@@ -167,9 +167,7 @@ def queued_log_lines(relay: str) -> int:
     for path in (base, base + ".1"):
         try:
             with open(path, encoding="utf-8", errors="replace") as handle:
-                total += sum(
-                    1 for line in handle if "Queued message" in line
-                )
+                total += sum(1 for line in handle if "Queued message" in line)
         except OSError:
             continue
     return total
@@ -245,9 +243,7 @@ def wait_for_peer_packet_ids(
     return distinct_marker_packets(listener, marker)
 
 
-def distinct_marker_packets(
-    listener: PeerNode, marker: str
-) -> list[dict[str, Any]]:
+def distinct_marker_packets(listener: PeerNode, marker: str) -> list[dict[str, Any]]:
     seen_ids: set[Any] = set()
     distinct: list[dict[str, Any]] = []
     for record in listener.received_packets():
@@ -301,7 +297,9 @@ def envelope_problems(envelope: dict[str, Any] | None, label: str) -> list[str]:
     problems: list[str] = []
     schema_version = envelope.get("schema_version")
     if type(schema_version) is not int or schema_version != 1:
-        problems.append(f"{label}: schema_version must be int 1, got {schema_version!r}")
+        problems.append(
+            f"{label}: schema_version must be int 1, got {schema_version!r}"
+        )
     canonical_event_id = envelope.get("canonical_event_id")
     if not (isinstance(canonical_event_id, str) and canonical_event_id.strip()):
         problems.append(f"{label}: canonical_event_id missing/malformed")
@@ -337,7 +335,7 @@ def main() -> int:
     alice_token = runtime["users"]["alice"]["access_token"]
     admin_token = runtime["users"]["admin"]["access_token"]
     relay_a_user = runtime["users"]["relay-a"]["user_id"]
-    relay_b_user = runtime["users"]["relay-b"]["user_id"]
+    runtime["users"]["relay-b"]["user_id"]
     medre_user = runtime["users"]["medre"]["user_id"]
     bridge_room = runtime["rooms"]["lab-bridge"]["room_id"]
 
@@ -469,7 +467,9 @@ def main() -> int:
             key: counts_t1[key] - counts_t0[key] for key in counts_t0
         }
         print(f"  marker-scoped deltas over settle: {flat_deltas}")
-        print(f"  global deltas (informational): {result['steps']['global_deltas_over_settle']}")
+        print(
+            f"  global deltas (informational): {result['steps']['global_deltas_over_settle']}"
+        )
         if any(delta != 0 for delta in flat_deltas.values()):
             return fail(
                 result,
@@ -512,13 +512,15 @@ def main() -> int:
         print(f"[B1] Injecting on meshtasticd-c-peer: {marker_c}")
         injector_c.send_text(marker_c)
         medre_events = wait_for_room_event_count(
-            admin_token, bridge_room, marker_c, expected=1,
-            timeout=SMOKE_TIMEOUT_MATRIX, sender=medre_user,
+            admin_token,
+            bridge_room,
+            marker_c,
+            expected=1,
+            timeout=SMOKE_TIMEOUT_MATRIX,
+            sender=medre_user,
         )
         if not medre_events:
-            return fail(
-                result, "no @medre canonical event for the MeshC injection"
-            )
+            return fail(result, "no @medre canonical event for the MeshC injection")
         event = medre_events[0]
         envelope = envelope_of(event)
         problems = envelope_problems(envelope, "medre-normal(b1)")
@@ -528,14 +530,16 @@ def main() -> int:
             .get("envelope", {})
             .get("metadata", {})
         )
-        print(f"  medre event_id={event.get('event_id')} body={event.get('content', {}).get('body', '')!r}")
+        print(
+            f"  medre event_id={event.get('event_id')} body={event.get('content', {}).get('body', '')!r}"
+        )
         print(f"  envelope={json.dumps(envelope, sort_keys=True)}")
         result["steps"]["b1_medre_event"] = {
             "event_id": event.get("event_id"),
             "envelope": envelope,
-            "native_metadata_keys": sorted(native_meta.keys())
-            if isinstance(native_meta, dict)
-            else [],
+            "native_metadata_keys": (
+                sorted(native_meta.keys()) if isinstance(native_meta, dict) else []
+            ),
             "problems": problems,
         }
         if problems:
@@ -546,8 +550,12 @@ def main() -> int:
         print(f"[B2] Injecting on meshtasticd-a-peer: {marker_a2}")
         injector_a.send_text(marker_a2)
         relay_a_events = wait_for_room_event_count(
-            admin_token, bridge_room, marker_a2, expected=1,
-            timeout=SMOKE_TIMEOUT_MATRIX, sender=relay_a_user,
+            admin_token,
+            bridge_room,
+            marker_a2,
+            expected=1,
+            timeout=SMOKE_TIMEOUT_MATRIX,
+            sender=relay_a_user,
         )
         if not relay_a_events:
             return fail(result, "no @relay-a copy for the Alpha injection")
@@ -567,9 +575,7 @@ def main() -> int:
         beta_b2 = wait_for_peer_packet_ids(
             witness_b, marker_a2, expected=1, timeout=SMOKE_TIMEOUT_RADIO
         )
-        print(
-            f"  MeshC distinct={len(gamma_b2)} BetaLab distinct={len(beta_b2)}"
-        )
+        print(f"  MeshC distinct={len(gamma_b2)} BetaLab distinct={len(beta_b2)}")
         result["steps"]["b2_radio_copies_initial"] = {
             "gamma": gamma_b2,
             "beta": beta_b2,

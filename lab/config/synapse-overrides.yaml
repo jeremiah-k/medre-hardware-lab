@@ -3,7 +3,7 @@
 # idempotent provisioning and relaxed rate limits for bursty relay/invite
 # traffic. rc_invites uses the structured per_room/per_user/per_issuer form
 # (a flat rc_invites block is ignored by Synapse >= ~v1.4x).
-registration_shared_secret: "medre-lab-shared-secret"
+registration_shared_secret: "medre-lab-shared-secret" # checkov:skip=CKV_SECRET_6:Public deterministic fixture for the isolated lab service.
 rc_message:
   per_second: 25
   burst_count: 100

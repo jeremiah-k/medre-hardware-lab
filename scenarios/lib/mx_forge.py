@@ -93,7 +93,9 @@ def main() -> int:
     if response.status_code >= 400:
         print(
             json.dumps(
-                {"error": f"forged send failed: {response.status_code} {response.text[:300]}"}
+                {
+                    "error": f"forged send failed: {response.status_code} {response.text[:300]}"
+                }
             )
         )
         return 1

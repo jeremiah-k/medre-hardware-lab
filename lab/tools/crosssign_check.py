@@ -14,7 +14,6 @@ import json
 import sys
 
 import vodozemac
-
 from lab_lib import LAB_STATE_DIR, matrix_request
 
 MMRELAY_DEVICE_COUNT = int(sys.argv[1]) if len(sys.argv) > 1 else 2
@@ -40,7 +39,9 @@ def sole_ed25519_key(keys: dict, context: str) -> tuple[str, str]:
 
 def verify(public_key_b64: str, signed: dict, signature_b64: str) -> None:
     unsigned = {
-        key: value for key, value in signed.items() if key not in ("signatures", "unsigned")
+        key: value
+        for key, value in signed.items()
+        if key not in ("signatures", "unsigned")
     }
     message = canonical_json(unsigned)
     public_key = vodozemac.Ed25519PublicKey.from_base64(public_key_b64)
@@ -57,7 +58,9 @@ def verify_device(admin_token: str, user_id: str, device_id: str) -> None:
         timeout=30,
     )
     if response.status_code >= 400:
-        raise RuntimeError(f"keys/query failed ({response.status_code}): {response.text[:300]}")
+        raise RuntimeError(
+            f"keys/query failed ({response.status_code}): {response.text[:300]}"
+        )
     payload = response.json()
 
     master = payload.get("master_keys", {}).get(user_id)
@@ -77,7 +80,9 @@ def verify_device(admin_token: str, user_id: str, device_id: str) -> None:
     self_signing_signature = (
         self_signing.get("signatures", {}).get(user_id, {}).get(master_key_id)
     )
-    device_signature = device.get("signatures", {}).get(user_id, {}).get(self_signing_key_id)
+    device_signature = (
+        device.get("signatures", {}).get(user_id, {}).get(self_signing_key_id)
+    )
     if not isinstance(self_signing_signature, str) or not self_signing_signature:
         raise RuntimeError("Self-signing key is not signed by the master key")
     if not isinstance(device_signature, str) or not device_signature:
@@ -89,9 +94,7 @@ def verify_device(admin_token: str, user_id: str, device_id: str) -> None:
 
 
 def main() -> int:
-    runtime = json.load(
-        open(f"{LAB_STATE_DIR}/runtime.json", encoding="utf-8")
-    )
+    runtime = json.load(open(f"{LAB_STATE_DIR}/runtime.json", encoding="utf-8"))
     admin_token = runtime["users"]["untrusted"]["access_token"]
     for index in range(ord("a"), ord("a") + MMRELAY_DEVICE_COUNT):
         relay = f"mmrelay-{chr(index)}"

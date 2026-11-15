@@ -46,7 +46,7 @@ def wait_row(
     Returns (rows_or_None, last_error). rows is None only on timeout.
     """
     deadline = time.monotonic() + timeout
-    sql = f"SELECT * FROM message_map WHERE {where}"
+    sql = f"SELECT * FROM message_map WHERE {where}"  # nosec B608 # Fixed predicates; values bound.
     last_error = ""
     while True:
         try:
@@ -71,14 +71,33 @@ def main() -> int:
     def db_arg(sub_parser: argparse.ArgumentParser) -> None:
         sub_parser.add_argument("db")
 
-    p = sub.add_parser("rows-for-event"); db_arg(p); p.add_argument("event_id"); p.add_argument("--wait", type=float, default=0.0)
-    p = sub.add_parser("rows-for-text"); db_arg(p); p.add_argument("substr"); p.add_argument("--wait", type=float, default=0.0)
-    p = sub.add_parser("rows-for-radio"); db_arg(p); p.add_argument("packet_id"); p.add_argument("--wait", type=float, default=0.0)
-    p = sub.add_parser("count"); db_arg(p)
-    p = sub.add_parser("dump"); db_arg(p); p.add_argument("--limit", type=int, default=10)
+    p = sub.add_parser("rows-for-event")
+    db_arg(p)
+    p.add_argument("event_id")
+    p.add_argument("--wait", type=float, default=0.0)
+    p = sub.add_parser("rows-for-text")
+    db_arg(p)
+    p.add_argument("substr")
+    p.add_argument("--wait", type=float, default=0.0)
+    p = sub.add_parser("rows-for-radio")
+    db_arg(p)
+    p.add_argument("packet_id")
+    p.add_argument("--wait", type=float, default=0.0)
+    p = sub.add_parser("count")
+    db_arg(p)
+    p = sub.add_parser("dump")
+    db_arg(p)
+    p.add_argument("--limit", type=int, default=10)
     p = sub.add_parser("seed")
-    p.add_argument("db"); p.add_argument("packet_id"); p.add_argument("event_id"); p.add_argument("room"); p.add_argument("text"); p.add_argument("meshnet")
-    p = sub.add_parser("delete-event"); db_arg(p); p.add_argument("event_id")
+    p.add_argument("db")
+    p.add_argument("packet_id")
+    p.add_argument("event_id")
+    p.add_argument("room")
+    p.add_argument("text")
+    p.add_argument("meshnet")
+    p = sub.add_parser("delete-event")
+    db_arg(p)
+    p.add_argument("event_id")
 
     args = parser.parse_args()
 
@@ -106,7 +125,12 @@ def main() -> int:
                 return 1
         else:
             with contextlib.closing(connect(args.db, write=False)) as conn:
-                rows = rows_to_dicts(conn.execute(f"SELECT * FROM message_map WHERE {where}", params))
+                rows = rows_to_dicts(
+                    conn.execute(
+                        f"SELECT * FROM message_map WHERE {where}",  # nosec B608 # Fixed predicates.
+                        params,
+                    )
+                )
         print(json.dumps({"rows": rows, "db": args.db}, ensure_ascii=False))
         return 0
 
@@ -120,7 +144,8 @@ def main() -> int:
         with contextlib.closing(connect(args.db, write=False)) as conn:
             rows = rows_to_dicts(
                 conn.execute(
-                    "SELECT * FROM message_map ORDER BY rowid DESC LIMIT ?", (args.limit,)
+                    "SELECT * FROM message_map ORDER BY rowid DESC LIMIT ?",
+                    (args.limit,),
                 )
             )
         print(json.dumps({"rows": rows, "db": args.db}, ensure_ascii=False))
@@ -136,15 +161,32 @@ def main() -> int:
                 "INSERT OR REPLACE INTO message_map (meshtastic_id, matrix_event_id,"
                 " matrix_room_id, meshtastic_text, meshtastic_meshnet)"
                 " VALUES (?, ?, ?, ?, ?)",
-                (str(args.packet_id), args.event_id, args.room, args.text, args.meshnet),
+                (
+                    str(args.packet_id),
+                    args.event_id,
+                    args.room,
+                    args.text,
+                    args.meshnet,
+                ),
             )
             conn.commit()
-        print(json.dumps({"seeded": {"meshtastic_id": str(args.packet_id), "matrix_event_id": args.event_id}}))
+        print(
+            json.dumps(
+                {
+                    "seeded": {
+                        "meshtastic_id": str(args.packet_id),
+                        "matrix_event_id": args.event_id,
+                    }
+                }
+            )
+        )
         return 0
 
     if args.command == "delete-event":
         with contextlib.closing(connect(args.db, write=True)) as conn:
-            cursor = conn.execute("DELETE FROM message_map WHERE matrix_event_id = ?", (args.event_id,))
+            cursor = conn.execute(
+                "DELETE FROM message_map WHERE matrix_event_id = ?", (args.event_id,)
+            )
             conn.commit()
             print(json.dumps({"deleted": cursor.rowcount}))
         return 0

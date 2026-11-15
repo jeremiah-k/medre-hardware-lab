@@ -9,13 +9,17 @@ description = "Shared Docker and physical-radio qualification lab for MEDRE"
 requires-python = ">=3.12"
 license = "MIT"
 readme = "README.md"
-authors = [{name = "Jeremiah K"}]
+authors = [{ name = "Jeremiah K" }]
 dependencies = []
 
 [project.optional-dependencies]
-hardware = ["medre==0.1.0", "medre-adapter-meshtastic==0.1.0", "medre-adapter-lxmf==0.1.0"]
+hardware = [
+  "medre==0.1.0",
+  "medre-adapter-meshtastic==0.1.0",
+  "medre-adapter-lxmf==0.1.0",
+]
 meshcore = ["medre-adapter-meshcore>=0.1.0,<0.2.0"]
-dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff", "black", "PyYAML"]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "PyYAML"]
 
 [project.scripts]
 medre-lab = "medre_lab.cli:main"
@@ -33,3 +37,17 @@ line-length = 88
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
+
+[tool.black]
+target-version = ["py312"]
+line-length = 88
+
+[tool.isort]
+profile = "black"
+
+[tool.uv]
+required-version = ">=0.12.22"
+
+# MeshCore has no published adapter wheel yet; lock a merged source revision.
+[tool.uv.sources]
+medre-adapter-meshcore = { git = "https://github.com/jeremiah-k/medre-adapter-meshcore.git", rev = "766a03645b99d927cbb56a66d7a698d0dc420941" }
