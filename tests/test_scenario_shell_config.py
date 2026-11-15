@@ -35,7 +35,6 @@ def test_scenario_shell_config_preserves_defaults_and_overrides(override):
     ]
 
 
-
 def test_deferred_scenario_is_recognized_without_running_it(tmp_path):
     """Formatting must not change the associative-array scenario key."""
     runner = tmp_path / "lab/run-scenarios.sh"
