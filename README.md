@@ -138,12 +138,14 @@ remains local and the distinction between historical and current evidence.
 Use the committed Trunk launcher; local work and CI share its tool versions:
 
 ```bash
-.trunk/trunk upgrade
 .trunk/trunk check --fix --all
 .trunk/trunk check --all --no-fix --ci
 uv sync --locked --extra dev
 uv run --no-sync pytest -q
 ```
+
+Run `.trunk/trunk upgrade` only for an intentional toolchain refresh; review
+the resulting pin changes and repeat both checks before committing.
 
 uv owns `.venv` and `uv.lock`; rerun sync after dependency changes. Select every
 needed extra on each sync. CI selects only `dev`, so offline tests do not start
