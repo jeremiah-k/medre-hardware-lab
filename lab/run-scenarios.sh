@@ -49,7 +49,7 @@ ALL_SCENARIOS=(
 
 # Scenarios deliberately NOT run (policy decisions recorded with reasons).
 declare -A DEFERRED_SCENARIOS=(
-	[threenode - same - mesh]="DEFERRED by owner (2026-11-10): same-mesh multi-relay loop handling is a later work item; scenario kept in scenarios/deferred/"
+	["threenode-same-mesh"]="DEFERRED by owner (2026-11-10): same-mesh multi-relay loop handling is a later work item; scenario kept in scenarios/deferred/"
 )
 
 if (($# > 0)); then
