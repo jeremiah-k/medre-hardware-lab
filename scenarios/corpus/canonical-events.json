@@ -1,0 +1,1043 @@
+{
+ "schema_version": 1,
+ "description": [
+  "Golden corpus of canonical radio-origin wire events for the MMRelay /",
+  "MEDRE interop suite. This file is the SINGLE AUTHORITY that judges BOTH",
+  "implementations' Matrix emissions: scenarios/lib/corpus.py validates any",
+  "live bot-authored event (from @relay-a, @relay-b, or the medre bot)",
+  "against these cases plus the shared contract, using medre's own installed",
+  "schema validation (bridge_context normalization + canonical model",
+  "construction) as the schema backend.",
+  "",
+  "A corpus case is an INVARIANT CLASS, not an exact-match fixture: a live",
+  "event matches by (event_kind, relation_info, channel) and must satisfy",
+  "the shared contract and the case's structural expectations. Each case",
+  "also carries a full synthetic wire example; `corpus.py selftest` proves",
+  "every example passes the validator and every contract violation class is",
+  "actually rejected.",
+  "",
+  "Wire projection covered here (Matrix message content):",
+  "  content.medre.envelope          - provenance envelope (schema v1)",
+  "  content.medre.metadata.bridge_context - bounded source claims + relations",
+  "",
+  "Event-kind mapping (the wire has no 'message.replied' kind): a radio reply",
+  "is event_kind message.created carrying relation_info=reply with a",
+  "radio-native target_native_ref. The corpus 'replied' cases document that",
+  "shape; the 'chain' case documents reply-to-a-reply correlation.",
+  "",
+  "Adapter ids are OPERATOR-CONFIGURED (mmrelay emits 'mmrelay.meshtastic';",
+  "the medre lab rig uses 'radio-a'/'radio-b' for its meshtastic adapters and",
+  "'medre' for its matrix adapter). The radio-origin class is therefore pinned",
+  "by the numeric channel/packet-id invariants - Matrix-origin channels (room",
+  "ids) and native message ids ($event ids) cannot satisfy them.",
+  "Meshnet-label isolation (r14/r15 regression class): the meshnet label is",
+  "an ATTRIBUTION string. Its canonical home is",
+  "bridge_context.source.native_facts.fields.meshnet_label; it may also",
+  "appear as bridge_context.source.origin_label (attribution fallback both",
+  "implementations emit). It must NEVER occupy a channel-identity field:",
+  "envelope.source_channel and source_native_ref.native_channel_id carry",
+  "the ORIGIN transport's channel identity only - numeric radio channel ids",
+  "('0', '2', ...) for radio origins, the peer's delivery-destination hash",
+  "for addressed-transport origins (the source ref's channel may be null",
+  "there). Relation-hint TARGET refs follow the TARGET's own transport:",
+  "radio-native targets keep numeric channel ids; Matrix-native targets",
+  "carry the room id ('!...') plus a $-prefixed Matrix event id.",
+  "",
+  "Packet ids are unsigned 32-bit integers as decimal strings; ZERO IS VALID",
+  "(the zero-target contract: '0' is never dropped as falsy). Live note:",
+  "a reply_id=0 tapback is not expressible over the radio wire (proto3",
+  "default, proven live 2026-11-10); the zero cases are enforced by the",
+  "validator itself and exercised by selftest.",
+  "",
+  "Reaction emote fallback leading newline (owner ruling 2026-11-12): a",
+  "reaction rendered as the m.emote fallback carries EXACTLY ONE intentional",
+  "leading newline on its body - mmrelay's radio->Matrix reaction emote",
+  "presentation template is the design reference, and two or ZERO leading",
+  "newlines is the defect class. Native m.reaction annotations stay bodyless",
+  "(no msgtype/body at all); every other body still rejects any leading",
+  "newline as the stray fallback-prefix shape."
+ ],
+ "contract": {
+  "envelope_schema_version": 1,
+  "event_kinds": [
+   "message.created",
+   "message.reacted"
+  ],
+  "relation_types": [
+   "reply",
+   "reaction"
+  ],
+  "numeric_channel_re": "^(0|[1-9][0-9]*)$",
+  "packet_id_re": "^[0-9]{1,10}$",
+  "packet_id_max": 4294967295,
+  "fact_key_re": "^[a-z][a-z0-9_]{0,63}$",
+  "max_bridge_string": 1024,
+  "max_facts": 12,
+  "max_fact_value": 256,
+  "max_relations": 32,
+  "radio_text_bytes_max": 227,
+  "attribution": {
+   "required": [
+    "sender_id"
+   ],
+   "any_of": [
+    "sender_name",
+    "sender_short_name"
+   ]
+  }
+ },
+ "cases": [
+  {
+   "name": "created-ch0",
+   "covers": "plain authored radio text on the primary channel; ch0 numeric channel identity; bounded native facts; sender attribution",
+   "match": {
+    "event_kind": "message.created",
+    "relation_info": "",
+    "channel": "0"
+   },
+   "example": {
+    "msgtype": "m.text",
+    "body": "hello from the mesh",
+    "format": "org.matrix.custom.html",
+    "formatted_body": "hello from the mesh",
+    "medre": {
+     "envelope": {
+      "schema_version": 1,
+      "canonical_event_id": "0d1f2a3b-4c5d-6e7f-8a9b-0c1d2e3f4a5b",
+      "source_adapter": "mmrelay.meshtastic",
+      "source_transport_id": "!a1b2c3d4",
+      "source_channel": "0",
+      "source_native_ref": {
+       "adapter": "mmrelay.meshtastic",
+       "native_channel_id": "0",
+       "native_message_id": "2747580760",
+       "native_thread_id": null
+      },
+      "event_kind": "message.created",
+      "relation_info": ""
+     },
+     "metadata": {
+      "bridge_context": {
+       "schema_version": 1,
+       "source": {
+        "adapter": "mmrelay.meshtastic",
+        "canonical_event_id": "0d1f2a3b-4c5d-6e7f-8a9b-0c1d2e3f4a5b",
+        "channel": "0",
+        "sender_id": "!a1b2c3d4",
+        "sender_name": "Alpha Peer",
+        "sender_short_name": "AP",
+        "sender_verification": "unknown",
+        "origin_label": "AlphaLab",
+        "native_ref": {
+         "adapter": "mmrelay.meshtastic",
+         "native_channel_id": "0",
+         "native_message_id": "2747580760",
+         "native_thread_id": null
+        },
+        "native_facts": {
+         "namespace": "meshtastic",
+         "fields": {
+          "portnum": 1,
+          "meshnet_label": "AlphaLab"
+         }
+        }
+       },
+       "relations": []
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "created-ch2",
+   "covers": "authored radio text on the secondary channel; non-zero numeric channel identity end to end",
+   "match": {
+    "event_kind": "message.created",
+    "relation_info": "",
+    "channel": "2"
+   },
+   "example": {
+    "msgtype": "m.text",
+    "body": "secondary channel hello",
+    "medre": {
+     "envelope": {
+      "schema_version": 1,
+      "canonical_event_id": "1e2f3a4b-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+      "source_adapter": "mmrelay.meshtastic",
+      "source_transport_id": "!b2c3d4e5",
+      "source_channel": "2",
+      "source_native_ref": {
+       "adapter": "mmrelay.meshtastic",
+       "native_channel_id": "2",
+       "native_message_id": "1405055332",
+       "native_thread_id": null
+      },
+      "event_kind": "message.created",
+      "relation_info": ""
+     },
+     "metadata": {
+      "bridge_context": {
+       "schema_version": 1,
+       "source": {
+        "adapter": "mmrelay.meshtastic",
+        "canonical_event_id": "1e2f3a4b-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+        "channel": "2",
+        "sender_id": "!b2c3d4e5",
+        "sender_name": "Beta Peer",
+        "sender_short_name": null,
+        "sender_verification": "unknown",
+        "origin_label": "BetaLab",
+        "native_ref": {
+         "adapter": "mmrelay.meshtastic",
+         "native_channel_id": "2",
+         "native_message_id": "1405055332",
+         "native_thread_id": null
+        },
+        "native_facts": {
+         "namespace": "meshtastic",
+         "fields": {
+          "portnum": 1,
+          "meshnet_label": "BetaLab"
+         }
+        }
+       },
+       "relations": []
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "created-zero-packet",
+   "covers": "packet id zero is a valid radio-native source reference (never dropped as falsy); live caveat: not injectable over the radio wire, enforced by the validator + selftest",
+   "match": {
+    "event_kind": "message.created",
+    "relation_info": "",
+    "channel": "0"
+   },
+   "example": {
+    "msgtype": "m.text",
+    "body": "packet id zero is still a packet",
+    "medre": {
+     "envelope": {
+      "schema_version": 1,
+      "canonical_event_id": "2f3a4b5c-6d7e-8f9a-0b1c-2d3e4f5a6b7c",
+      "source_adapter": "mmrelay.meshtastic",
+      "source_transport_id": "!c3d4e5f6",
+      "source_channel": "0",
+      "source_native_ref": {
+       "adapter": "mmrelay.meshtastic",
+       "native_channel_id": "0",
+       "native_message_id": "0",
+       "native_thread_id": null
+      },
+      "event_kind": "message.created",
+      "relation_info": ""
+     },
+     "metadata": {
+      "bridge_context": {
+       "schema_version": 1,
+       "source": {
+        "adapter": "mmrelay.meshtastic",
+        "canonical_event_id": "2f3a4b5c-6d7e-8f9a-0b1c-2d3e4f5a6b7c",
+        "channel": "0",
+        "sender_id": "!c3d4e5f6",
+        "sender_name": "Zero Node",
+        "sender_short_name": "ZN",
+        "sender_verification": "unknown",
+        "origin_label": "AlphaLab",
+        "native_ref": {
+         "adapter": "mmrelay.meshtastic",
+         "native_channel_id": "0",
+         "native_message_id": "0",
+         "native_thread_id": null
+        },
+        "native_facts": {
+         "namespace": "meshtastic",
+         "fields": {
+          "portnum": 1,
+          "meshnet_label": "AlphaLab"
+         }
+        }
+       },
+       "relations": []
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "replied-ch0-radio-target",
+   "covers": "radio reply rendered as message.created + relation_info=reply with a radio-native numeric target on ch0; attribution preserved",
+   "match": {
+    "event_kind": "message.created",
+    "relation_info": "reply",
+    "channel": "0",
+    "hint_target": "radio"
+   },
+   "example": {
+    "msgtype": "m.text",
+    "body": "replying across the mesh",
+    "medre": {
+     "envelope": {
+      "schema_version": 1,
+      "canonical_event_id": "3a4b5c6d-7e8f-9a0b-1c2d-3e4f5a6b7c8d",
+      "source_adapter": "mmrelay.meshtastic",
+      "source_transport_id": "!d4e5f6a7",
+      "source_channel": "0",
+      "source_native_ref": {
+       "adapter": "mmrelay.meshtastic",
+       "native_channel_id": "0",
+       "native_message_id": "2319876501",
+       "native_thread_id": null
+      },
+      "event_kind": "message.created",
+      "relation_info": "reply"
+     },
+     "metadata": {
+      "bridge_context": {
+       "schema_version": 1,
+       "source": {
+        "adapter": "mmrelay.meshtastic",
+        "canonical_event_id": "3a4b5c6d-7e8f-9a0b-1c2d-3e4f5a6b7c8d",
+        "channel": "0",
+        "sender_id": "!d4e5f6a7",
+        "sender_name": "Beta Relay",
+        "sender_short_name": "BR",
+        "sender_verification": "unknown",
+        "origin_label": "BetaLab",
+        "native_ref": {
+         "adapter": "mmrelay.meshtastic",
+         "native_channel_id": "0",
+         "native_message_id": "2319876501",
+         "native_thread_id": null
+        },
+        "native_facts": {
+         "namespace": "meshtastic",
+         "fields": {
+          "portnum": 1,
+          "meshnet_label": "BetaLab"
+         }
+        }
+       },
+       "relations": [
+        {
+         "relation_type": "reply",
+         "target_event_id": null,
+         "key": null,
+         "target_native_ref": {
+          "adapter": "mmrelay.meshtastic",
+          "native_channel_id": "0",
+          "native_message_id": "49762617",
+          "native_thread_id": null
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "replied-ch2-radio-target",
+   "covers": "structured reply on the secondary channel: reply target carries the SAME numeric channel id as the source (r14 invariant)",
+   "match": {
+    "event_kind": "message.created",
+    "relation_info": "reply",
+    "channel": "2",
+    "hint_target": "radio"
+   },
+   "example": {
+    "msgtype": "m.text",
+    "body": "channel-two reply",
+    "medre": {
+     "envelope": {
+      "schema_version": 1,
+      "canonical_event_id": "4b5c6d7e-8f9a-0b1c-2d3e-4f5a6b7c8d9e",
+      "source_adapter": "mmrelay.meshtastic",
+      "source_transport_id": "!e5f6a7b8",
+      "source_channel": "2",
+      "source_native_ref": {
+       "adapter": "mmrelay.meshtastic",
+       "native_channel_id": "2",
+       "native_message_id": "987654321",
+       "native_thread_id": null
+      },
+      "event_kind": "message.created",
+      "relation_info": "reply"
+     },
+     "metadata": {
+      "bridge_context": {
+       "schema_version": 1,
+       "source": {
+        "adapter": "mmrelay.meshtastic",
+        "canonical_event_id": "4b5c6d7e-8f9a-0b1c-2d3e-4f5a6b7c8d9e",
+        "channel": "2",
+        "sender_id": "!e5f6a7b8",
+        "sender_name": "Alpha Relay",
+        "sender_short_name": null,
+        "sender_verification": "unknown",
+        "origin_label": "AlphaLab",
+        "native_ref": {
+         "adapter": "mmrelay.meshtastic",
+         "native_channel_id": "2",
+         "native_message_id": "987654321",
+         "native_thread_id": null
+        },
+        "native_facts": {
+         "namespace": "meshtastic",
+         "fields": {
+          "portnum": 1,
+          "meshnet_label": "AlphaLab"
+         }
+        }
+       },
+       "relations": [
+        {
+         "relation_type": "reply",
+         "target_event_id": null,
+         "key": null,
+         "target_native_ref": {
+          "adapter": "mmrelay.meshtastic",
+          "native_channel_id": "2",
+          "native_message_id": "123456789",
+          "native_thread_id": null
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "replied-chained",
+   "covers": "reply chains: a reply whose radio-native target packet is itself the source packet of another replied event (depth-2 chain); target channel == source channel",
+   "match": {
+    "event_kind": "message.created",
+    "relation_info": "reply",
+    "channel": "0",
+    "hint_target": "radio"
+   },
+   "example": {
+    "msgtype": "m.text",
+    "body": "reply to the reply",
+    "medre": {
+     "envelope": {
+      "schema_version": 1,
+      "canonical_event_id": "5c6d7e8f-9a0b-1c2d-3e4f-5a6b7c8d9e0f",
+      "source_adapter": "mmrelay.meshtastic",
+      "source_transport_id": "!f6a7b8c9",
+      "source_channel": "0",
+      "source_native_ref": {
+       "adapter": "mmrelay.meshtastic",
+       "native_channel_id": "0",
+       "native_message_id": "555000111",
+       "native_thread_id": null
+      },
+      "event_kind": "message.created",
+      "relation_info": "reply"
+     },
+     "metadata": {
+      "bridge_context": {
+       "schema_version": 1,
+       "source": {
+        "adapter": "mmrelay.meshtastic",
+        "canonical_event_id": "5c6d7e8f-9a0b-1c2d-3e4f-5a6b7c8d9e0f",
+        "channel": "0",
+        "sender_id": "!f6a7b8c9",
+        "sender_name": "Alpha Peer",
+        "sender_short_name": "AP",
+        "sender_verification": "unknown",
+        "origin_label": "AlphaLab",
+        "native_ref": {
+         "adapter": "mmrelay.meshtastic",
+         "native_channel_id": "0",
+         "native_message_id": "555000111",
+         "native_thread_id": null
+        },
+        "native_facts": {
+         "namespace": "meshtastic",
+         "fields": {
+          "portnum": 1,
+          "meshnet_label": "AlphaLab"
+         }
+        }
+       },
+       "relations": [
+        {
+         "relation_type": "reply",
+         "target_event_id": null,
+         "key": null,
+         "target_native_ref": {
+          "adapter": "mmrelay.meshtastic",
+          "native_channel_id": "0",
+          "native_message_id": "2319876501",
+          "native_thread_id": null
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "reacted-ch0-plain",
+   "covers": "radio tapback as message.reacted with the EXACT relation key preserved byte-for-byte (plain symbol), numeric radio-native target, m.emote fallback body carrying the key verbatim",
+   "match": {
+    "event_kind": "message.reacted",
+    "relation_info": "reaction",
+    "channel": "0",
+    "hint_target": "radio"
+   },
+   "example": {
+    "msgtype": "m.emote",
+    "body": "\nreacted 🦄 to \"hello from the mesh\"",
+    "medre": {
+     "envelope": {
+      "schema_version": 1,
+      "canonical_event_id": "6d7e8f9a-0b1c-2d3e-4f5a-6b7c8d9e0f1a",
+      "source_adapter": "mmrelay.meshtastic",
+      "source_transport_id": "!a7b8c9d0",
+      "source_channel": "0",
+      "source_native_ref": {
+       "adapter": "mmrelay.meshtastic",
+       "native_channel_id": "0",
+       "native_message_id": "777000222",
+       "native_thread_id": null
+      },
+      "event_kind": "message.reacted",
+      "relation_info": "reaction"
+     },
+     "metadata": {
+      "bridge_context": {
+       "schema_version": 1,
+       "source": {
+        "adapter": "mmrelay.meshtastic",
+        "canonical_event_id": "6d7e8f9a-0b1c-2d3e-4f5a-6b7c8d9e0f1a",
+        "channel": "0",
+        "sender_id": "!a7b8c9d0",
+        "sender_name": "Beta Relay",
+        "sender_short_name": "BR",
+        "sender_verification": "unknown",
+        "origin_label": "BetaLab",
+        "native_ref": {
+         "adapter": "mmrelay.meshtastic",
+         "native_channel_id": "0",
+         "native_message_id": "777000222",
+         "native_thread_id": null
+        },
+        "native_facts": {
+         "namespace": "meshtastic",
+         "fields": {
+          "portnum": 1,
+          "meshnet_label": "BetaLab"
+         }
+        }
+       },
+       "relations": [
+        {
+         "relation_type": "reaction",
+         "target_event_id": null,
+         "key": "🦄",
+         "target_native_ref": {
+          "adapter": "mmrelay.meshtastic",
+          "native_channel_id": "0",
+          "native_message_id": "2747580760",
+          "native_thread_id": null
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "reacted-ch0-modifier",
+   "covers": "skin-tone-modifier reaction key preserved byte-exact (multi-codepoint symbol; byte-exact key requirement)",
+   "match": {
+    "event_kind": "message.reacted",
+    "relation_info": "reaction",
+    "channel": "0",
+    "hint_target": "radio"
+   },
+   "example": {
+    "msgtype": "m.emote",
+    "body": "\nreacted 👍🏽 to \"secondary channel hello\"",
+    "medre": {
+     "envelope": {
+      "schema_version": 1,
+      "canonical_event_id": "7e8f9a0b-1c2d-3e4f-5a6b-7c8d9e0f1a2b",
+      "source_adapter": "mmrelay.meshtastic",
+      "source_transport_id": "!b8c9d0e1",
+      "source_channel": "0",
+      "source_native_ref": {
+       "adapter": "mmrelay.meshtastic",
+       "native_channel_id": "0",
+       "native_message_id": "888000333",
+       "native_thread_id": null
+      },
+      "event_kind": "message.reacted",
+      "relation_info": "reaction"
+     },
+     "metadata": {
+      "bridge_context": {
+       "schema_version": 1,
+       "source": {
+        "adapter": "mmrelay.meshtastic",
+        "canonical_event_id": "7e8f9a0b-1c2d-3e4f-5a6b-7c8d9e0f1a2b",
+        "channel": "0",
+        "sender_id": "!b8c9d0e1",
+        "sender_name": "Alpha Relay",
+        "sender_short_name": null,
+        "sender_verification": "unknown",
+        "origin_label": "AlphaLab",
+        "native_ref": {
+         "adapter": "mmrelay.meshtastic",
+         "native_channel_id": "0",
+         "native_message_id": "888000333",
+         "native_thread_id": null
+        },
+        "native_facts": {
+         "namespace": "meshtastic",
+         "fields": {
+          "portnum": 1,
+          "meshnet_label": "AlphaLab"
+         }
+        }
+       },
+       "relations": [
+        {
+         "relation_type": "reaction",
+         "target_event_id": null,
+         "key": "👍🏽",
+         "target_native_ref": {
+          "adapter": "mmrelay.meshtastic",
+          "native_channel_id": "0",
+          "native_message_id": "1405055332",
+          "native_thread_id": null
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "reacted-zero-target",
+   "covers": "reaction whose radio-native target packet id is 0: zero stays a valid target (never dropped as falsy); live caveat: reply_id=0 not injectable over the radio wire, enforced by the validator + selftest",
+   "match": {
+    "event_kind": "message.reacted",
+    "relation_info": "reaction",
+    "channel": "0",
+    "hint_target": "radio"
+   },
+   "example": {
+    "msgtype": "m.emote",
+    "body": "\nreacted ⚡ to \"packet id zero is still a packet\"",
+    "medre": {
+     "envelope": {
+      "schema_version": 1,
+      "canonical_event_id": "8f9a0b1c-2d3e-4f5a-6b7c-8d9e0f1a2b3c",
+      "source_adapter": "mmrelay.meshtastic",
+      "source_transport_id": "!c9d0e1f2",
+      "source_channel": "0",
+      "source_native_ref": {
+       "adapter": "mmrelay.meshtastic",
+       "native_channel_id": "0",
+       "native_message_id": "999000444",
+       "native_thread_id": null
+      },
+      "event_kind": "message.reacted",
+      "relation_info": "reaction"
+     },
+     "metadata": {
+      "bridge_context": {
+       "schema_version": 1,
+       "source": {
+        "adapter": "mmrelay.meshtastic",
+        "canonical_event_id": "8f9a0b1c-2d3e-4f5a-6b7c-8d9e0f1a2b3c",
+        "channel": "0",
+        "sender_id": "!c9d0e1f2",
+        "sender_name": "Zero Node",
+        "sender_short_name": "ZN",
+        "sender_verification": "unknown",
+        "origin_label": "AlphaLab",
+        "native_ref": {
+         "adapter": "mmrelay.meshtastic",
+         "native_channel_id": "0",
+         "native_message_id": "999000444",
+         "native_thread_id": null
+        },
+        "native_facts": {
+         "namespace": "meshtastic",
+         "fields": {
+          "portnum": 1,
+          "meshnet_label": "AlphaLab"
+         }
+        }
+       },
+       "relations": [
+        {
+         "relation_type": "reaction",
+         "target_event_id": null,
+         "key": "⚡",
+         "target_native_ref": {
+          "adapter": "mmrelay.meshtastic",
+          "native_channel_id": "0",
+          "native_message_id": "0",
+          "native_thread_id": null
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "reacted-ch2",
+   "covers": "radio reaction on the secondary channel: reaction target carries the SAME numeric channel id as the tapback's channel (r14 invariant class)",
+   "match": {
+    "event_kind": "message.reacted",
+    "relation_info": "reaction",
+    "channel": "2",
+    "hint_target": "radio"
+   },
+   "example": {
+    "msgtype": "m.emote",
+    "body": "\nreacted 🚀 to \"channel-two reply\"",
+    "medre": {
+     "envelope": {
+      "schema_version": 1,
+      "canonical_event_id": "9a0b1c2d-3e4f-5a6b-7c8d-9e0f1a2b3c4d",
+      "source_adapter": "mmrelay.meshtastic",
+      "source_transport_id": "!d0e1f2a3",
+      "source_channel": "2",
+      "source_native_ref": {
+       "adapter": "mmrelay.meshtastic",
+       "native_channel_id": "2",
+       "native_message_id": "111000555",
+       "native_thread_id": null
+      },
+      "event_kind": "message.reacted",
+      "relation_info": "reaction"
+     },
+     "metadata": {
+      "bridge_context": {
+       "schema_version": 1,
+       "source": {
+        "adapter": "mmrelay.meshtastic",
+        "canonical_event_id": "9a0b1c2d-3e4f-5a6b-7c8d-9e0f1a2b3c4d",
+        "channel": "2",
+        "sender_id": "!d0e1f2a3",
+        "sender_name": "Beta Peer",
+        "sender_short_name": "BP",
+        "sender_verification": "unknown",
+        "origin_label": "BetaLab",
+        "native_ref": {
+         "adapter": "mmrelay.meshtastic",
+         "native_channel_id": "2",
+         "native_message_id": "111000555",
+         "native_thread_id": null
+        },
+        "native_facts": {
+         "namespace": "meshtastic",
+         "fields": {
+          "portnum": 1,
+          "meshnet_label": "BetaLab"
+         }
+        }
+       },
+       "relations": [
+        {
+         "relation_type": "reaction",
+         "target_event_id": null,
+         "key": "🚀",
+         "target_native_ref": {
+          "adapter": "mmrelay.meshtastic",
+          "native_channel_id": "2",
+          "native_message_id": "987654321",
+          "native_thread_id": null
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "replied-ch0-matrix-target",
+   "covers": "radio reply whose target resolved to the canonical Matrix event: the relation hints a MATRIX-native reference (room id channel + $event id) - the reply-target contract mmrelay's canonical_outbound documents",
+   "match": {
+    "event_kind": "message.created",
+    "relation_info": "reply",
+    "channel": "0",
+    "hint_target": "matrix"
+   },
+   "example": {
+    "msgtype": "m.text",
+    "body": "replying across the mesh",
+    "medre": {
+     "envelope": {
+      "schema_version": 1,
+      "canonical_event_id": "9a7b6c5d-4e3f-2a1b-0c9d-8e7f6a5b4c3d",
+      "source_adapter": "radio-c",
+      "source_transport_id": "!f2746318",
+      "source_channel": "0",
+      "source_native_ref": {
+       "adapter": "radio-c",
+       "native_channel_id": "0",
+       "native_message_id": "2066265818",
+       "native_thread_id": null
+      },
+      "event_kind": "message.created",
+      "relation_info": "reply"
+     },
+     "metadata": {
+      "bridge_context": {
+       "schema_version": 1,
+       "source": {
+        "adapter": "radio-c",
+        "canonical_event_id": "9a7b6c5d-4e3f-2a1b-0c9d-8e7f6a5b4c3d",
+        "channel": "0",
+        "sender_id": "!f2746318",
+        "sender_name": "MeshC Peer",
+        "sender_short_name": "MCP",
+        "sender_verification": "unknown",
+        "origin_label": "GammaLab",
+        "native_ref": {
+         "adapter": "radio-c",
+         "native_channel_id": "0",
+         "native_message_id": "2066265818",
+         "native_thread_id": null
+        },
+        "native_facts": {
+         "namespace": "meshtastic",
+         "fields": {
+          "portnum": 1,
+          "meshnet_label": "GammaLab"
+         }
+        }
+       },
+       "relations": [
+        {
+         "relation_type": "reply",
+         "target_event_id": null,
+         "key": null,
+         "target_native_ref": {
+          "adapter": "medre",
+          "native_channel_id": "!XFIPQjPsEzStODRDVw:lab.test",
+          "native_message_id": "$v7-RiDAFw3sOi7sVE2ecjEj4y2AyCABW5m68bwHB-bM",
+          "native_thread_id": null
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "reacted-ch0-unobserved-target",
+   "covers": "reaction whose target message was NEVER observed (the DM-privacy / cross-bridge class: the hinted radio-native packet id has no stored canonical event - e.g. a direct message the bridge ignores or a far bridge's own radio packet): the described emote body degrades to the honest wording 'an earlier message' instead of quoting an empty string; the literal shape to \"\" must not reach the wire (matrix renderer #53 convention, meshtastic renderer 614372e). Live radio-hint reacted events match reacted-ch0-plain first (first-match order); this case pins the licensed degraded shape and feeds the selftest positive + reaction-degraded-empty-quote negative",
+   "match": {
+    "event_kind": "message.reacted",
+    "relation_info": "reaction",
+    "channel": "0",
+    "hint_target": "radio"
+   },
+   "example": {
+    "msgtype": "m.emote",
+    "body": "\n[Meshtastic 6318/GammaLab]: reacted 🦄 to an earlier message",
+    "medre": {
+     "envelope": {
+      "schema_version": 1,
+      "canonical_event_id": "2a3b4c5d-6e7f-4a5b-8c9d-0e1f2a3b4c5d",
+      "source_adapter": "radio-c",
+      "source_transport_id": "!f2746318",
+      "source_channel": "0",
+      "source_native_ref": {
+       "adapter": "radio-c",
+       "native_channel_id": "0",
+       "native_message_id": "2279585588",
+       "native_thread_id": null
+      },
+      "event_kind": "message.reacted",
+      "relation_info": "reaction"
+     },
+     "metadata": {
+      "bridge_context": {
+       "schema_version": 1,
+       "source": {
+        "adapter": "radio-c",
+        "canonical_event_id": "2a3b4c5d-6e7f-4a5b-8c9d-0e1f2a3b4c5d",
+        "channel": "0",
+        "sender_id": "!f2746318",
+        "sender_name": "MeshC Peer",
+        "sender_short_name": "MCP",
+        "sender_verification": "unknown",
+        "origin_label": "GammaLab",
+        "native_ref": {
+         "adapter": "radio-c",
+         "native_channel_id": "0",
+         "native_message_id": "2279585588",
+         "native_thread_id": null
+        },
+        "native_facts": {
+         "namespace": "meshtastic",
+         "fields": {
+          "portnum": 1,
+          "meshnet_label": "GammaLab"
+         }
+        }
+       },
+       "relations": [
+        {
+         "relation_type": "reaction",
+         "target_event_id": null,
+         "key": "🦄",
+         "target_native_ref": {
+          "adapter": "radio-c",
+          "native_channel_id": "0",
+          "native_message_id": "999000555",
+          "native_thread_id": null
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "reacted-ch0-matrix-target",
+   "covers": "radio tapback resolved to the canonical Matrix event: the reacted hint targets a MATRIX-native reference (room id channel + $event id) while the source ref stays radio-native; exact key preserved in the fallback body",
+   "match": {
+    "event_kind": "message.reacted",
+    "relation_info": "reaction",
+    "channel": "0",
+    "hint_target": "matrix"
+   },
+   "example": {
+    "msgtype": "m.emote",
+    "body": "\n[Meshtastic 6318/GammaLab]: reacted 🦄 to \"seed text\"",
+    "medre": {
+     "envelope": {
+      "schema_version": 1,
+      "canonical_event_id": "1f2e3d4c-5b6a-7988-9aab-bccddeeff001",
+      "source_adapter": "radio-c",
+      "source_transport_id": "!f2746318",
+      "source_channel": "0",
+      "source_native_ref": {
+       "adapter": "radio-c",
+       "native_channel_id": "0",
+       "native_message_id": "2279585588",
+       "native_thread_id": null
+      },
+      "event_kind": "message.reacted",
+      "relation_info": "reaction"
+     },
+     "metadata": {
+      "bridge_context": {
+       "schema_version": 1,
+       "source": {
+        "adapter": "radio-c",
+        "canonical_event_id": "1f2e3d4c-5b6a-7988-9aab-bccddeeff001",
+        "channel": "0",
+        "sender_id": "!f2746318",
+        "sender_name": "MeshC Peer",
+        "sender_short_name": "MCP",
+        "sender_verification": "unknown",
+        "origin_label": "GammaLab",
+        "native_ref": {
+         "adapter": "radio-c",
+         "native_channel_id": "0",
+         "native_message_id": "2279585588",
+         "native_thread_id": null
+        },
+        "native_facts": {
+         "namespace": "meshtastic",
+         "fields": {
+          "portnum": 1,
+          "meshnet_label": "GammaLab"
+         }
+        }
+       },
+       "relations": [
+        {
+         "relation_type": "reaction",
+         "target_event_id": "a6250490-992b-4a78-8b9d-0c9ce4ee5433",
+         "key": "🦄",
+         "target_native_ref": {
+          "adapter": "medre",
+          "native_channel_id": "!XFIPQjPsEzStODRDVw:lab.test",
+          "native_message_id": "$8yridS8lvqSHKRw-ANruFwC9TsvH3lvi44__aDMFZDo",
+          "native_thread_id": null
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "created-lxmf-addressed",
+   "covers": "addressed-transport origin (LXMF): the channel is the peer's delivery-destination hash (the packet's source address), the native message id is the transport's hex message hash, no radio channel concept and no native_facts requirement - attribution via sender hash + name",
+   "match": {
+    "event_kind": "message.created",
+    "relation_info": "",
+    "channel_class": "addressed"
+   },
+   "example": {
+    "msgtype": "m.text",
+    "body": "[lab-counterpart/]: hello from the loopback",
+    "medre": {
+     "envelope": {
+      "schema_version": 1,
+      "canonical_event_id": "dabc6a82-0a51-4ac8-b2af-2bf4bb298f60",
+      "source_adapter": "lxmf0",
+      "source_transport_id": "ae227771e9e097e1d64206472bad5bf1",
+      "source_channel": "ae227771e9e097e1d64206472bad5bf1",
+      "event_kind": "message.created",
+      "relation_info": "",
+      "source_native_ref": {
+       "adapter": "lxmf0",
+       "native_channel_id": null,
+       "native_message_id": "a82262ed2d739653873910857ca78c65b4da4508cc868d9ca23b9b61a9b1f1b6",
+       "native_thread_id": null
+      }
+     },
+     "metadata": {
+      "bridge_context": {
+       "schema_version": 1,
+       "source": {
+        "adapter": "lxmf0",
+        "platform": "lxmf",
+        "canonical_event_id": "dabc6a82-0a51-4ac8-b2af-2bf4bb298f60",
+        "channel": "ae227771e9e097e1d64206472bad5bf1",
+        "sender_id": "ae227771e9e097e1d64206472bad5bf1",
+        "sender_name": "lab-counterpart",
+        "sender_short_name": "lab-counterpart",
+        "sender_verification": "unknown",
+        "origin_label": "",
+        "native_ref": {
+         "adapter": "lxmf0",
+         "native_channel_id": null,
+         "native_message_id": "a82262ed2d739653873910857ca78c65b4da4508cc868d9ca23b9b61a9b1f1b6",
+         "native_thread_id": null
+        }
+       },
+       "relations": []
+      }
+     }
+    }
+   }
+  }
+ ]
+}

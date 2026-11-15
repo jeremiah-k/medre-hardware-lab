@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medre-hardware-lab"
+version = "0.1.0.dev0"
+description = "Shared Docker and physical-radio qualification lab for MEDRE"
+requires-python = ">=3.12"
+license = "MIT"
+readme = "README.md"
+authors = [{name = "Jeremiah K"}]
+dependencies = []
+
+[project.optional-dependencies]
+hardware = ["medre==0.1.0", "medre-adapter-meshtastic==0.1.0", "medre-adapter-lxmf==0.1.0"]
+meshcore = ["medre-adapter-meshcore>=0.1.0,<0.2.0"]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff", "black", "PyYAML"]
+
+[project.scripts]
+medre-lab = "medre_lab.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["medre_lab*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests", "lab/tests"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

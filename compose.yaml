@@ -1,0 +1,626 @@
+# =============================================================================
+# MMRelay / MEDRE canonical interop lab
+#
+# Two MMRelay dev containers, each wired to its own meshtasticd software node
+# PAIRED WITH A PEER NODE (one virtual meshnet per relay: AlphaLab = A+A-peer,
+# BetaLab = B+B-peer), bridged through one shared Synapse homeserver.
+#
+# Compose profiles:
+#   (none)     the 2-relay base rig.
+#   `medre`    STRESS topology: medre-relay shares BOTH mmrelay meshnets via
+#              dedicated a/b-medre nodes (documents the cross-bridge loop).
+#   `normal`   NORMAL-DEPLOYMENT topology (loop-free star): medre-normal gets
+#              its OWN third meshnet MeshC (GammaLab) on its own docker
+#              bridge, plus a loopback-only LXMF/Reticulum leg. See
+#              lab/README.md.
+#
+# Peer nodes exist for (a) a second radio identity on each meshnet and
+# (b) injection/witness surfaces that never touch the relay-connected node's
+# API (meshtasticd force-closes the previous TCP client on each new API
+# connection). Radio injection goes through the peer; the relay hears the
+# packet over the simulated air (UDP multicast 224.0.0.69:4403, enabled by
+# Config.EnableUDP in lab/config/meshtasticd-config.yaml).
+#
+# The mmrelay source is consumed READ-ONLY from the host checkout
+# (mmrelay-src build context, /src bind mount) and shadowed in via
+# PYTHONPATH=/src/src, so branch iteration needs no rebuild.
+#
+# NOTE on the image pin: the owner directive is to track the DAILY firmware
+# channel. meshtasticd 2.7.15 (the CI-pinned digest) does not support
+# Config.EnableUDP, which the peer-node mesh requires. Fallback digest of the
+# last bring-up that passed is recorded in lab/VERSION.
+# =============================================================================
+name: medre-lab
+
+x-mmrelay-build: &mmrelay-build
+  build:
+    context: .
+    dockerfile: lab/mmrelay/Dockerfile
+    additional_contexts:
+      # Read-only build context pointing at the host mmrelay checkout.
+      # The checkout must be on branch release/1.5.0-medre-ingress (see lab/VERSION).
+      mmrelay-src: ${MMRELAY_SRC:?run medre-lab docker prepare}
+      # medre-adapter-matrix override context: the Dockerfile force-reinstalls
+      # medre-adapter-matrix FROM THIS CHECKOUT (git+file, direct_url.json
+      # carries the exact commit) instead of the pyproject-pinned revision.
+      # Same source the medre profiles mount/shadow (MEDRE_MATRIX_SRC), so one
+      # variable pins the matrix adapter everywhere it appears in the rig.
+      medre-matrix-src: ${MEDRE_MATRIX_SRC:?run medre-lab docker prepare}
+      # mmrelay-bake core context (R2 round): mmrelay's pyproject-era source
+      # imports the LEGACY rendering helper names that candidate core #504
+      # removed (extract_relation_text -> extract_event_text rename). The
+      # Dockerfile force-reinstalls medre core for the MMRELAY IMAGES from
+      # THIS checkout — the additive prerequisite #505 that preserves the
+      # legacy helpers AND carries the R2 APIs the candidate matrix adapter
+      # imports. medre-normal keeps mounting the #504 head; only the mmrelay
+      # bake differs. MMRelay's DECLARED core/Matrix pair still qualifies
+      # separately (rig-only bake overrides prove rig compatibility only).
+      mmrelay-core-src: ${MMRELAY_BAKE_CORE_SRC:?run medre-lab docker prepare}
+      # medre core override context (r26): the candidate matrix adapter
+      # requires core APIs from medre PR #504; the Dockerfile force-reinstalls
+      # medre core FROM THIS CHECKOUT so the baked core+adapter pair is
+      # consistent (the pyproject pin stays at the landed main revision).
+      medre-core-src: ${MEDRE_CORE_SRC:?run medre-lab docker prepare}
+    args:
+      # Ref resolved inside the checkout; lab/up.sh exports the exact HEAD
+      # SHA so a detached checkout is honored verbatim.
+      MEDRE_MATRIX_REF: ${MEDRE_MATRIX_REF:-main}
+      MEDRE_CORE_REF: ${MEDRE_CORE_REF:-main}
+      MMRELAY_BAKE_CORE_REF: ${MMRELAY_BAKE_CORE_REF:-main}
+  image: medre-lab/mmrelay-dev:latest
+
+# MEDRE dev image build (profiles `medre` + `normal`). Build contexts point
+# at the git worktrees holding the candidate revisions (created by lab/up.sh
+# guard rails; see lab/README.md "MEDRE bridge profile"):
+#   core       medre @ 93f43311 (release/0.1.0-schema-freeze)
+#   matrix     medre-adapter-matrix @ 75d961d8 (PR #42 head)
+#   meshtastic medre-adapter-meshtastic @ 928b9185 (PR #34 head)
+#   lxmf       medre-adapter-lxmf @ de04e71d (r15q-lxmf, READ-ONLY; optional
+#              LXMF transport baked so the `normal` profile can run it; the
+#              stress `medre` relay never references the lxmf transport)
+x-medre-build: &medre-build
+  build:
+    context: .
+    dockerfile: lab/medre/Dockerfile
+    additional_contexts:
+      medre-core-src: ${MEDRE_CORE_SRC:?run medre-lab docker prepare}
+      medre-matrix-src: ${MEDRE_MATRIX_SRC:?run medre-lab docker prepare}
+      medre-meshtastic-src: ${MEDRE_MESHTASTIC_SRC:?run medre-lab docker prepare}
+      medre-lxmf-src: ${MEDRE_LXMF_SRC:?run medre-lab docker prepare}
+  image: medre-lab/medre-dev:latest
+
+x-mmrelay-common: &mmrelay-common
+  <<: *mmrelay-build
+  restart: unless-stopped
+  stop_grace_period: 30s
+  user: "1000:1000"
+  environment:
+    PYTHONUNBUFFERED: "1"
+    MMRELAY_READY_FILE: /tmp/mmrelay-ready
+    TZ: UTC
+  # Branch source mounted read-only: the baked install (deps + package
+  # metadata) is shadowed by PYTHONPATH=/src/src at runtime.
+  healthcheck:
+    test:
+      [
+        CMD-SHELL,
+        "find $${MMRELAY_READY_FILE:-/tmp/mmrelay-ready} -mmin -2 | grep -q .",
+      ]
+    interval: 5s
+    timeout: 5s
+    retries: 12
+    start_period: 30s
+
+# meshtasticd nodes run WITHOUT -s: the -s flag short-circuits config-file
+# loading (PortduinoGlue force_simradio branch), which would silently disable
+# Config.EnableUDP and thus all cross-node sim-radio meshing.
+x-meshtasticd-common: &meshtasticd-common
+  image: meshtastic/meshtasticd@sha256:68694cd2b704a1f4ed3bc6739e8edb7b519ce5798ac2dbab1a6352f90a632e3f # daily 2.8.3.b78db83
+  restart: unless-stopped
+  healthcheck:
+    # NEVER probe the TCP API port: the API server keeps a single client
+    # and force-closes the standing one on each new connection, so a
+    # port-probe healthcheck evicts the relay (relay nodes) or an armed
+    # sniffer (peer nodes) every interval. Process liveness via /proc only.
+    test:
+      [
+        CMD-SHELL,
+        "bash -c 'for p in /proc/[0-9]*/comm; do grep -q meshtasticd \"$$p\" && exit 0; done; exit 1'",
+      ]
+    interval: 5s
+    timeout: 5s
+    retries: 36
+    start_period: 15s
+
+services:
+  synapse:
+    image: matrixdotorg/synapse@sha256:f223f5fc532600801284fededefca82288fb71551bf4fcc89cd0b3363a3461cc # v1.149.0
+    container_name: medre-lab-synapse
+    restart: unless-stopped
+    environment:
+      SYNAPSE_SERVER_NAME: lab.test
+      SYNAPSE_REPORT_STATS: "no"
+      TZ: UTC
+    ports:
+      # Loopback only: the lab is a local, untrusted-input-safe environment.
+      - "127.0.0.1:${LAB_MATRIX_PORT:-8008}:8008"
+    volumes:
+      - synapse-data:/data
+    networks:
+      - matrix
+    healthcheck:
+      test:
+        [
+          CMD-SHELL,
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8008/_matrix/client/versions', timeout=5)\"",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+
+  meshtasticd-a:
+    <<: *meshtasticd-common
+    container_name: medre-lab-mesh-a
+    command: ["meshtasticd", "--fsdir=/data", "-p", "4403", "-h", "11"]
+    ports:
+      - "127.0.0.1:4403:4403"
+    volumes:
+      - type: bind
+        source: ./lab/config/meshtasticd-config.yaml
+        target: /etc/meshtasticd/config.yaml
+        read_only: true
+      - mesh-a-node:/data
+    networks: [mesh-a]
+
+  meshtasticd-a-peer:
+    <<: *meshtasticd-common
+    container_name: medre-lab-mesh-a-peer
+    command: ["meshtasticd", "--fsdir=/data", "-p", "4403", "-h", "21"]
+    ports:
+      - "127.0.0.1:4405:4403"
+    volumes:
+      - type: bind
+        source: ./lab/config/meshtasticd-config.yaml
+        target: /etc/meshtasticd/config.yaml
+        read_only: true
+      - mesh-a-peer-node:/data
+    networks: [mesh-a]
+
+  meshtasticd-b:
+    <<: *meshtasticd-common
+    container_name: medre-lab-mesh-b
+    command: ["meshtasticd", "--fsdir=/data", "-p", "4403", "-h", "22"]
+    ports:
+      - "127.0.0.1:4404:4403"
+    volumes:
+      - type: bind
+        source: ./lab/config/meshtasticd-config.yaml
+        target: /etc/meshtasticd/config.yaml
+        read_only: true
+      - mesh-b-node:/data
+    networks: [mesh-b]
+
+  meshtasticd-b-peer:
+    <<: *meshtasticd-common
+    container_name: medre-lab-mesh-b-peer
+    command: ["meshtasticd", "--fsdir=/data", "-p", "4403", "-h", "32"]
+    ports:
+      - "127.0.0.1:4406:4403"
+    volumes:
+      - type: bind
+        source: ./lab/config/meshtasticd-config.yaml
+        target: /etc/meshtasticd/config.yaml
+        read_only: true
+      - mesh-b-peer-node:/data
+    networks: [mesh-b]
+
+  mmrelay-a:
+    <<: *mmrelay-common
+    container_name: medre-lab-mmrelay-a
+    command:
+      [
+        "python",
+        "-m",
+        "mmrelay.cli",
+        "--config",
+        "/config/mmrelay-a.yaml",
+        "--home",
+        "/data",
+        "--log-level",
+        "debug",
+      ]
+    # Per-relay volumes: /config bind (generated relay configs), /src bind
+    # (branch checkout, read-only), state named volume (nio store, SQLite,
+    # logs) mounted at MMRELAY home /data, echo_observed scenario plugin,
+    # and the shared lab-logs bind (plugin observation output).
+    volumes:
+      - type: bind
+        source: ./lab/state/config
+        target: /config
+        read_only: true
+      - type: bind
+        source: ${MMRELAY_SRC:?run medre-lab docker prepare}
+        target: /src
+        read_only: true
+      - type: bind
+        source: ./lab/plugins/echo_observed.py
+        target: /data/plugins/custom/echo_observed.py
+        read_only: true
+      - type: bind
+        source: ./lab/logs
+        target: /lab-logs
+      - mmrelay-a-state:/data
+    environment:
+      PYTHONUNBUFFERED: "1"
+      MMRELAY_READY_FILE: /tmp/mmrelay-ready
+      TZ: UTC
+      ECHO_OBSERVED_PATH: /lab-logs/scenarios/echo-observed-a.jsonl
+    networks: [matrix, mesh-a]
+    depends_on:
+      synapse:
+        condition: service_healthy
+      meshtasticd-a:
+        condition: service_healthy
+
+  mmrelay-b:
+    <<: *mmrelay-common
+    container_name: medre-lab-mmrelay-b
+    command:
+      [
+        "python",
+        "-m",
+        "mmrelay.cli",
+        "--config",
+        "/config/mmrelay-b.yaml",
+        "--home",
+        "/data",
+        "--log-level",
+        "debug",
+      ]
+    volumes:
+      - type: bind
+        source: ./lab/state/config
+        target: /config
+        read_only: true
+      - type: bind
+        source: ${MMRELAY_SRC:?run medre-lab docker prepare}
+        target: /src
+        read_only: true
+      - type: bind
+        source: ./lab/plugins/echo_observed.py
+        target: /data/plugins/custom/echo_observed.py
+        read_only: true
+      - type: bind
+        source: ./lab/logs
+        target: /lab-logs
+      - mmrelay-b-state:/data
+    environment:
+      PYTHONUNBUFFERED: "1"
+      MMRELAY_READY_FILE: /tmp/mmrelay-ready
+      TZ: UTC
+      ECHO_OBSERVED_PATH: /lab-logs/scenarios/echo-observed-b.jsonl
+    networks: [matrix, mesh-b]
+    depends_on:
+      synapse:
+        condition: service_healthy
+      meshtasticd-b:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
+  # MEDRE bridge profile: dedicated meshtasticd nodes + one medre relay.
+  #
+  # HARD RULE (owner-set): ONE api client per meshtasticd node. meshtasticd
+  # force-closes the standing TCP client on every new connection and the
+  # python transport auto-reconnects and fights. These nodes are therefore
+  # DEDICATED: meshtasticd-a-medre is owned exclusively by medre-relay
+  # (radio-a), meshtasticd-b-medre exclusively by medre-relay (radio-b) —
+  # never shared with mmrelay-a/b or the peer nodes. Healthchecks are /proc
+  # process scans (never TCP probes: a probe evicts the client every
+  # interval). Host ports 4407/4408 are loopback debugging conveniences ONLY;
+  # nothing in the lab connects to them while the relay is up.
+  # -------------------------------------------------------------------------
+  meshtasticd-a-medre:
+    <<: *meshtasticd-common
+    profiles: [medre]
+    container_name: medre-lab-mesh-a-medre
+    command: ["meshtasticd", "--fsdir=/data", "-p", "4403", "-h", "41"]
+    ports:
+      - "127.0.0.1:4407:4403"
+    volumes:
+      - type: bind
+        source: ./lab/config/meshtasticd-config.yaml
+        target: /etc/meshtasticd/config.yaml
+        read_only: true
+      - mesh-a-medre-node:/data
+    networks: [mesh-a]
+
+  meshtasticd-b-medre:
+    <<: *meshtasticd-common
+    profiles: [medre]
+    container_name: medre-lab-mesh-b-medre
+    command: ["meshtasticd", "--fsdir=/data", "-p", "4403", "-h", "52"]
+    ports:
+      - "127.0.0.1:4408:4403"
+    volumes:
+      - type: bind
+        source: ./lab/config/meshtasticd-config.yaml
+        target: /etc/meshtasticd/config.yaml
+        read_only: true
+      - mesh-b-medre-node:/data
+    networks: [mesh-b]
+
+  # -------------------------------------------------------------------------
+  # NORMAL-DEPLOYMENT profile (star topology; see lab/README.md). MeshC is a
+  # THIRD virtual meshnet on its own docker bridge: medre-normal owns the
+  # dedicated primary node (one API client per node) and the peer node is the
+  # tooling injection/witness surface. mmrelay-a/b keep their Alpha/Beta
+  # meshnets; the three meshes are L2-isolated from each other, so every
+  # bridge sits on its OWN mesh (loop-free star: no bridge shares a meshnet
+  # with another bridge, which is what closed the cross-bridge loop under the
+  # stress `medre` profile). Same pinned daily image + sim-radio config +
+  # /proc healthcheck as every other node.
+  # -------------------------------------------------------------------------
+  meshtasticd-c-medre:
+    <<: *meshtasticd-common
+    profiles: [normal]
+    container_name: medre-lab-mesh-c-medre
+    command: ["meshtasticd", "--fsdir=/data", "-p", "4403", "-h", "63"]
+    ports:
+      - "127.0.0.1:4409:4403"
+    volumes:
+      - type: bind
+        source: ./lab/config/meshtasticd-config.yaml
+        target: /etc/meshtasticd/config.yaml
+        read_only: true
+      - mesh-c-medre-node:/data
+    networks: [mesh-c]
+
+  meshtasticd-c-peer:
+    <<: *meshtasticd-common
+    profiles: [normal]
+    container_name: medre-lab-mesh-c-peer
+    command: ["meshtasticd", "--fsdir=/data", "-p", "4403", "-h", "74"]
+    ports:
+      - "127.0.0.1:4410:4403"
+    volumes:
+      - type: bind
+        source: ./lab/config/meshtasticd-config.yaml
+        target: /etc/meshtasticd/config.yaml
+        read_only: true
+      - mesh-c-peer-node:/data
+    networks: [mesh-c]
+
+  # One medre runtime for the NORMAL deployment: ONE matrix adapter
+  # (@medre:lab.test, bot account shared with the stress profile's relay —
+  # every lab/up.sh-orchestrated bring-up cross-stops the OTHER mode's medre
+  # containers first, so the two instances never coexist on an up.sh path;
+  # invoking raw `docker compose` with both profiles active is NOT guarded
+  # and would double-book the bot account), ONE
+  # meshtastic adapter (radio-c -> meshtasticd-c-medre on MeshC), and ONE
+  # lxmf adapter (loopback-only Reticulum UDPInterface pair inside the
+  # container network namespace; no hardware, no egress). The LXMF adapter
+  # code ships read-only from the r15q-lxmf worktree; RNS/LXMF deps are
+  # baked by lab/medre/Dockerfile.
+  medre-normal:
+    <<: *medre-build
+    profiles: [normal]
+    container_name: medre-lab-medre-normal
+    restart: unless-stopped
+    stop_grace_period: 30s
+    user: "1000:1000"
+    command: ["medre", "run", "--config", "/config/medre-normal.yaml"]
+    environment:
+      MEDRE_HOME: /data
+      PYTHONUNBUFFERED: "1"
+      TZ: UTC
+      # Candidate worktrees shadow the baked install (pkgutil namespace
+      # merging; core src first). lxmf LAST: it contributes the
+      # medre.adapters.lxmf portion of the namespace only.
+      PYTHONPATH: /src/core/src:/src/matrix/src:/src/meshtastic/src:/src/lxmf/src
+    volumes:
+      - type: bind
+        source: ./lab/state/config
+        target: /config
+        read_only: true
+      - type: bind
+        source: ${MEDRE_CORE_SRC:?run medre-lab docker prepare}
+        target: /src/core
+        bind:
+          create_host_path: false
+        read_only: true
+      - type: bind
+        source: ${MEDRE_MATRIX_SRC:?run medre-lab docker prepare}
+        target: /src/matrix
+        bind:
+          create_host_path: false
+        read_only: true
+      - type: bind
+        source: ${MEDRE_MESHTASTIC_SRC:?run medre-lab docker prepare}
+        target: /src/meshtastic
+        bind:
+          create_host_path: false
+        read_only: true
+      - type: bind
+        source: ${MEDRE_LXMF_SRC:?run medre-lab docker prepare}
+        target: /src/lxmf
+        bind:
+          create_host_path: false
+        read_only: true
+      # Lab tools (lxmf counterpart driver + peer bootstrap), read-only.
+      - type: bind
+        source: ./lab/tools
+        target: /opt/lab-tools
+        read_only: true
+      # Reticulum config template for medre's embedded RNS (loopback-only
+      # UDPInterface half); lab/up.sh seeds it into /data/reticulum in the
+      # state volume at bring-up (RNS writes a DEFAULT config if the dir is
+      # empty, which would silently drop the loopback interface).
+      - type: bind
+        source: ./lab/config/reticulum
+        target: /config-reticulum
+        read_only: true
+      # LXMF counterpart material on the host (peer identity, peer Reticulum
+      # config). medre itself never writes here; the counterpart driver does.
+      - type: bind
+        source: ./lab/state/lxmf
+        target: /data-lxmf
+      - medre-normal-state:/data
+    # Process-liveness healthcheck via /proc only (never TCP: a probe would
+    # evict the node's single API client; same rationale as medre-relay).
+    healthcheck:
+      test:
+        [
+          CMD-SHELL,
+          "bash -c 'for p in /proc/[0-9]*/cmdline; do tr \"\\0\" \"\\n\" < \"$$p\" | grep -qx \"/usr/local/bin/medre\" && exit 0; done; exit 1'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 30s
+    networks: [matrix, mesh-c]
+    depends_on:
+      synapse:
+        condition: service_healthy
+      meshtasticd-c-medre:
+        condition: service_healthy
+
+  # One medre runtime: ONE matrix adapter (@medre:lab.test) + TWO meshtastic
+  # adapter instances (radio-a -> meshtasticd-a-medre on AlphaLab, radio-b ->
+  # meshtasticd-b-medre on BetaLab). The runtime supports multiple instances
+  # per transport kind (see medre examples/configs/docker-bridge-smoke.yaml,
+  # which holds two matrix + two meshtastic instances in one process).
+  medre-relay:
+    <<: *medre-build
+    profiles: [medre]
+    container_name: medre-lab-medre-relay
+    restart: unless-stopped
+    stop_grace_period: 30s
+    user: "1000:1000"
+    command: ["medre", "run", "--config", "/config/medre-relay.yaml"]
+    environment:
+      MEDRE_HOME: /data
+      PYTHONUNBUFFERED: "1"
+      TZ: UTC
+      # Candidate worktrees shadow the baked install (pkgutil namespace
+      # merging; core src first). Mirrors the mmrelay PYTHONPATH dev pattern.
+      PYTHONPATH: /src/core/src:/src/matrix/src:/src/meshtastic/src
+    volumes:
+      - type: bind
+        source: ./lab/state/config
+        target: /config
+        read_only: true
+      - type: bind
+        source: ${MEDRE_CORE_SRC:?run medre-lab docker prepare}
+        target: /src/core
+        bind:
+          create_host_path: false
+        read_only: true
+      - type: bind
+        source: ${MEDRE_MATRIX_SRC:?run medre-lab docker prepare}
+        target: /src/matrix
+        bind:
+          create_host_path: false
+        read_only: true
+      - type: bind
+        source: ${MEDRE_MESHTASTIC_SRC:?run medre-lab docker prepare}
+        target: /src/meshtastic
+        bind:
+          create_host_path: false
+        read_only: true
+      - medre-state:/data
+    # Process-liveness healthcheck via /proc only. The exact-line match
+    # (`grep -qx '/usr/local/bin/medre'`) reads the relay process's
+    # NUL-separated argv, so the healthcheck shell's own cmdline (one long
+    # line containing the pattern as a substring) cannot match. No TCP
+    # probes anywhere in this lab's healthchecks.
+    healthcheck:
+      test:
+        [
+          CMD-SHELL,
+          "bash -c 'for p in /proc/[0-9]*/cmdline; do tr \"\\0\" \"\\n\" < \"$$p\" | grep -qx \"/usr/local/bin/medre\" && exit 0; done; exit 1'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 30s
+    networks: [matrix, mesh-a, mesh-b]
+    depends_on:
+      synapse:
+        condition: service_healthy
+      meshtasticd-a-medre:
+        condition: service_healthy
+      meshtasticd-b-medre:
+        condition: service_healthy
+
+  lab-tools:
+    build:
+      context: .
+      dockerfile: lab/tools/Dockerfile
+    image: medre-lab/lab-tools:latest
+    container_name: medre-lab-tools
+    restart: unless-stopped
+    user: "${LAB_UID:-1000}:${LAB_GID:-1000}"
+    environment:
+      TZ: UTC
+      LAB_STATE_DIR: /lab-state
+      LAB_LOGS_DIR: /lab-logs
+    command: ["sleep", "infinity"]
+    volumes:
+      # Host-side lab state (runtime.json, generated configs) and logs.
+      - ./lab/state:/lab-state
+      - ./lab/logs:/lab-logs
+      # Scenario suite layer (helpers run inside lab-tools).
+      - ./scenarios:/scenarios:ro
+      # Read-only views of relay state for SQLite assertions (message_map,
+      # names tables) and credentials/device-id reads.
+      - mmrelay-a-state:/state/mmrelay-a:ro
+      - mmrelay-b-state:/state/mmrelay-b:ro
+      # Read-only view of the medre relay state (medre.sqlite canonical
+      # event/delivery mapping db, adapter stores) for the same assertions.
+      - medre-state:/state/medre:ro
+      # Read-only view of the normal-profile medre runtime state (fresh
+      # volume; mapping db at /state/medre-normal/state/medre.sqlite).
+      - medre-normal-state:/state/medre-normal:ro
+    networks: [matrix, mesh-a, mesh-b, mesh-c]
+    depends_on:
+      synapse:
+        condition: service_healthy
+
+networks:
+  matrix:
+    name: medre-lab-matrix
+  mesh-a:
+    name: medre-lab-mesh-a
+  mesh-b:
+    name: medre-lab-mesh-b
+  mesh-c:
+    name: medre-lab-mesh-c
+
+volumes:
+  synapse-data:
+    name: medre-lab-synapse-data
+  mmrelay-a-state:
+    name: medre-lab-mmrelay-a-state
+  mmrelay-b-state:
+    name: medre-lab-mmrelay-b-state
+  medre-state:
+    name: medre-lab-medre-state
+  medre-normal-state:
+    name: medre-lab-medre-normal-state
+  mesh-a-node:
+    name: medre-lab-mesh-a-node
+  mesh-a-peer-node:
+    name: medre-lab-mesh-a-peer-node
+  mesh-a-medre-node:
+    name: medre-lab-mesh-a-medre-node
+  mesh-b-node:
+    name: medre-lab-mesh-b-node
+  mesh-b-peer-node:
+    name: medre-lab-mesh-b-peer-node
+  mesh-b-medre-node:
+    name: medre-lab-mesh-b-medre-node
+  mesh-c-medre-node:
+    name: medre-lab-mesh-c-medre-node
+  mesh-c-peer-node:
+    name: medre-lab-mesh-c-peer-node

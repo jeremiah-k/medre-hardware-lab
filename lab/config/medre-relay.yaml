@@ -1,0 +1,112 @@
+# =============================================================================
+# MEDRE relay (interop lab) - contract config template.
+#
+# This committed file is the canonical one-process medre topology. lab/up.sh
+# copies it to lab/state/config/medre-relay.yaml with the __MEDRE_*__
+# placeholders substituted from lab/state/runtime.json (bot access token and
+# provisioned room IDs), and only when the `medre` compose profile is active.
+# The generated copy is the one mounted read-only into the medre-relay
+# container; the committed template is the durable contract.
+#
+# - Bot account: @medre:lab.test (registered by lab/tools/provision.py under
+#   the profile; password lab-medre-pass; token rotated each bring-up).
+# - ONE matrix adapter + TWO meshtastic adapter instances in one runtime:
+#   radio-a owns meshtasticd-a-medre (meshnet AlphaLab, dedicated node,
+#   never shared with mmrelay-a or the peer), radio-b owns
+#   meshtasticd-b-medre (meshnet BetaLab).
+# - Room <-> (meshnet, channel) mapping mirrors the mmrelay configs' channel
+#   identity (index 0 primary, index 2 secondary) with one room per
+#   origin-meshnet x channel. mmrelay's config maps ALL four rooms onto its
+#   one radio; medre's route model expands context_map into per-context
+#   legs and rejects duplicate dest_context across reverse legs (fan-in
+#   ambiguity, routing-delivery spec 17.6), so the medre mapping is
+#   per-meshnet: Alpha rooms <-> radio-a, Beta rooms <-> radio-b.
+# - The retired mmrelay_compatibility switch was DROPPED by the meshtastic
+#   adapter (25b5583b): the legacy flat meshtastic_* Matrix-event embedding it
+#   described no longer exists, and constructing the config with the key now
+#   fails. Behavior is unchanged (canonical attribution prefixes, descriptive
+#   reactions, tapback replies).
+# - Trust: peer relay authorization lives on the mmrelay side
+#   (matrix.trusted_relays gains "@medre:lab.test" via profile-gated
+#   injection in lab/up.sh). The candidate matrix adapter config surface
+#   (medre-adapter-matrix 75d961d8) exposes no operator-facing MXID allowlist
+#   for peer relays; inbound peer claims are carried as unverified source
+#   observations on the event metadata (core 93f43311 native-facts contract).
+# - #lab-other and #lab-bridge-e2ee are mapped NOWHERE by this config.
+# =============================================================================
+
+runtime:
+  name: medre-lab-medre-relay
+  shutdown_timeout_seconds: 30
+
+logging:
+  level: DEBUG # bring-up visibility; medre log surfaces on container stdout
+  format: text
+
+storage:
+  backend: sqlite
+  path: "{state}/medre.sqlite" # MEDRE_HOME=/data -> /data/state/medre.sqlite
+
+adapters:
+  matrix:
+    medre:
+      enabled: true
+      adapter_kind: real
+      homeserver: "http://synapse:8008"
+      user_id: "@medre:lab.test"
+      access_token: "__MEDRE_ACCESS_TOKEN__" # substituted by lab/up.sh
+      encryption_mode: plaintext
+      room_allowlist:
+        - "__ROOM_ALPHA_CH0__" # substituted by lab/up.sh
+        - "__ROOM_ALPHA_CH2__"
+        - "__ROOM_BETA_CH0__"
+        - "__ROOM_BETA_CH2__"
+      relay_prefix: "[{sender}/{origin_label}]: " # radio -> Matrix attribution
+
+  meshtastic:
+    radio-a:
+      enabled: true
+      adapter_kind: real
+      connection_type: tcp
+      host: "meshtasticd-a-medre"
+      port: 4403
+      origin_label: "AlphaLab" # mirrors mmrelay-a meshtastic.meshnet_name
+      relay_prefix: "{sender_short}: " # Matrix -> radio attribution (unified key, core #496)
+      channel_mapping:
+        "0": "LabPrimA"
+        "2": "LabSecA"
+
+    radio-b:
+      enabled: true
+      adapter_kind: real
+      connection_type: tcp
+      host: "meshtasticd-b-medre"
+      port: 4403
+      origin_label: "BetaLab" # mirrors mmrelay-b meshtastic.meshnet_name
+      relay_prefix: "{sender_short}: " # unified key, core #496
+      channel_mapping:
+        "0": "LabPrimB"
+        "2": "LabSecB"
+
+routes:
+  alpha-radio:
+    source_adapters: ["radio-a"]
+    dest_adapters: ["medre"]
+    directionality: bidirectional
+    enabled: true
+    context_map:
+      "0":
+        dest_context: "__ROOM_ALPHA_CH0__"
+      "2":
+        dest_context: "__ROOM_ALPHA_CH2__"
+
+  beta-radio:
+    source_adapters: ["radio-b"]
+    dest_adapters: ["medre"]
+    directionality: bidirectional
+    enabled: true
+    context_map:
+      "0":
+        dest_context: "__ROOM_BETA_CH0__"
+      "2":
+        dest_context: "__ROOM_BETA_CH2__"

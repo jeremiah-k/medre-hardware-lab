@@ -1,0 +1,145 @@
+# =============================================================================
+# MEDRE normal-deployment runtime (interop lab) - contract config template.
+#
+# This committed file is the canonical ONE-process medre topology for the
+# `normal` compose profile (the realistic deployment: the bridge owns its own
+# meshnet and a local LXMF store-and-forward leg, and shares Matrix rooms
+# with two mmrelay relays that each own their own meshnet — a loop-free star).
+# lab/up.sh copies it to lab/state/config/medre-normal.yaml with the
+# __MEDRE_NORMAL_*__ placeholders substituted (bot access token, provisioned
+# room IDs, LXMF counterpart destination hash) and only when the `normal`
+# profile is active. The generated copy is the one mounted read-only into the
+# medre-normal container; the committed template is the durable contract.
+#
+# - Bot account: @medre:lab.test (the SAME account the stress `medre` profile
+#   uses; lab/up.sh guarantees the two instances never run simultaneously and
+#   reprovisions a fresh token on every --normal bring-up).
+# - ONE matrix adapter + ONE meshtastic adapter + ONE lxmf adapter in one
+#   runtime:
+#     matrix  -> the two shared bridge rooms (#lab-bridge ch0,
+#                #lab-bridge-ch2 ch2) — the SINGLE shared surface.
+#     radio-c -> meshtasticd-c-medre (meshnet GammaLab, dedicated node on its
+#                own docker bridge `mesh-c`, never shared with mmrelay-a/b or
+#                the peer).
+#     lxmf0   -> LOOPBACK-ONLY Reticulum: an embedded RNS instance with a
+#                single UDPInterface pair confined to 127.0.0.1 inside the
+#                container's network namespace (no hardware, no egress). The
+#                counterpart driver (lab/tools/lxmf_counterpart.py, run via
+#                `docker compose exec medre-normal`) connects over the other
+#                half of the pair using the config seeded into /data-lxmf.
+# - Routes: bridge rooms <-> radio-c channels (0/2) and #lab-bridge <->
+#   the LXMF counterpart destination (bidirectional: counterpart messages
+#   surface in #lab-bridge; room text fans out to the LXMF leg). The LXMF
+#   "channel" key is the peer's delivery-destination hash (adapter codec
+#   contract), which is what dest_channel carries.
+# - Loop freedom (why this star topology cannot cycle): each bridge sits on
+#   its OWN meshnet, so a relay's radio TX is never heard by another bridge;
+#   the only cross-bridge surface is Matrix, where mmrelay marks its own
+#   sends and every other bridge's re-bridge terminates on its own mesh.
+#   The stress `medre` profile keeps the shared-mesh loop case documented.
+# - Trust: peer relay authorization lives on the mmrelay side (generated
+#   mmrelay configs list the peer relay bot AND @medre:lab.test under
+#   `normal`). The matrix adapter exposes no operator-facing MXID allowlist;
+#   inbound peer claims ride on event metadata as unverified source
+#   observations (core 93f43311 native-facts contract).
+# - All other lab rooms (#lab-alpha-*, #lab-beta-*, #lab-other,
+#   #lab-bridge-e2ee) are mapped NOWHERE by this config.
+# =============================================================================
+
+runtime:
+  name: medre-lab-medre-normal
+  shutdown_timeout_seconds: 30
+
+logging:
+  level: DEBUG # bring-up visibility; medre log surfaces on container stdout
+  format: text
+
+storage:
+  backend: sqlite
+  path: "{state}/medre.sqlite" # MEDRE_HOME=/data -> /data/state/medre.sqlite
+
+# Hard content privacy ceiling (operator opt-in; docs/spec/configuration.md
+# section 2.9). Enabling it also provisions described-reaction and reply
+# quote previews: admission issues the bounded `reply_quotes` body grant so
+# a resolved-target reaction quotes the seed text after ingress completes
+# (core change: ceiling-governed admission issues the bounded reply-quote
+# grant). 24h bounds quoting and every content dependency well outside any
+# lab scenario duration while staying far under the 1-year schema maximum.
+content_ceiling:
+  enabled: true
+  max_age_seconds: 86400
+
+adapters:
+  matrix:
+    medre:
+      enabled: true
+      adapter_kind: real
+      homeserver: "http://synapse:8008"
+      user_id: "@medre:lab.test"
+      access_token: "__MEDRE_ACCESS_TOKEN__" # substituted by lab/up.sh
+      encryption_mode: plaintext
+      room_allowlist:
+        - "__ROOM_BRIDGE__" # substituted by lab/up.sh
+        - "__ROOM_BRIDGE_CH2__"
+      relay_prefix: "[{sender}/{origin_label}]: " # radio -> Matrix attribution
+
+  meshtastic:
+    radio-c:
+      enabled: true
+      adapter_kind: real
+      connection_type: tcp
+      host: "meshtasticd-c-medre"
+      port: 4403
+      origin_label: "GammaLab" # medre-normal's OWN meshnet (MeshC bridge)
+      relay_prefix: "{sender_short}: " # Matrix -> radio attribution (unified key, core #496)
+      channel_mapping:
+        "0": "LabPrimC"
+        "2": "LabSecC"
+
+  lxmf:
+    lxmf0:
+      enabled: true
+      adapter_kind: real
+      connection_type: reticulum
+      # Embedded, container-private Reticulum: config dir is seeded by
+      # lab/up.sh from lab/config/reticulum/medre.config (one loopback-only
+      # UDPInterface half, share_instance = No). RNS keeps its destination
+      # cache under the same dir (writable, volume-backed).
+      reticulum_config_dir: "/data/reticulum"
+      # LXMRouter storage (required in reticulum mode). The adapter's own
+      # Reticulum identity auto-persists here on first start (no
+      # identity_path: the worker stores a dedicated identity in the storage
+      # path), so this stays stable across restarts.
+      storage_path: "/data/lxmf-router"
+      display_name: "medre-lab"
+      # Announce cadence: the counterpart learns the path to medre's delivery
+      # destination from these announces (loop sleeps one interval first).
+      announce_interval_seconds: 15
+      default_delivery_method: opportunistic
+      stamp_cost: 0 # lab loopback: no proof-of-work stamps required
+      message_delay_seconds: 0
+      relay_prefix: "" # human readability only; envelope is authoritative (unified key, core #497 / lxmf 438a149)
+
+routes:
+  gamma-radio:
+    source_adapters: ["radio-c"]
+    dest_adapters: ["medre"]
+    directionality: bidirectional
+    enabled: true
+    context_map:
+      "0":
+        dest_context: "__ROOM_BRIDGE__"
+      "2":
+        dest_context: "__ROOM_BRIDGE_CH2__"
+
+  lxmf-bridge:
+    # Bidirectional over the peer's fixed delivery-destination hash:
+    # forward (matrix -> lxmf) targets the counterpart; reverse
+    # (lxmf -> matrix) matches inbound events whose source channel is the
+    # sender's delivery-destination hash (adapter codec contract).
+    source_adapters: ["medre"]
+    dest_adapters: ["lxmf0"]
+    directionality: bidirectional
+    enabled: true
+    source_room: "__ROOM_BRIDGE__"
+    dest_channel: "__LXMF_PEER_DEST__"

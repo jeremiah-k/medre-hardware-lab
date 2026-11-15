@@ -1,0 +1,29 @@
+# interop-lab Synapse overrides v3 (appended to /data/homeserver.yaml by lab/up.sh)
+# Lifted from the upstream CI homeserver tuning: shared-secret registration for
+# idempotent provisioning and relaxed rate limits for bursty relay/invite
+# traffic. rc_invites uses the structured per_room/per_user/per_issuer form
+# (a flat rc_invites block is ignored by Synapse >= ~v1.4x).
+registration_shared_secret: "medre-lab-shared-secret"
+rc_message:
+  per_second: 25
+  burst_count: 100
+rc_invites:
+  per_room:
+    per_second: 5
+    burst_count: 50
+  per_user:
+    per_second: 5
+    burst_count: 50
+  per_issuer:
+    per_second: 5
+    burst_count: 50
+rc_login:
+  address:
+    per_second: 5
+    burst_count: 30
+  account:
+    per_second: 5
+    burst_count: 30
+  failed_attempts:
+    per_second: 5
+    burst_count: 30

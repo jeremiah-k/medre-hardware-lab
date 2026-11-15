@@ -1,0 +1,56 @@
+# =============================================================================
+# MMRelay instance A (interop lab)
+# - Bot account: @relay-a:lab.test
+# - Meshtastic: TCP to its own meshtasticd node (meshnet AlphaLab =
+#   meshtasticd-a + meshtasticd-a-peer); the peer is the injection/witness
+#   surface and never hosts the relay's API connection.
+# - trusted_relays: ONLY the other relay bot's exact MXIDs.
+# - Rooms: one shared room per (origin meshnet, channel) pair. A maps
+#   Alpha-origin rooms to the channel it observed them on and bridges
+#   Beta-origin rooms onto its own radio at the same channel index.
+# - #lab-other is mapped NOWHERE (deliberate: clean cross-room-rejection).
+# =============================================================================
+
+matrix:
+  homeserver: "http://synapse:8008"
+  bot_user_id: "@relay-a:lab.test"
+  trusted_relays: ["@relay-b:lab.test"]
+  e2ee:
+    enabled: true
+    store_path: "/data/matrix/store"
+
+matrix_rooms:
+  - id: "#lab-alpha-ch0:lab.test"
+    meshtastic_channel: 0
+  - id: "#lab-alpha-ch2:lab.test"
+    meshtastic_channel: 2
+  - id: "#lab-beta-ch0:lab.test"
+    meshtastic_channel: 0
+  - id: "#lab-beta-ch2:lab.test"
+    meshtastic_channel: 2
+
+custom-plugins:
+  echo_observed:
+    active: true
+
+meshtastic:
+  connection_type: tcp
+  host: "meshtasticd-a"
+  port: 4403
+  meshnet_name: "AlphaLab"
+  nodedb_refresh_interval: 5
+  health_check:
+    enabled: false
+  broadcast_enabled: true
+  message_interactions:
+    reactions: true
+    replies: true
+
+database:
+  msg_map:
+    msgs_to_keep: 1500
+    wipe_on_restart: false
+
+logging:
+  level: debug
+  log_to_file: true

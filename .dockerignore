@@ -1,0 +1,17 @@
+.git
+.env
+lab.toml
+sources
+profiles
+identities
+evidence
+lab/state
+lab/logs
+lab/config/meshnet.env
+.venv
+.pytest_cache
+.ruff_cache
+**/__pycache__
+build
+dist
+*.egg-info

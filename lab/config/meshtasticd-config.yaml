@@ -1,0 +1,14 @@
+# meshtasticd node config for all interop-lab nodes (mounted read-only at
+# /etc/meshtasticd/config.yaml).
+#
+# - Lora.Module: sim replaces the CLI -s flag. IMPORTANT: meshtasticd -s
+#   short-circuits config-file loading entirely (PortduinoGlue
+#   force_simradio branch), which silently disables Config.EnableUDP.
+# - Config.EnableUDP turns on the sim-radio UDP multicast mesh
+#   (224.0.0.69:4403) so a node and its peer on the same docker bridge form
+#   one virtual meshnet. Requires meshtasticd firmware with EnableUDP
+#   support (daily/2.8.x does; 2.7.15 does not).
+Config:
+  EnableUDP: true
+Lora:
+  Module: sim

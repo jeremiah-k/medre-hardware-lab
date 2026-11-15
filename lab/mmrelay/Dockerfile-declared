@@ -1,0 +1,81 @@
+# =============================================================================
+# MMRelay DEV image for the interop lab.
+#
+# Mirrors the upstream Dockerfile dependency install (pip install ".[e2e]"
+# into a /install prefix, python:3.15-slim-bookworm runtime with git/procps)
+# so E2EE and relay dependencies are baked. The mmrelay source is NOT baked
+# into the running path: the host checkout is mounted read-only at /src and
+# PYTHONPATH=/src/src shadows the baked package, so branch iteration needs
+# no rebuild. The baked install provides package metadata + entry points.
+#
+# Build requires the extra build context "mmrelay-src" pointing at the host
+# checkout (see compose.yaml x-mmrelay-build).
+# =============================================================================
+
+# Build stage: identical dependency install to the upstream Dockerfile.
+FROM python:3.15-slim-bookworm@sha256:96599df822d0e1c6bb700014a05c7f3c8cabc6e0f7ff3c4f9f69cee033b4b5d9 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential=12.9 \
+    git=1:2.39.5-0+deb12u2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir --upgrade pip==26.2.1 setuptools==80.9.0 wheel==0.45.1
+
+# Copy source from the read-only mmrelay-src context (host checkout).
+COPY --from=mmrelay-src pyproject.toml MANIFEST.in setup.py README.md LICENSE ./
+COPY --from=mmrelay-src src/ ./src/
+
+# hadolint ignore=DL3013
+RUN python -m pip install --no-cache-dir --timeout=300 --retries=3 \
+    --prefix=/install ".[e2e]"
+
+# -----------------------------------------------------------------------------
+# =============================================================================
+# DECLARED-PAIR variant of lab/mmrelay/Dockerfile.
+#
+# Identical builder/runtime minus BOTH rig override stages: the image contains
+# exactly what mmrelay's pyproject declares (medre core + medre-adapter-matrix
+# at their git pins, resolved from GitHub by the primary install). Used to
+# qualify the declared dependency pair itself - the override bake proves rig
+# compatibility, never the declared pin (see Dockerfile notes). A bake stamp
+# records the declaration mode; verify the resolved revisions in-container via
+# direct_url.json vcs_info before trusting a build.
+# =============================================================================
+FROM python:3.15-slim-bookworm@sha256:96599df822d0e1c6bb700014a05c7f3c8cabc6e0f7ff3c4f9f69cee033b4b5d9
+
+RUN groupadd --gid 1000 mmrelay && \
+    useradd --uid 1000 --gid mmrelay --shell /bin/bash --create-home mmrelay
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git=1:2.39.5-0+deb12u2 \
+    procps=2:4.0.2-3 \
+    && (apt-get install -y --no-install-recommends bluez=5.66-1+deb12u2 || echo "Warning: bluez package not found for this architecture. BLE support will be unavailable.") \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /install /usr/local
+
+RUN mkdir -p /app /data /config && chown -R mmrelay:mmrelay /app /data
+
+ARG BUILD_DATE
+ARG VCS_REF
+LABEL org.opencontainers.image.title="MMRelay dev (interop-lab)" \
+    org.opencontainers.image.description="MMRelay dev container: deps baked, source mounted at /src" \
+    org.opencontainers.image.revision="${VCS_REF:-unknown}" \
+    org.opencontainers.image.created="${BUILD_DATE:-unknown}"
+
+ENV PYTHONUNBUFFERED=1
+ENV MPLCONFIGDIR=/tmp/matplotlib
+ENV PATH=/usr/local/bin:/usr/bin:/bin
+ENV MMRELAY_HOME=/data
+ENV MMRELAY_READY_FILE=/tmp/mmrelay-ready
+# Dev shadowing: mounted branch source takes precedence over the baked install.
+ENV PYTHONPATH=/src/src
+
+USER 1000:1000
+
+WORKDIR /app
+
+CMD ["python", "-m", "mmrelay.cli"]
