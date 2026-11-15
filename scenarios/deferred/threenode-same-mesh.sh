@@ -26,8 +26,8 @@
 #      the packet id in A's map row).
 # =============================================================================
 set -euo pipefail
-# shellcheck source=lib/common.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+# shellcheck source=../lib/common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/common.sh"
 
 require_rig
 resolve_rooms
