@@ -1,7 +1,7 @@
 # Python policy lives in pyproject.toml; source-able config.env is Bash.
 version: 0.1
 cli:
-  version: 1.29.0 # renovate: datasource=github-releases depName=trunk-io/trunk
+  version: 1.29.0 # renovate: datasource=custom.trunk-cli depName=trunk-cli
 plugins:
   sources:
     - id: trunk

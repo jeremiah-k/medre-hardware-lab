@@ -29,15 +29,28 @@
       "matchFileNames": [".trunk/trunk.yaml"],
       "groupName": "Trunk toolchain",
       "automerge": false
+    },
+    {
+      "description": "Review CLI releases from the launcher manifest without a release timestamp",
+      "matchDatasources": ["custom.trunk-cli"],
+      "minimumReleaseAge": "0 days",
+      "automerge": false
     }
   ],
+  "customDatasources": {
+    "trunk-cli": {
+      "defaultRegistryUrlTemplate": "https://trunk.io/releases/latest",
+      "format": "yaml",
+      "transformTemplates": ["{\"releases\":[{\"version\": $string(version)}]}"]
+    }
+  },
   "customManagers": [
     {
       "customType": "regex",
       "description": "Track Trunk CLI, plugins and linters from their declared upstream package sources",
       "managerFilePatterns": ["/^\\.trunk/trunk\\.yaml$/"],
       "matchStrings": [
-        "(?:@|version:\\s+|ref:\\s+v?)(?<currentValue>[0-9][^\\s]*)\\s+# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)"
+        "(?:@|version:\\s+|ref:\\s+v?)(?<currentValue>[0-9][^\\s]*)\\s+# renovate: datasource=(?<datasource>[a-z.-]+) depName=(?<depName>[^\\s]+)"
       ],
       "extractVersionTemplate": "^v?(?<version>.*)$"
     }
