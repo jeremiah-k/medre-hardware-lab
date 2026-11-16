@@ -35,3 +35,6 @@ junit-*.xml
 htmlcov/
 .env
 .medre-dev.yaml
+
+# Private operator state and isolated campaign environments
+/.local/

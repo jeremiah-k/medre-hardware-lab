@@ -1,4 +1,4 @@
-# Provenance and migration
+# Provenance
 
 The Docker topology, scenario corpus and source-mount guard were imported from
 the existing local interop-lab. Native peer ownership and protocol helpers derive
@@ -7,11 +7,9 @@ from MEDRE's MIT-licensed live-test helpers at
 Git history, actual physical device mappings, embedded physical channel URLs,
 identity files, private configuration, runtime tokens and raw campaign evidence.
 
-The local source workspaces remain in place while the existing Docker rig is
-running. They are not a second supported operator interface. After this repo's
-Docker and hardware paths are qualified, stop the old topology, transfer only
-needed ignored local configuration, bring this topology up and verify it before
-retiring old directories. Never move a running rig's bind-mounted sources.
+The supported operator interface is this checkout. Keep exact sources and local
+state beneath its ignored paths. Each campaign records its actual source,
+package, SDK and observer provenance.
 
 The original short recovery campaign passed all six directed radio transport
 pairs with both board roles: 12/12 ordinary-text messages, each with independent
@@ -23,8 +21,8 @@ receipt provenance.
 
 ## Remaining qualification boundaries
 
-- Full Docker campaign on this portable checkout after a controlled topology
-  cutover; static Compose checks do not substitute for it.
+- Fresh Docker image builds and candidate source selections; static Compose
+  checks do not substitute for a campaign on the selected images.
 - Attachments, restart/recovery, sustained traffic and negative/absence windows
   beyond the short ordinary-text hardware route checks.
 - Mixed Matrix-to-physical-radio scenarios beyond the inherited Docker-only
