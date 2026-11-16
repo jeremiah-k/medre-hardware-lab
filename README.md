@@ -114,7 +114,13 @@ Each command runs one bounded startup and one message per direction, stops after
 a failed stage and writes private evidence under `evidence/`. Worker processes
 isolate SDK state. Native listener startup, observation and teardown run off the
 MEDRE event loop. Endpoint locks prevent overlapping lab runs from owning the
-same configured devices. An LXMF receiver is stopped/reaped before its identity
+same configured devices. Before arming the first peer receiver, the worker checks
+adapter health and waits for any reported initial startup drain to pass. The
+wait polls the reported epoch and window, follows initial-setup re-arms and
+fails within three times the initial window plus five seconds if it cannot
+establish retirement. Verdicts record each adapter's wait or skip reason in
+`startup_drain_wait`; native send and observation deadlines remain unchanged.
+An LXMF receiver is stopped/reaped before its identity
 is reused by the sender. Peer teardown interrupts gracefully and falls back to a
 bounded kill. A command timeout interrupts the entire owned process group.
 

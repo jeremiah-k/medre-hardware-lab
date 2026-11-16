@@ -21,6 +21,87 @@ async def bounded(awaitable, timeout):
     return await asyncio.wait_for(awaitable, timeout)
 
 
+_DRAIN_POLL_INTERVAL = 0.25
+_DRAIN_WINDOW_FACTOR = 3.0
+_DRAIN_WINDOW_SLACK = 5.0
+# The drain deadline is armed from a monotonic clock at (wall-clock)
+# adapter_start_epoch; crossing the two clocks needs a small read margin.
+_DRAIN_EPOCH_MARGIN = 0.1
+
+
+async def wait_startup_drain_retired(
+    app,
+    poll_interval: float = _DRAIN_POLL_INTERVAL,
+    window_factor: float = _DRAIN_WINDOW_FACTOR,
+    window_slack: float = _DRAIN_WINDOW_SLACK,
+) -> list[dict]:
+    """Wait out each running adapter's initial startup drain before first send.
+
+    The Meshtastic adapter's content-independent startup drain drops
+    relay-classified peer traffic while it is live, and the standard short
+    check starts its first leg immediately after adapter startup — sending
+    into a live drain window would false-fail the check. This observes each
+    adapter's public diagnostics: an adapter that exposes no diagnostics or
+    reports no ``startup_packet_drain_seconds`` window is skipped, as is a
+    non-positive window; otherwise the wait proceeds until the wall clock
+    passes ``adapter_start_epoch + window``, re-reading both values every
+    poll so a re-armed window extends the wait. The adapter retires the
+    window lazily on later packets, so deadline passage — not an observed
+    state flip — is the retirement criterion.
+
+    Raises RuntimeError with a diagnostics snapshot when the window has not
+    retired within ``window_factor * window + window_slack`` seconds; leg
+    deadlines and verification are never adjusted to obtain a pass.
+    """
+    records: list[dict] = []
+    for adapter in app.adapters.values():
+        adapter_id = getattr(adapter, "adapter_id", "unknown")
+        diag = adapter.diagnostics() if hasattr(adapter, "diagnostics") else {}
+        window = diag.get("startup_packet_drain_seconds")
+        record: dict = {"adapter": adapter_id, "window_seconds": window}
+        if window is None:
+            record.update(
+                outcome="skipped", reason="adapter reports no startup drain window"
+            )
+            records.append(record)
+            continue
+        window = float(window)
+        record["window_seconds"] = window
+        if window <= 0:
+            record.update(outcome="skipped", reason="startup drain disabled")
+            records.append(record)
+            continue
+        started = time.monotonic()
+        bound = started + window * window_factor + window_slack
+        armed = None
+        while True:
+            diag = adapter.diagnostics()
+            window = diag.get("startup_packet_drain_seconds")
+            if window is None or float(window) <= 0:
+                armed = diag.get("adapter_start_epoch")
+                break
+            armed = diag.get("adapter_start_epoch")
+            if armed is not None and time.time() >= (
+                armed + float(window) + _DRAIN_EPOCH_MARGIN
+            ):
+                break
+            if time.monotonic() >= bound:
+                raise RuntimeError(
+                    f"adapter {adapter_id} startup drain (window={window}s,"
+                    f" armed_epoch={armed}) did not retire within"
+                    f" {window * window_factor + window_slack:.1f}s;"
+                    f" diagnostics: {json.dumps(diag, default=str)[-800:]}"
+                )
+            await asyncio.sleep(poll_interval)
+        record.update(
+            outcome="retired",
+            armed_epoch=armed,
+            waited_seconds=round(time.monotonic() - started, 3),
+        )
+        records.append(record)
+    return records
+
+
 def provenance(transports):
     names = ["medre"] + [f"medre-adapter-{t}" for t in transports]
     names += [
@@ -187,6 +268,16 @@ async def run_pair(config, transports, role, run):
     try:
         with own(endpoints):
             try:
+                app = build(config, transports, role, run, destinations)
+                await bounded(app.start(), hw["startup_timeout"])
+                for adapter in app.adapters.values():
+                    health = await bounded(adapter.health_check(), 15)
+                    if health.health != "healthy":
+                        raise RuntimeError("adapter did not report healthy at startup")
+                # Receiver lifetimes must not include adapter startup or an
+                # arbitrarily long configured drain. Arm each receiver only
+                # after the initial drain has passed, before its leg sends.
+                result["startup_drain_wait"] = await wait_startup_drain_retired(app)
                 for source, destination in (transports, transports[::-1]):
                     async with async_peer_context(
                         listeners[destination](
@@ -196,15 +287,6 @@ async def run_pair(config, transports, role, run):
                             + 20
                         )
                     ) as receiver:
-                        if app is None:
-                            app = build(config, transports, role, run, destinations)
-                            await bounded(app.start(), hw["startup_timeout"])
-                            for adapter in app.adapters.values():
-                                health = await bounded(adapter.health_check(), 15)
-                                if health.health != "healthy":
-                                    raise RuntimeError(
-                                        "adapter did not report healthy at startup"
-                                    )
                         nonce = "MLAB-" + uuid.uuid4().hex[:12]
                         before = time.monotonic()
                         sent = await asyncio.to_thread(senders[source], nonce)
