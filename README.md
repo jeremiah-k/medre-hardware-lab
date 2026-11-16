@@ -88,7 +88,7 @@ qualifying an unpublished provider:
 
 ```sh
 uv sync --locked --extra dev --extra hardware
-# Once available as a distribution:
+# Include the published MeshCore adapter:
 uv sync --locked --extra dev --extra hardware --extra meshcore
 # Or use a checkout at the exact candidate commit:
 # uv pip install --python .venv/bin/python --no-deps -e /path/to/medre-adapter-meshcore
@@ -160,12 +160,13 @@ uv owns `.venv` and `uv.lock`; rerun sync after dependency changes. Select every
 needed extra on each sync. CI selects only `dev`, so offline tests do not start
 radios or install optional hardware SDKs. Black targets Python 3.12.
 
-Core, Matrix, Meshtastic and LXMF have published 0.1.0 packages. MeshCore's
-adapter is not published yet, so the `meshcore` extra uses an exact merged Git
-revision in `tool.uv.sources`; the lock records its resolved commit. Qualify a
-source update before changing that pin. Local editable overrides are development
-experiments and do not qualify the committed lock. A later exact sync restores
-the locked environment.
+Core, Matrix, Meshtastic, MeshCore, LXMF and XMPP have published 0.1.0 packages.
+The `hardware` and `meshcore` extras resolve released distributions from the
+package index, with exact versions and artifact hashes recorded in `uv.lock`.
+Local editable overrides are development experiments and do not qualify the
+committed lock. A later exact sync restores the locked environment. Qualify
+package updates against the campaign's actual installed sources and SDK pins;
+package availability alone is not radio evidence.
 
 The deployment source manifest and `medre-lab sources` continue to control Docker
 checkouts and bake provenance independently of the host uv environment. Report
