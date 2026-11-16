@@ -47,7 +47,3 @@ profile = "black"
 
 [tool.uv]
 required-version = ">=0.12.22"
-
-# MeshCore has no published adapter wheel yet; lock a merged source revision.
-[tool.uv.sources]
-medre-adapter-meshcore = { git = "https://github.com/jeremiah-k/medre-adapter-meshcore.git", rev = "766a03645b99d927cbb56a66d7a698d0dc420941" }

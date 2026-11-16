@@ -1,8 +1,12 @@
 # Repository guidelines
 
 Read the development and installation sections of [README.md](README.md) before
-changing environments or lab setup. Host uv dependencies and Docker source/bake
-provenance have separate authorities; qualify and report the actual selection.
+changing environments or lab setup. Use this checkout as the lab workspace; see
+[workspace layout](docs/workspace.md) for local state and source selection.
+For Chatmail or SimpleX campaigns, read
+[service qualification](docs/service-qualification.md) and invoke the selected
+provider harness from exact sources beneath this checkout. Host uv dependencies
+and Docker source/bake provenance have separate authorities; qualify and report the actual selection.
 
 ```bash
 uv sync --locked --extra dev
