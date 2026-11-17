@@ -2,7 +2,8 @@
 
 One lab for MEDRE and MMRelay: Docker interop, physical radio routes, and mixed
 Docker/radio deployments, plus native service qualification. It imports the
-retired interop rig and the bounded native-peer checks used to qualify Meshtastic, MeshCore and LXMF.
+retired interop rig and the bounded native-peer checks used to qualify Meshtastic,
+MeshCore and LXMF.
 
 The lab owns setup, evidence and resource lifetimes. MEDRE and its providers
 continue to own routing, rendering, encoding and transport behavior.
@@ -65,14 +66,17 @@ manifest and generates the local `.env`. Bind mounts remain read-only, with
 
 Synthetic mesh keys are generated locally on first preparation. Local credentials,
 state, logs and source clones are ignored. Source-baked MMRelay dependencies are
-explicit candidate overrides. `lab/mmrelay/Dockerfile-declared` is retained for
-separate qualification of MMRelay's own declared dependencies; do not equate the
-two evidence classes.
+explicit rig-level overrides, whether or not the selected revisions are released.
+`lab/mmrelay/Dockerfile-declared` is retained for separate qualification of
+MMRelay's own declared dependencies; do not equate the two evidence classes.
 
 The Docker topology uses `medre-lab-*` container/network/volume names. Stop an
 older rig using the same host ports before bringing this one up. The CLI refuses
 to take over a topology owned by another checkout. `docker down` retains volumes;
-`lab/reset.sh` is the explicit destructive reset operation.
+`lab/reset.sh` is the explicit destructive reset operation. The generated Synapse
+configuration reserves its suffix from the first lab override marker onward;
+place local settings before that marker. Bring-up replaces only that owned suffix
+and does not support manually managed configuration files or symlinks.
 
 See [Docker topology and scenarios](lab/README.md).
 
@@ -166,7 +170,8 @@ uv owns `.venv` and `uv.lock`; rerun sync after dependency changes. Select every
 needed extra on each sync. CI selects only `dev`, so offline tests do not start
 radios or install optional hardware SDKs. Black targets Python 3.12.
 
-Core and all seven adapter distributions have published packages from the 0.1.0 line; medre and medre-adapter-meshtastic additionally publish 0.1.1.
+Core and all seven adapter distributions have published packages from the 0.1.0
+line; medre and medre-adapter-meshtastic additionally publish 0.1.1.
 The `hardware` and `meshcore` extras resolve released distributions from the
 package index, with exact versions and artifact hashes recorded in `uv.lock`.
 The current host hardware lock still records core and Meshtastic 0.1.0;

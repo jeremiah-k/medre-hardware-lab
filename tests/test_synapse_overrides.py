@@ -1,5 +1,6 @@
 """Exercise the same override installation script used by the lab container."""
 
+import os
 import stat
 import subprocess
 from pathlib import Path
@@ -45,3 +46,88 @@ def test_synapse_overrides_are_idempotent(tmp_path, tail):
     assert config.stat().st_ino == before.st_ino
     assert config.read_text() == prefix + block
     assert list(tmp_path.iterdir()) == [config]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "",
+        "unmarked",
+        "legacy",
+        "duplicate",
+        "header-only",
+        "header-blank",
+        "header-comments",
+    ],
+)
+def test_invalid_override_source_preserves_config(tmp_path, source):
+    block = OVERRIDES.read_text()
+    invalid = {
+        "": "",
+        "unmarked": "rc_message: {}\n",
+        "legacy": block.replace("Hardware-lab", "interop-lab"),
+        "duplicate": block + block,
+        "header-only": block.splitlines()[0] + "\n",
+        "header-blank": block.splitlines()[0] + "\n\n",
+        "header-comments": block.splitlines()[0] + "\n\n# help\n \t\n",
+    }[source]
+    config = tmp_path / "homeserver.yaml"
+    old = "server_name: lab.test\n" + block
+    config.write_text(old)
+    overrides = tmp_path / "overrides.yaml"
+    overrides.write_text(invalid)
+    inode = config.stat().st_ino
+    result = subprocess.run(
+        ["sh", str(SCRIPT), str(config), str(overrides)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert "expected one current" in result.stderr
+    assert config.read_text() == old
+    assert config.stat().st_ino == inode
+    assert set(tmp_path.iterdir()) == {config, overrides}
+
+
+def test_override_refuses_symlink(tmp_path):
+    target = tmp_path / "actual.yaml"
+    target.write_text("server_name: lab.test\n")
+    config = tmp_path / "homeserver.yaml"
+    config.symlink_to(target)
+    result = subprocess.run(
+        ["sh", str(SCRIPT), str(config), str(OVERRIDES)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert config.is_symlink()
+    assert target.read_text() == "server_name: lab.test\n"
+
+
+def test_comparison_error_preserves_config(tmp_path):
+    config = tmp_path / "homeserver.yaml"
+    old = "server_name: lab.test\n"
+    config.write_text(old)
+    inode = config.stat().st_ino
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    cmp = bin_dir / "cmp"
+    cmp.write_text("#!/bin/sh\nexit 2\n")
+    cmp.chmod(0o755)
+    result = subprocess.run(
+        ["sh", str(SCRIPT), str(config), str(OVERRIDES)],
+        env={
+            **os.environ,
+            "PATH": os.pathsep.join((str(bin_dir), os.environ["PATH"])),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 2
+    assert "unable to compare" in result.stderr
+    assert config.read_text() == old
+    assert config.stat().st_ino == inode
+    assert set(tmp_path.iterdir()) == {config, bin_dir}

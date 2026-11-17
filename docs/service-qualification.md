@@ -88,7 +88,9 @@ Validate the completed metadata against independently selected core/provider
 SHAs using `--validate`, `--core-commit` and `--provider-commit`. The validator
 checks completeness and consistency; it neither performs the campaign nor
 verifies the truth of linked observations. Replies were advertised as fallback
-until the completed campaign and promotion review; native replies are now advertised. Any new capability change still requires the campaign and a separate promotion review.
+until the completed campaign and promotion review; native replies are now
+advertised. This does not automatically qualify a later SDK/source pair. Any new
+capability change still requires the campaign and a separate promotion review.
 
 ## Completion and publication review
 

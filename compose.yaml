@@ -46,8 +46,8 @@ x-mmrelay-build: &mmrelay-build
       # Same source the medre profiles mount/shadow (MEDRE_MATRIX_SRC), so one
       # variable pins the matrix adapter everywhere it appears in the rig.
       medre-matrix-src: ${MEDRE_MATRIX_SRC:?run medre-lab docker prepare}
-      # Separate MMRelay bake core preserves the declared MMRelay compatibility
-      # pair; the rig override is not evidence for its declared dependencies.
+      # Separate MMRelay bake core supports an explicitly selected rig pair;
+      # it is not evidence for MMRelay's declared dependencies.
       mmrelay-core-src: ${MMRELAY_BAKE_CORE_SRC:?run medre-lab docker prepare}
       # The MEDRE image uses the core checkout selected by the source manifest.
       medre-core-src: ${MEDRE_CORE_SRC:?run medre-lab docker prepare}
