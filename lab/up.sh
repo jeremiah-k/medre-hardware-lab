@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# interop-lab bring-up: synapse -> provision -> relay auth/cross-signing ->
+# hardware-lab bring-up: synapse -> provision -> relay auth/cross-signing ->
 # meshtasticd node pairs + channels -> relays -> smoke test.
 #
 # Topology: meshnet AlphaLab = meshtasticd-a + meshtasticd-a-peer (mmrelay-a);
@@ -162,7 +162,7 @@ if ((WITH_MEDRE)); then
 			die "MEDRE source ${src} does not look like a medre checkout/worktree"
 		fi
 	done
-	echo "medre candidate worktrees:"
+	echo "medre selected source checkouts:"
 	echo "  core:       ${MEDRE_CORE_SRC} ($(git -C "${MEDRE_CORE_SRC}" rev-parse --short HEAD))"
 	echo "  matrix:     ${MEDRE_MATRIX_SRC} ($(git -C "${MEDRE_MATRIX_SRC}" rev-parse --short HEAD))"
 	echo "  meshtastic: ${MEDRE_MESHTASTIC_SRC} ($(git -C "${MEDRE_MESHTASTIC_SRC}" rev-parse --short HEAD))"
@@ -195,7 +195,7 @@ if ((WITH_NORMAL)); then
 	if [[ ! -d "${MEDRE_LXMF_SRC}/src/medre/adapters/lxmf" ]]; then
 		die "MEDRE_LXMF_SRC=${MEDRE_LXMF_SRC} does not look like the lxmf adapter worktree"
 	fi
-	echo "medre candidate worktrees (normal profile):"
+	echo "medre selected source checkouts (normal profile):"
 	echo "  core:       ${MEDRE_CORE_SRC} ($(git -C "${MEDRE_CORE_SRC}" rev-parse --short HEAD))"
 	echo "  matrix:     ${MEDRE_MATRIX_SRC} ($(git -C "${MEDRE_MATRIX_SRC}" rev-parse --short HEAD))"
 	echo "  meshtastic: ${MEDRE_MESHTASTIC_SRC} ($(git -C "${MEDRE_MESHTASTIC_SRC}" rev-parse --short HEAD))"
@@ -362,10 +362,10 @@ if ! "${COMPOSE[@]}" run --rm --entrypoint sh synapse -c 'test -f /data/homeserv
 	echo "  generated homeserver.yaml"
 fi
 log "Synapse: applying lab overrides (idempotent, version-aware)"
-# shellcheck disable=SC2016 # Child-language syntax or named output, not a host-shell read.
 OVERRIDES_OUT="$("${COMPOSE[@]}" run --rm --entrypoint sh \
 	--volume "${PWD}/lab/config/synapse-overrides.yaml:/overrides.yaml:ro" \
-	synapse -c 'grep -q "interop-lab Synapse overrides v3" /data/homeserver.yaml 2>/dev/null || { sed -i "/# interop-lab Synapse overrides/,\$d" /data/homeserver.yaml; cat /overrides.yaml >> /data/homeserver.yaml; echo "overrides reapplied"; }')"
+	--volume "${PWD}/lab/tools/apply-synapse-overrides.sh:/apply-overrides.sh:ro" \
+	synapse /apply-overrides.sh /data/homeserver.yaml /overrides.yaml)"
 echo "  ${OVERRIDES_OUT:-overrides unchanged}"
 if grep -q "reapplied" <<<"${OVERRIDES_OUT}"; then
 	log "Synapse: recreating container to load new overrides"
@@ -999,7 +999,7 @@ echo "  logs: ${LOG_DIR}/bringup-${TS}.log (+ per-relay logs)"
 
 MESHTASTICD_REF="$(docker image inspect meshtastic/meshtasticd:daily --format '{{index .RepoDigests 0}}')"
 cat >lab/VERSION <<EOF
-# interop-lab version record (rewritten by lab/up.sh at each bring-up)
+# hardware-lab version record (rewritten by lab/up.sh at each bring-up)
 recorded_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 mmrelay:
   checkout: ${MMRELAY_SRC}
@@ -1022,7 +1022,7 @@ medre_profile:
   core: ${MEDRE_CORE_SRC} @ $(git -C "${MEDRE_CORE_SRC}" rev-parse HEAD)
   adapter_matrix: ${MEDRE_MATRIX_SRC} @ $(git -C "${MEDRE_MATRIX_SRC}" rev-parse HEAD)
   adapter_meshtastic: ${MEDRE_MESHTASTIC_SRC} @ $(git -C "${MEDRE_MESHTASTIC_SRC}" rev-parse HEAD)
-  image: medre-lab/medre-dev:latest (built from lab/medre/Dockerfile; deps baked from the candidate checkouts, worktrees mounted read-only)
+  image: medre-lab/medre-dev:latest (built from lab/medre/Dockerfile; deps baked from the selected checkouts, worktrees mounted read-only)
   medre_topology: AlphaLab += meshtasticd-a-medre, BetaLab += meshtasticd-b-medre (dedicated nodes, one API client each: medre-relay)
 EOF
 fi
