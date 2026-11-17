@@ -169,6 +169,9 @@ radios or install optional hardware SDKs. Black targets Python 3.12.
 Core and all seven adapter distributions have published packages from the 0.1.0 line; medre and medre-adapter-meshtastic additionally publish 0.1.1.
 The `hardware` and `meshcore` extras resolve released distributions from the
 package index, with exact versions and artifact hashes recorded in `uv.lock`.
+The current host hardware lock still records core and Meshtastic 0.1.0;
+it does not describe a 0.1.1 qualification. Upgrade the host lock and
+requalify it separately from Docker checkout selection.
 Local editable overrides are development experiments and do not qualify the
 committed lock. A later exact sync restores the locked environment. Qualify
 package updates against the campaign's actual installed sources and SDK pins;

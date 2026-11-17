@@ -4,7 +4,7 @@
 # =============================================================================
 # MEDRE DEV image for the interop lab (mirrors the mmrelay-dev pattern).
 #
-# Dependency install is baked from the candidate checkouts' own dependency
+# Dependency install is baked from the selected checkouts' own dependency
 # specs (medre core -> matrix adapter -> meshtastic adapter -> lxmf adapter),
 # so mindroom-nio[e2e] (vodozemac), the mtjk Meshtastic SDK, and the pinned
 # LXMF/RNS stack (lxmf==1.2.1, rns==1.5.7) are present. The package CODE is
@@ -28,7 +28,7 @@
 # mindroom-nio sync backend); core supports 3.11+.
 # =============================================================================
 
-# Build stage: deps baked from the candidate checkouts' dependency specs.
+# Build stage: deps baked from the selected checkouts' dependency specs.
 FROM python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -72,8 +72,8 @@ RUN mkdir -p /app /data /config && chown -R medre:medre /app /data
 
 ARG BUILD_DATE
 ARG VCS_REF
-LABEL org.opencontainers.image.title="MEDRE dev (interop-lab)" \
-    org.opencontainers.image.description="MEDRE core + matrix/meshtastic adapters: deps baked from candidate checkouts, source worktrees mounted at /src" \
+LABEL org.opencontainers.image.title="MEDRE dev (hardware-lab)" \
+    org.opencontainers.image.description="MEDRE core + matrix/meshtastic adapters: deps baked from selected checkouts, source worktrees mounted at /src" \
     org.opencontainers.image.revision="${VCS_REF:-unknown}" \
     org.opencontainers.image.created="${BUILD_DATE:-unknown}"
 
@@ -83,7 +83,7 @@ ENV PATH=/usr/local/bin:/usr/bin:/bin
 # state (medre.sqlite mapping db, adapter stores) at /data/state,
 # logs dir at /data/logs.
 ENV MEDRE_HOME=/data
-# Dev shadowing: mounted candidate worktrees take precedence over the baked
+# Dev shadowing: mounted selected worktrees take precedence over the baked
 # install. Core src FIRST so its pkgutil.extend_path medre/__init__.py wins
 # the namespace import and merges the adapter portions. Services override
 # this per profile (the stress `medre` relay omits the lxmf src mount).

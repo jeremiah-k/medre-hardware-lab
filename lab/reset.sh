@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Wipe all interop-lab state for a clean bring-up: stops containers, removes
+# Wipe all hardware-lab state for a clean bring-up: stops containers, removes
 # named volumes (synapse data, relay state, node DBs) and clears lab/state +
 # lab/logs. Called by lab/up.sh --reset.
 # =============================================================================

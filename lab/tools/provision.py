@@ -1,4 +1,4 @@
-"""Provision the interop-lab Synapse: accounts, rooms, runtime.json.
+"""Provision the hardware-lab Synapse: accounts, rooms, runtime.json.
 
 Idempotent: existing accounts are logged into (password-based), existing
 room aliases are reused, memberships are ensured. Lifted from the upstream

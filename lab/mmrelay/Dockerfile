@@ -36,23 +36,10 @@ RUN python -m pip install --no-cache-dir --timeout=300 --retries=3 \
     --prefix=/install ".[e2e]"
 
 # -----------------------------------------------------------------------------
-# medre core OVERRIDE for the mmrelay images (r26 round: medre-core-src,
-# R2 round: mmrelay-core-src; mirrors the matrix override below).
-#
-# mmrelay's pyproject pins medre core to a landed main revision; that pin is
-# NOT touched (the mmrelay checkout stays byte-identical). The candidate
-# matrix adapter requires core APIs newer than that pin, and from candidate
-# core #504 the LEGACY helper names mmrelay's source imports
-# (extract_relation_text) are removed — so the mmrelay images bake the core
-# checkout given by MMRELAY_BAKE_CORE_SRC (default: MEDRE_CORE_SRC):
-#   r26 round  : medre-core-src  = MEDRE_CORE_SRC  (#504 head, the only
-#                candidate core then; still exported all legacy names)
-#   R2 round   : mmrelay-core-src = interop-medre-core-505 (PR #505 head,
-#                the additive prerequisite preserving the legacy helpers AND
-#                carrying the R2 APIs the candidate matrix adapter imports)
-# medre-normal itself mounts and runs the #504 head; only the mmrelay bake
-# differs. MMRelay's DECLARED core/Matrix pair must still qualify separately
-# — a rig-only bake override proves rig compatibility, not the declared pin.
+# medre core override for the MMRelay rig. The selected bake core is separate
+# from the normal MEDRE mount when compatibility with MMRelay's legacy helper
+# imports requires it. The declared MMRelay pair must qualify separately; a
+# rig override is evidence only for the explicitly selected pair.
 #
 # NOTE: this is a LOCAL DIRECTORY install (same recipe as the medre-dev
 # image), NOT git+file like the matrix override: the context is a detached
@@ -120,7 +107,7 @@ RUN mkdir -p /app /data /config && chown -R mmrelay:mmrelay /app /data
 
 ARG BUILD_DATE
 ARG VCS_REF
-LABEL org.opencontainers.image.title="MMRelay dev (interop-lab)" \
+LABEL org.opencontainers.image.title="MMRelay dev (hardware-lab)" \
     org.opencontainers.image.description="MMRelay dev container: deps baked, source mounted at /src" \
     org.opencontainers.image.revision="${VCS_REF:-unknown}" \
     org.opencontainers.image.created="${BUILD_DATE:-unknown}"

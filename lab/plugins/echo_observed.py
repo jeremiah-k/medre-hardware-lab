@@ -1,4 +1,4 @@
-"""echo_observed: a transparent observation plugin for interop-lab scenarios.
+"""echo_observed: a transparent observation plugin for hardware-lab scenarios.
 
 REQUIREMENT FOR THE RIG (scenarios/README.md documents this too):
   * bind-mount this file into each mmrelay container at

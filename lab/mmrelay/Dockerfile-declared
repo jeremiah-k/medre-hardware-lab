@@ -61,7 +61,7 @@ RUN mkdir -p /app /data /config && chown -R mmrelay:mmrelay /app /data
 
 ARG BUILD_DATE
 ARG VCS_REF
-LABEL org.opencontainers.image.title="MMRelay dev (interop-lab)" \
+LABEL org.opencontainers.image.title="MMRelay dev (hardware-lab)" \
     org.opencontainers.image.description="MMRelay dev container: deps baked, source mounted at /src" \
     org.opencontainers.image.revision="${VCS_REF:-unknown}" \
     org.opencontainers.image.created="${BUILD_DATE:-unknown}"

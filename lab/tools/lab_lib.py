@@ -1,4 +1,4 @@
-"""Shared helpers for interop-lab tooling (runs inside lab-tools)."""
+"""Shared helpers for hardware-lab tooling (runs inside lab-tools)."""
 
 from __future__ import annotations
 
