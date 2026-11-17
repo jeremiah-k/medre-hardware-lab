@@ -66,9 +66,9 @@ manifest and generates the local `.env`. Bind mounts remain read-only, with
 
 Synthetic mesh keys are generated locally on first preparation. Local credentials,
 state, logs and source clones are ignored. Source-baked MMRelay dependencies are
-explicit rig-level overrides, whether or not the selected revisions are released. `lab/mmrelay/Dockerfile-declared` is retained for
-separate qualification of MMRelay's own declared dependencies; do not equate the
-two evidence classes.
+explicit rig-level overrides, whether or not the selected revisions are released.
+`lab/mmrelay/Dockerfile-declared` is retained for separate qualification of
+MMRelay's own declared dependencies; do not equate the two evidence classes.
 
 The Docker topology uses `medre-lab-*` container/network/volume names. Stop an
 older rig using the same host ports before bringing this one up. The CLI refuses
