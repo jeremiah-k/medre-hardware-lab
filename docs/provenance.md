@@ -1,7 +1,7 @@
 # Provenance
 
 The Docker topology, scenario corpus and source-mount guard were imported from
-the existing local interop-lab. Native peer ownership and protocol helpers derive
+the retired local interop-lab predecessor. Native peer ownership and protocol helpers derive
 from MEDRE's MIT-licensed live-test helpers at
 `7b8839d0374875a173d9993be131f59b41ac7d9d`. This clean repository excludes prior
 Git history, actual physical device mappings, embedded physical channel URLs,

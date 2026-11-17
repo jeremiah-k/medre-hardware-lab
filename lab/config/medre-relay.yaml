@@ -28,8 +28,8 @@
 #   reactions, tapback replies).
 # - Trust: peer relay authorization lives on the mmrelay side
 #   (matrix.trusted_relays gains "@medre:lab.test" via profile-gated
-#   injection in lab/up.sh). The candidate matrix adapter config surface
-#   (medre-adapter-matrix 75d961d8) exposes no operator-facing MXID allowlist
+#   injection in lab/up.sh). The selected Matrix adapter config surface
+#   exposes no operator-facing MXID allowlist
 #   for peer relays; inbound peer claims are carried as unverified source
 #   observations on the event metadata (core 93f43311 native-facts contract).
 # - #lab-other and #lab-bridge-e2ee are mapped NOWHERE by this config.

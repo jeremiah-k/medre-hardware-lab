@@ -38,7 +38,7 @@ x-mmrelay-build: &mmrelay-build
     dockerfile: lab/mmrelay/Dockerfile
     additional_contexts:
       # Read-only build context pointing at the host mmrelay checkout.
-      # The checkout must be on branch release/1.5.0-medre-ingress (see lab/VERSION).
+      # Use the MMRelay revision selected in sources.lock.json.
       mmrelay-src: ${MMRELAY_SRC:?run medre-lab docker prepare}
       # medre-adapter-matrix override context: the Dockerfile force-reinstalls
       # medre-adapter-matrix FROM THIS CHECKOUT (git+file, direct_url.json
@@ -46,20 +46,10 @@ x-mmrelay-build: &mmrelay-build
       # Same source the medre profiles mount/shadow (MEDRE_MATRIX_SRC), so one
       # variable pins the matrix adapter everywhere it appears in the rig.
       medre-matrix-src: ${MEDRE_MATRIX_SRC:?run medre-lab docker prepare}
-      # mmrelay-bake core context (R2 round): mmrelay's pyproject-era source
-      # imports the LEGACY rendering helper names that candidate core #504
-      # removed (extract_relation_text -> extract_event_text rename). The
-      # Dockerfile force-reinstalls medre core for the MMRELAY IMAGES from
-      # THIS checkout — the additive prerequisite #505 that preserves the
-      # legacy helpers AND carries the R2 APIs the candidate matrix adapter
-      # imports. medre-normal keeps mounting the #504 head; only the mmrelay
-      # bake differs. MMRelay's DECLARED core/Matrix pair still qualifies
-      # separately (rig-only bake overrides prove rig compatibility only).
+      # Separate MMRelay bake core preserves the declared MMRelay compatibility
+      # pair; the rig override is not evidence for its declared dependencies.
       mmrelay-core-src: ${MMRELAY_BAKE_CORE_SRC:?run medre-lab docker prepare}
-      # medre core override context (r26): the candidate matrix adapter
-      # requires core APIs from medre PR #504; the Dockerfile force-reinstalls
-      # medre core FROM THIS CHECKOUT so the baked core+adapter pair is
-      # consistent (the pyproject pin stays at the landed main revision).
+      # The MEDRE image uses the core checkout selected by the source manifest.
       medre-core-src: ${MEDRE_CORE_SRC:?run medre-lab docker prepare}
     args:
       # Ref resolved inside the checkout; lab/up.sh exports the exact HEAD
@@ -69,15 +59,9 @@ x-mmrelay-build: &mmrelay-build
       MMRELAY_BAKE_CORE_REF: ${MMRELAY_BAKE_CORE_REF:-main}
   image: medre-lab/mmrelay-dev:latest
 
-# MEDRE dev image build (profiles `medre` + `normal`). Build contexts point
-# at the git worktrees holding the candidate revisions (created by lab/up.sh
-# guard rails; see lab/README.md "MEDRE bridge profile"):
-#   core       medre @ 93f43311 (release/0.1.0-schema-freeze)
-#   matrix     medre-adapter-matrix @ 75d961d8 (PR #42 head)
-#   meshtastic medre-adapter-meshtastic @ 928b9185 (PR #34 head)
-#   lxmf       medre-adapter-lxmf @ de04e71d (r15q-lxmf, READ-ONLY; optional
-#              LXMF transport baked so the `normal` profile can run it; the
-#              stress `medre` relay never references the lxmf transport)
+# MEDRE dev image build (profiles `medre` + `normal`). Build contexts are
+# resolved by `medre-lab docker prepare` from sources.lock.json and explicit
+# overrides. See lab/README.md for the topology and source qualification.
 x-medre-build: &medre-build
   build:
     context: .

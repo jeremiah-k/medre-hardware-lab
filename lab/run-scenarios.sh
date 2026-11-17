@@ -78,7 +78,7 @@ FAILED=0
 RAN=0
 
 echo "==================================================================="
-echo " interop-lab scenario suite - $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+echo " hardware-lab scenario suite - $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo " rig: already-up containers (this runner never starts/stops them)"
 echo "==================================================================="
 

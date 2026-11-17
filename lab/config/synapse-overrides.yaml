@@ -1,4 +1,4 @@
-# interop-lab Synapse overrides v3 (appended to /data/homeserver.yaml by lab/up.sh)
+# Hardware-lab Synapse overrides v3 (appended to /data/homeserver.yaml by lab/up.sh)
 # Lifted from the upstream CI homeserver tuning: shared-secret registration for
 # idempotent provisioning and relaxed rate limits for bursty relay/invite
 # traffic. rc_invites uses the structured per_room/per_user/per_issuer form

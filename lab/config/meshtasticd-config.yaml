@@ -1,4 +1,4 @@
-# meshtasticd node config for all interop-lab nodes (mounted read-only at
+# meshtasticd node config for all lab mesh nodes (mounted read-only at
 # /etc/meshtasticd/config.yaml).
 #
 # - Lora.Module: sim replaces the CLI -s flag. IMPORTANT: meshtasticd -s
