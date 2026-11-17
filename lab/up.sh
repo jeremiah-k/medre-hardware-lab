@@ -102,14 +102,8 @@ echo "medre-adapter-matrix override: ${MEDRE_MATRIX_SRC}"
 echo "  ref:    ${MEDRE_MATRIX_REF} (baked into mmrelay images; mounted for medre)"
 
 # --- medre core override (every path) ------------------------------------------
-# The r26 matrix adapter requires core APIs introduced by medre PR #504, but
-# mmrelay's pyproject pins medre core to a landed main revision (5e8043af),
-# so baking the r26 adapter alone made the relays fail at import
-# (resolve_relay_attribution missing). Same rig-level override pattern as the
-# matrix block: force-reinstall medre core FROM THE MEDRE_CORE_SRC checkout
-# (git+file, direct_url.json carries the exact commit); the mmrelay checkout
-# stays byte-identical. Installed BEFORE the matrix override so both dists
-# land at their intended revisions.
+# The selected core source backs the MEDRE image. Rig-level MMRelay bake
+# overrides are separate from qualification of MMRelay's declared dependencies.
 MEDRE_CORE_SRC="${MEDRE_CORE_SRC:-${LAB_ROOT}/sources/medre}"
 if [[ ! -d "${MEDRE_CORE_SRC}/src/medre" ]]; then
 	die "MEDRE_CORE_SRC=${MEDRE_CORE_SRC} does not look like a medre core checkout"
@@ -120,12 +114,10 @@ echo "medre core override: ${MEDRE_CORE_SRC}"
 echo "  ref:    ${MEDRE_CORE_REF} (mounted for medre)"
 
 # --- mmrelay-bake core override (every path) ------------------------------------
-# From the R2 round the mmrelay images may bake a DIFFERENT core than the
-# medre mount: mmrelay's source imports legacy rendering helper names that
-# candidate core #504 removed, so MMRELAY_BAKE_CORE_SRC (default: the medre
-# core checkout) selects the additive-prerequisite core (#505) that preserves
-# them while still carrying the R2 APIs the candidate matrix adapter imports.
-# The bake-pin stamp records the actual ref for in-container provenance.
+# The MMRelay images may bake a different core than the MEDRE mount. Defaults
+# to the selected MEDRE core; compatibility with MMRelay's legacy imports is
+# a property of the actual selected pair, not a guarantee of this override.
+# The bake-pin stamp records its exact ref for in-container provenance.
 MMRELAY_BAKE_CORE_SRC="${MMRELAY_BAKE_CORE_SRC:-${MEDRE_CORE_SRC}}"
 if [[ ! -d "${MMRELAY_BAKE_CORE_SRC}/src/medre" ]]; then
 	die "MMRELAY_BAKE_CORE_SRC=${MMRELAY_BAKE_CORE_SRC} does not look like a medre core checkout"
