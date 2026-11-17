@@ -49,7 +49,16 @@ def test_synapse_overrides_are_idempotent(tmp_path, tail):
 
 
 @pytest.mark.parametrize(
-    "source", ["", "unmarked", "legacy", "duplicate", "header-only"]
+    "source",
+    [
+        "",
+        "unmarked",
+        "legacy",
+        "duplicate",
+        "header-only",
+        "header-blank",
+        "header-comments",
+    ],
 )
 def test_invalid_override_source_preserves_config(tmp_path, source):
     block = OVERRIDES.read_text()
@@ -59,6 +68,8 @@ def test_invalid_override_source_preserves_config(tmp_path, source):
         "legacy": block.replace("Hardware-lab", "interop-lab"),
         "duplicate": block + block,
         "header-only": block.splitlines()[0] + "\n",
+        "header-blank": block.splitlines()[0] + "\n\n",
+        "header-comments": block.splitlines()[0] + "\n\n# help\n \t\n",
     }[source]
     config = tmp_path / "homeserver.yaml"
     old = "server_name: lab.test\n" + block

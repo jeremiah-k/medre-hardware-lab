@@ -13,7 +13,8 @@ fi
 if ! awk '
     NR == 1 { first = /^# Hardware-lab Synapse overrides([[:space:]]|$)/ }
     /^# (interop-lab|Hardware-lab) Synapse overrides([[:space:]]|$)/ { count++ }
-    END { exit !(first && count == 1 && NR > 1) }
+    NR > 1 && $0 !~ /^[[:space:]]*(#|$)/ { body = 1 }
+    END { exit !(first && count == 1 && body) }
 ' "$overrides"; then
 	echo "expected one current Synapse override block" >&2
 	exit 1
