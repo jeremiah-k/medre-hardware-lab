@@ -5,8 +5,8 @@ set -eu
 config=$1
 overrides=$2
 if [ ! -f "$config" ] || [ -L "$config" ]; then
-    echo "expected a regular, non-symlink lab homeserver config" >&2
-    exit 1
+	echo "expected a regular, non-symlink lab homeserver config" >&2
+	exit 1
 fi
 # Refuse a malformed override source before touching the destination. Exactly
 # one current marker, on the first line, makes the replacement idempotent.
@@ -15,8 +15,8 @@ if ! awk '
     /^# (interop-lab|Hardware-lab) Synapse overrides([[:space:]]|$)/ { count++ }
     END { exit !(first && count == 1 && NR > 1) }
 ' "$overrides"; then
-    echo "expected one current Synapse override block" >&2
-    exit 1
+	echo "expected one current Synapse override block" >&2
+	exit 1
 fi
 temp=$(mktemp "${config}.XXXXXX")
 trap 'rm -f "$temp"' 0
@@ -25,14 +25,14 @@ cp -p "$config" "$temp"
 awk '/^# (interop-lab|Hardware-lab) Synapse overrides([[:space:]]|$)/ {exit} {print}' "$config" >"$temp"
 cat "$overrides" >>"$temp"
 if cmp -s "$config" "$temp"; then
-    exit 0
+	exit 0
 else
-    rc=$?
-    # cmp status 1 means different; other errors are not permission to replace.
-    if [ "$rc" -ne 1 ]; then
-        echo "unable to compare Synapse configuration" >&2
-        exit "$rc"
-    fi
+	rc=$?
+	# cmp status 1 means different; other errors are not permission to replace.
+	if [ "$rc" -ne 1 ]; then
+		echo "unable to compare Synapse configuration" >&2
+		exit "$rc"
+	fi
 fi
 mv -f "$temp" "$config"
 echo "overrides reapplied"

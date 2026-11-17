@@ -48,7 +48,9 @@ def test_synapse_overrides_are_idempotent(tmp_path, tail):
     assert list(tmp_path.iterdir()) == [config]
 
 
-@pytest.mark.parametrize("source", ["", "unmarked", "legacy", "duplicate", "header-only"])
+@pytest.mark.parametrize(
+    "source", ["", "unmarked", "legacy", "duplicate", "header-only"]
+)
 def test_invalid_override_source_preserves_config(tmp_path, source):
     block = OVERRIDES.read_text()
     invalid = {
