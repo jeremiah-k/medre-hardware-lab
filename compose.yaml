@@ -47,10 +47,12 @@ x-mmrelay-build: &mmrelay-build
       # variable pins the matrix adapter everywhere it appears in the rig.
       medre-matrix-src: ${MEDRE_MATRIX_SRC:?run medre-lab docker prepare}
       # mmrelay-bake core context (R2 round): mmrelay's pyproject-era source
-      # imports the LEGACY rendering helper names that candidate core #504
+      # imports the LEGACY rendering helper names that core #504 (released in
+      # medre 0.1.0)
       # removed (extract_relation_text -> extract_event_text rename). The
       # Dockerfile force-reinstalls medre core for the MMRELAY IMAGES from
-      # THIS checkout — the additive prerequisite #505 that preserves the
+      # THIS checkout — the additive prerequisite #505 (also released in medre
+      # 0.1.0) that preserves the
       # legacy helpers AND carries the R2 APIs the candidate matrix adapter
       # imports. medre-normal keeps mounting the #504 head; only the mmrelay
       # bake differs. MMRelay's DECLARED core/Matrix pair still qualifies

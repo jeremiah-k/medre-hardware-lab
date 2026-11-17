@@ -1,6 +1,6 @@
 # Scenarios layer (cross-instance canonical-interop suite)
 
-Behavioral scenarios for the interop-lab rig. This layer OWNS ONLY:
+Behavioral scenarios for the lab rig. This layer OWNS ONLY:
 
 - `scenarios/` — this directory (config, lib, scenario scripts, `deferred/`)
 - `lab/run-scenarios.sh` — the suite runner

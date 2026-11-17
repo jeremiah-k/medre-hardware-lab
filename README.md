@@ -2,7 +2,7 @@
 
 One lab for MEDRE and MMRelay: Docker interop, physical radio routes, and mixed
 Docker/radio deployments, plus native service qualification. It imports the
-existing interop rig and the bounded native-peer checks used to qualify Meshtastic, MeshCore and LXMF.
+retired interop rig and the bounded native-peer checks used to qualify Meshtastic, MeshCore and LXMF.
 
 The lab owns setup, evidence and resource lifetimes. MEDRE and its providers
 continue to own routing, rendering, encoding and transport behavior.
@@ -84,7 +84,7 @@ harnesses and independent peer observations described in the
 ## Physical radio qualification
 
 Install the released transport packages, or editable source revisions when
-qualifying an unpublished provider:
+qualifying unreleased provider changes:
 
 ```sh
 uv sync --locked --extra dev --extra hardware
@@ -166,7 +166,7 @@ uv owns `.venv` and `uv.lock`; rerun sync after dependency changes. Select every
 needed extra on each sync. CI selects only `dev`, so offline tests do not start
 radios or install optional hardware SDKs. Black targets Python 3.12.
 
-Core, Matrix, Meshtastic, MeshCore, LXMF and XMPP have published 0.1.0 packages.
+Core and all seven adapter distributions have published packages from the 0.1.0 line; medre and medre-adapter-meshtastic additionally publish 0.1.1.
 The `hardware` and `meshcore` extras resolve released distributions from the
 package index, with exact versions and artifact hashes recorded in `uv.lock`.
 Local editable overrides are development experiments and do not qualify the
