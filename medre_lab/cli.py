@@ -118,12 +118,14 @@ def _write_worker_absent_verdict(run: Path, name: str, phase: str, code: int) ->
         )
 
 
-def hardware(root, config, selected, role):
+def hardware(root, config, selected, role, run_root: str | None = None):
     cfg = load(config)
     transports = pair(selected)
     if any(t not in cfg["hardware"] for t in transports):
         raise ValueError("configure both transports before running this pair")
-    run = _hardware_run_dir(root, transports, role, None)
+    run = _hardware_run_dir(
+        root, transports, role, Path(run_root) if run_root else None
+    )
     run.mkdir(parents=True, mode=0o700)
     timeout = (
         cfg["hardware"]["startup_timeout"]
@@ -308,6 +310,11 @@ def main(argv=None):
     run = hw.add_parser("run")
     run.add_argument("--pair", required=True)
     run.add_argument("--role", choices=("a", "b"), default="a")
+    run.add_argument(
+        "--run-root",
+        default=None,
+        help="private directory for the run (default: <root>/evidence)",
+    )
     cont = hw.add_parser(
         "continuity",
         help="opt-in disconnect/reopen continuity case (two owned phases)",
@@ -345,7 +352,7 @@ def main(argv=None):
             return doctor(config)
         if args.command == "hardware":
             if args.action == "run":
-                return hardware(root, config, args.pair, args.role)
+                return hardware(root, config, args.pair, args.role, args.run_root)
             return continuity(
                 root,
                 config,
