@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -59,47 +60,23 @@ def doctor(config):
     return 1 if result.get("problems") else 0
 
 
-def hardware(root, config, selected, role):
-    cfg = load(config)
-    transports = pair(selected)
-    if any(t not in cfg["hardware"] for t in transports):
-        raise ValueError("configure both transports before running this pair")
-    run = (
-        root
-        / "evidence"
-        / (
-            time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-            + "-"
-            + "-".join(transports)
-            + "-"
-            + role
-            + "-"
-            + uuid.uuid4().hex[:6]
-        )
-    )
-    run.mkdir(parents=True, mode=0o700)
-    timeout = (
-        cfg["hardware"]["startup_timeout"]
-        + 2 * (cfg["hardware"]["send_timeout"] + cfg["hardware"]["observation_timeout"])
-        + 180
-    )
-    with (run / "worker.log").open("w") as log:
+def _spawn_worker(argv: list[str], log_path: Path, timeout: float, watch=None) -> int:
+    """Run one owned worker subprocess with a bounded interrupt/kill ladder.
+
+    ``watch`` receives the live child handle once and runs detached; it must
+    return when the child exits so the thread never outlives the worker.
+    """
+    with log_path.open("w") as log:
         child = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "medre_lab.worker",
-                str(config.resolve()),
-                ":".join(transports),
-                str(0 if role == "a" else 1),
-                str(run),
-            ],
+            argv,
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        if watch is not None:
+            threading.Thread(target=watch, args=(child,), daemon=True).start()
         try:
-            code = child.wait(timeout=timeout)
+            return child.wait(timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
             os.killpg(child.pid, signal.SIGINT)
             try:
@@ -107,7 +84,65 @@ def hardware(root, config, selected, role):
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
-            code = 1
+            return 1
+
+
+def _hardware_run_dir(root: Path, transports, role: str, run_root: Path | None) -> Path:
+    base = run_root if run_root is not None else root / "evidence"
+    return base / (
+        time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        + "-"
+        + "-".join(transports)
+        + "-"
+        + role
+        + "-"
+        + uuid.uuid4().hex[:6]
+    )
+
+
+def _write_worker_absent_verdict(run: Path, name: str, phase: str, code: int) -> None:
+    path = run / name
+    if not path.exists():
+        path.write_text(
+            json.dumps(
+                {
+                    "phase": phase,
+                    "pass": False,
+                    "stage": "worker-exited-before-verdict",
+                    "exit_code": code,
+                    "details": "See private worker log; no qualification claim.",
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+
+
+def hardware(root, config, selected, role):
+    cfg = load(config)
+    transports = pair(selected)
+    if any(t not in cfg["hardware"] for t in transports):
+        raise ValueError("configure both transports before running this pair")
+    run = _hardware_run_dir(root, transports, role, None)
+    run.mkdir(parents=True, mode=0o700)
+    timeout = (
+        cfg["hardware"]["startup_timeout"]
+        + 2 * (cfg["hardware"]["send_timeout"] + cfg["hardware"]["observation_timeout"])
+        + 180
+    )
+    code = _spawn_worker(
+        [
+            sys.executable,
+            "-m",
+            "medre_lab.worker",
+            str(config.resolve()),
+            ":".join(transports),
+            str(0 if role == "a" else 1),
+            str(run),
+        ],
+        run / "worker.log",
+        timeout,
+    )
     if not (run / "verdict.json").exists():
         (run / "verdict.json").write_text(
             json.dumps(
@@ -124,6 +159,126 @@ def hardware(root, config, selected, role):
         code = 1
     print(json.dumps({"pass": code == 0, "evidence": str(run)}))
     return code
+
+
+def _auto_disconnect_watch(run: Path, owned_address: str):
+    """Perform the declared-link disconnect when the baseline arms the stage.
+
+    The watcher is the harness-owned interruption action: it waits for the
+    worker's interrupt sentinel, disconnects the MEDRE-owned MeshCore host
+    link once, and records the action. The worker observes the actual
+    disconnect and rejoin through adapter diagnostics. No setting, bond,
+    key, or firmware state is touched; disconnecting an owned BLE host link
+    is the declared fault mechanism.
+    """
+
+    def watch(child) -> None:
+        log_path = run / "disconnect-action.log"
+        performed = False
+        while child.poll() is None:
+            if not performed and (run / "interrupt-armed.json").exists():
+                performed = True
+                try:
+                    proc = subprocess.run(
+                        ["bluetoothctl", "disconnect", owned_address],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    log_path.write_text(
+                        f"$ bluetoothctl disconnect {owned_address}\n"
+                        f"exit={proc.returncode}\n{proc.stdout}{proc.stderr}"
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    log_path.write_text(f"disconnect action failed: {exc}")
+            time.sleep(1.0)
+
+    return watch
+
+
+def continuity(
+    root,
+    config,
+    selected,
+    role,
+    interrupt_wait: float,
+    auto_disconnect: bool,
+    run_root: str | None,
+):
+    """Two-phase continuity case: baseline owner, then fresh-process reopen."""
+    cfg = load(config)
+    transports = pair(selected)
+    if any(t not in cfg["hardware"] for t in transports):
+        raise ValueError("configure both transports before running this pair")
+    if "meshcore" not in transports:
+        raise ValueError(
+            "continuity link interruption currently supports the meshcore BLE host link"
+        )
+    owned_address = cfg["hardware"]["meshcore"]["addresses"][0 if role == "a" else 1]
+    run = _hardware_run_dir(
+        root, transports, role, Path(run_root) if run_root else None
+    )
+    run.mkdir(parents=True, mode=0o700)
+    hw = cfg["hardware"]
+    baseline_timeout = (
+        hw["startup_timeout"]
+        + 3 * (hw["send_timeout"] + hw["observation_timeout"])
+        + interrupt_wait
+        + 700
+    )
+    reopen_timeout = (
+        hw["startup_timeout"]
+        + 2 * (hw["send_timeout"] + hw["observation_timeout"])
+        + 900
+    )
+    boundary: dict = {}
+    phases_ok = True
+    for phase, timeout in (("baseline", baseline_timeout), ("reopen", reopen_timeout)):
+        argv = [
+            sys.executable,
+            "-m",
+            "medre_lab.worker",
+            str(config.resolve()),
+            ":".join(transports),
+            str(0 if role == "a" else 1),
+            str(run),
+            phase,
+        ]
+        if phase == "baseline":
+            argv.append(str(interrupt_wait))
+        started = time.time()
+        watch = (
+            _auto_disconnect_watch(run, owned_address)
+            if phase == "baseline" and auto_disconnect
+            else None
+        )
+        code = _spawn_worker(argv, run / f"{phase}-worker.log", timeout, watch=watch)
+        boundary[phase] = {
+            "exit_code": code,
+            "started_at": started,
+            "ended_at": time.time(),
+            "timeout_seconds": timeout,
+            "pass": False,
+            "log": str(run / f"{phase}-worker.log"),
+        }
+        _write_worker_absent_verdict(run, f"{phase}-verdict.json", phase, code)
+        verdict = json.loads((run / f"{phase}-verdict.json").read_text())
+        boundary[phase]["pass"] = bool(verdict.get("pass"))
+        phases_ok = phases_ok and boundary[phase]["pass"]
+    merged = {
+        "case": "reconnect-reopen-continuity",
+        "pass": phases_ok,
+        "pair": list(transports),
+        "role": role,
+        "process_boundary": boundary,
+        "scope": "Two-phase continuity case; physical interruption and MEDRE "
+        "shutdown are separate evidenced actions.",
+    }
+    (run / "continuity-verdict.json").write_text(
+        json.dumps(merged, indent=2, default=str) + "\n"
+    )
+    print(json.dumps({"pass": phases_ok, "evidence": str(run)}))
+    return 0 if phases_ok else 1
 
 
 def main(argv=None):
@@ -153,6 +308,28 @@ def main(argv=None):
     run = hw.add_parser("run")
     run.add_argument("--pair", required=True)
     run.add_argument("--role", choices=("a", "b"), default="a")
+    cont = hw.add_parser(
+        "continuity",
+        help="opt-in disconnect/reopen continuity case (two owned phases)",
+    )
+    cont.add_argument("--pair", required=True)
+    cont.add_argument("--role", choices=("a", "b"), default="a")
+    cont.add_argument(
+        "--interrupt-wait",
+        type=float,
+        default=300.0,
+        help="seconds the baseline waits for the declared link to be disconnected",
+    )
+    cont.add_argument(
+        "--no-auto-disconnect",
+        action="store_true",
+        help="leave the interruption to the operator; the harness only records",
+    )
+    cont.add_argument(
+        "--run-root",
+        default=None,
+        help="private directory for the run (default: <root>/evidence)",
+    )
     args = parser.parse_args(argv)
     try:
         root = root_path(args.root)
@@ -167,7 +344,17 @@ def main(argv=None):
         if args.command == "doctor":
             return doctor(config)
         if args.command == "hardware":
-            return hardware(root, config, args.pair, args.role)
+            if args.action == "run":
+                return hardware(root, config, args.pair, args.role)
+            return continuity(
+                root,
+                config,
+                args.pair,
+                args.role,
+                args.interrupt_wait,
+                not args.no_auto_disconnect,
+                args.run_root,
+            )
         from . import docker as rig
 
         if args.command == "sources":

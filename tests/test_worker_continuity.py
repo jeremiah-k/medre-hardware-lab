@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from medre_lab import continuity, ownership, worker
+from medre_lab import cli, continuity, ownership, worker
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS event_body_content (event_id TEXT NOT NULL, body TEXT NOT NULL);
@@ -546,6 +546,79 @@ def test_worker_main_dispatches_pair_and_phases(monkeypatch, tmp_path):
 
     with pytest.raises(SystemExit, match="unknown continuity phase"):
         worker.main([str(cfg), "meshcore:lxmf", "0", str(tmp_path), "bogus"])
+
+
+def _lab_config(tmp_path) -> "object":
+    config = tmp_path / "lab.toml"
+    config.write_text(
+        "[hardware]\n"
+        "startup_timeout=5\nsend_timeout=5\nobservation_timeout=5\n"
+        "[hardware.meshcore]\n"
+        'channel=1\naddresses=["C4:4F:33:6A:AE:A7", "C4:4F:33:6A:A5:2B"]\n'
+        "[hardware.lxmf]\n"
+        'profiles=["p-a", "p-b"]\nidentities=["i-a", "i-b"]\n'
+    )
+    return config
+
+
+def test_cli_continuity_records_process_boundary(tmp_path, monkeypatch):
+    config = _lab_config(tmp_path)
+    run_root = tmp_path / "runs"
+    spawned = []
+
+    def fake_spawn(argv, log_path, timeout, watch=None):
+        run = log_path.parent
+        phase = argv[7]
+        spawned.append((phase, argv[8] if len(argv) > 8 else None, watch is not None))
+        (run / f"{phase}-verdict.json").write_text(
+            json.dumps({"phase": phase, "pass": True}) + "\n"
+        )
+        if watch is not None:
+            # The watcher thread must stop once the child "exits".
+            class FakeChild:
+                def poll(self):
+                    return 0
+
+            threading.Thread(target=watch, args=(FakeChild(),), daemon=True).start()
+        return 0
+
+    monkeypatch.setattr(cli, "_spawn_worker", fake_spawn)
+    code = cli.continuity(
+        tmp_path, config, "meshcore:lxmf", "a", 30.0, True, str(run_root)
+    )
+    assert code == 0
+    assert [phase for phase, _, _ in spawned] == ["baseline", "reopen"]
+    # Baseline carries the interrupt wait; reopen does not.
+    assert spawned[0][1] == "30.0"
+    assert spawned[1][1] is None
+    # Auto-disconnect watcher armed for the baseline phase only.
+    assert spawned[0][2] is True
+    assert spawned[1][2] is False
+    runs = list(run_root.iterdir())
+    merged = json.loads((runs[0] / "continuity-verdict.json").read_text())
+    assert merged["pass"] is True
+    assert set(merged["process_boundary"]) == {"baseline", "reopen"}
+    assert merged["process_boundary"]["baseline"]["exit_code"] == 0
+    assert merged["process_boundary"]["reopen"]["pass"] is True
+
+
+def test_cli_continuity_records_worker_absent_honestly(tmp_path, monkeypatch):
+    config = _lab_config(tmp_path)
+    run_root = tmp_path / "runs"
+
+    def fake_spawn(argv, log_path, timeout, watch=None):
+        return 1  # dies before any verdict
+
+    monkeypatch.setattr(cli, "_spawn_worker", fake_spawn)
+    code = cli.continuity(
+        tmp_path, config, "meshcore:lxmf", "a", 30.0, False, str(run_root)
+    )
+    assert code == 1
+    runs = list(run_root.iterdir())
+    baseline = json.loads((runs[0] / "baseline-verdict.json").read_text())
+    assert baseline["stage"] == "worker-exited-before-verdict"
+    merged = json.loads((runs[0] / "continuity-verdict.json").read_text())
+    assert merged["pass"] is False
 
 
 def test_capture_nonce_state_reports_outbox_and_receipts(tmp_path):
