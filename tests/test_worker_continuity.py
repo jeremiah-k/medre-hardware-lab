@@ -134,6 +134,7 @@ class StubApp:
     def __init__(self, meshcore_diag=None, on_start=None, diagnostics=None):
         self.started = False
         self.stopped = False
+        self.stop_drain_deadline = None
         self.events: list = []
         self.on_start = on_start
         self._diagnostics = diagnostics or (
@@ -156,8 +157,9 @@ class StubApp:
         if self.on_start is not None:
             self.on_start()
 
-    async def stop(self):
+    async def stop(self, drain_deadline=None):
         self.stopped = True
+        self.stop_drain_deadline = drain_deadline
         self.events.append("stop")
 
 
@@ -170,6 +172,7 @@ def stub_config(**overrides):
 @pytest.fixture()
 def fast_polls(monkeypatch):
     monkeypatch.setattr(continuity, "_DB_POLL_INTERVAL", 0.02)
+    monkeypatch.setattr(continuity, "_HEAD_BOUNDARY_WAIT_SECONDS", 5.0)
     monkeypatch.setattr(continuity, "RECONCILE_WAIT_SECONDS", 5.0)
     monkeypatch.setattr(continuity, "UNCERTAIN_SETTLE_WAIT_SECONDS", 2.0)
 
@@ -184,6 +187,12 @@ class Harness:
         self.sent: list = []
         self.send_count = 0
         self.burst_mode = burst_mode
+        self.burst_head_nonce: str | None = None
+        # True once the scripted head pacing window expired into a completed
+        # send without the owner being stopped first (the capture lost).
+        self.window_closed = False
+        self.tail_started = threading.Event()
+        self.tail_finished = threading.Event()
         StubListener.instances = []
 
         def make_listener(kind, seconds):
@@ -216,6 +225,23 @@ class Harness:
                         )
                         self.deliver(destination, nonce)
                         return {"nonce": nonce}
+                    if self.burst_mode == "head_unreserved":
+                        # The head is ingested but the dispatcher never
+                        # reserves it: no claimed pre-handoff boundary.
+                        insert_event(
+                            self.con, nonce, "meshcore", outbox_status="pending"
+                        )
+                        return {"nonce": nonce}
+                    if self.send_count == 5:
+                        self.burst_head_nonce = nonce
+                        insert_event(
+                            self.con, nonce, "meshcore", outbox_status="in_progress"
+                        )
+                        return {"nonce": nonce}
+                    if self.burst_mode == "concurrent":
+                        return self._concurrent_tail(nonce)
+                    if self.burst_mode == "late_tail":
+                        return self._late_tail(nonce)
                     if self.burst_mode == "normal":
                         status = "in_progress" if self.send_count == 5 else "pending"
                         insert_event(self.con, nonce, "meshcore", outbox_status=status)
@@ -254,6 +280,54 @@ class Harness:
 
     def burst_never_pending(self):
         self.burst_mode = "head_only"
+
+    def _close_head_window(self):
+        """Expire the head's scripted pacing window into a completed send."""
+        import time
+
+        self.window_closed = True
+        self.con.execute(
+            "UPDATE delivery_outbox SET status='sent', attempt_number=1,"
+            " active_attempt=NULL, updated_at=? WHERE event_id=?",
+            (time.strftime("%Y-%m-%dT%H:%M:%S"), f"ev-{self.burst_head_nonce}"),
+        )
+        self.con.commit()
+
+    def _concurrent_tail(self, nonce):
+        """Tail lands while its sender is still retiring.
+
+        The tail's durable row appears 0.3s into the send and the sender only
+        retires 1.7s after it started. The head's scripted pacing window
+        expires 0.8s after release unless the owner was stopped before then —
+        a capture that only polls after the sender retires always loses this
+        race, a concurrent durable-state poll observes the boundary in time.
+        """
+        import time
+
+        self.tail_started.set()
+        time.sleep(0.3)
+        insert_event(self.con, nonce, "meshcore", outbox_status="pending")
+        threading.Timer(0.5, self._guarded_window_close).start()
+        time.sleep(1.4)
+        self.tail_finished.set()
+        return {"nonce": nonce}
+
+    def _guarded_window_close(self):
+        if not self.app.stopped:
+            # The owner was not stopped in time: the window really expired.
+            self._close_head_window()
+
+    def _late_tail(self, nonce):
+        """Tail lands only after the head's pacing window already expired."""
+        import time
+
+        self.tail_started.set()
+        self._close_head_window()
+        time.sleep(0.2)
+        insert_event(self.con, nonce, "meshcore", outbox_status="pending")
+        time.sleep(0.3)
+        self.tail_finished.set()
+        return {"nonce": nonce}
 
 
 def _nullctx():
@@ -308,9 +382,9 @@ def test_baseline_completes_all_stages_in_order(tmp_path, monkeypatch, fast_poll
     harness = Harness(monkeypatch, app, tmp_path)
     original_stop = app.stop
 
-    async def stop_with_listener():
+    async def stop_with_listener(drain_deadline=None):
         assert any(listener.active for listener in StubListener.instances)
-        await original_stop()
+        await original_stop(drain_deadline=drain_deadline)
 
     app.stop = stop_with_listener
 
@@ -340,8 +414,18 @@ def test_baseline_completes_all_stages_in_order(tmp_path, monkeypatch, fast_poll
     assert verdict["interrupt"]["rejoin_diagnostics"]["reconnect_attempts"] == 0
     assert verdict["interrupt"]["rejoin_peak_reconnect_attempts"] == 0
     assert verdict["pending_capture"]["captured"] is True
+    # The stop passes a bounded in-flight drain deadline so the captured
+    # head is abandoned mid-window with core's shutdown evidence instead of
+    # being drained to a completed native send.
+    assert verdict["stop_drain_deadline_seconds"] == (
+        continuity._STOP_DRAIN_DEADLINE_SECONDS
+    )
+    assert app.stop_drain_deadline is not None
     assert len(verdict["legs"]) == 4
     assert all(leg["observed_once"] for leg in verdict["legs"])
+    # The burst gate is durable evidence: the head's claimed pre-handoff row
+    # is observed before the tail is ever released.
+    assert "head-claimed-pre-handoff" in stages
     for leg in verdict["legs"]:
         assert leg["event_id"].startswith("ev-")
     state_file = json.loads((tmp_path / "continuity-state.json").read_text())
@@ -386,6 +470,149 @@ def test_baseline_missing_pending_capture_fails(tmp_path, monkeypatch, fast_poll
     verdict = json.loads((tmp_path / "baseline-verdict.json").read_text())
     assert verdict["pass"] is False
     assert "not observed pending" in verdict["error"]
+    assert app.stopped is True
+    assert all(not listener.active for listener in StubListener.instances)
+
+
+def test_capture_observes_boundary_while_tail_sender_retires(
+    tmp_path, monkeypatch, fast_polls
+):
+    """The pending boundary is observed during the tail send, not after it.
+
+    The scripted tail's durable row appears 0.3s into its send while the
+    sender only retires 1.7s after release, and the head's scripted pacing
+    window expires 0.8s after release unless the owner was stopped in time.
+    A capture that waited for the sender to retire before polling (the old
+    gate) always lost this race on a real link; the durable-state poll
+    observes the boundary while the send is in flight and the stop freezes
+    the head inside its pacing window.
+    """
+    state = {"connected": True, "reconnect_attempts": 0, "reconnecting": False}
+    app = StubApp(diagnostics=scripted_session(tmp_path, state))
+    harness = Harness(monkeypatch, app, tmp_path, burst_mode="concurrent")
+
+    ok = run_async(
+        lambda: continuity.run_baseline(
+            stub_config(observation_timeout=2.0),
+            "meshcore:lxmf",
+            0,
+            tmp_path,
+            5.0,
+        )
+    )
+    assert ok is True
+    verdict = json.loads((tmp_path / "baseline-verdict.json").read_text())
+    assert verdict["pass"] is True
+    stages = [t["stage"] for t in verdict["timeline"]]
+    assert "head-claimed-pre-handoff" in stages
+    assert "pending-captured" in stages
+    # The stop interrupted the scripted pacing window before it could expire:
+    # the capture won the race the sender-retirement gate always lost.
+    assert harness.window_closed is False
+    # The owned tail sender retired (drained), and its evidence was collected
+    # after the owner stop without ever gating the capture on it.
+    assert harness.tail_finished.is_set()
+    tail_nonce = harness.sent[5]
+    assert verdict["pending_capture"]["pending"]["nonce"] == tail_nonce
+    assert verdict["pending_capture"]["pending"]["native_send"] == {"nonce": tail_nonce}
+    state_file = json.loads((tmp_path / "continuity-state.json").read_text())
+    assert state_file["pending_capture"]["pending"]["native_send"] == {
+        "nonce": tail_nonce
+    }
+
+
+def test_capture_fails_honestly_when_window_expires_before_tail(
+    tmp_path, monkeypatch, fast_polls
+):
+    """A tail that lands after the pacing window expired is an honest failure.
+
+    The scripted head's window closes before the tail's row appears, so the
+    pending-behind-active-head state never exists; the capture must time out,
+    retire the owned sender, and record the final durable statuses.
+    """
+    state = {"connected": True, "reconnect_attempts": 0, "reconnecting": False}
+    app = StubApp(diagnostics=scripted_session(tmp_path, state))
+    harness = Harness(monkeypatch, app, tmp_path, burst_mode="late_tail")
+
+    ok = run_async(
+        lambda: continuity.run_baseline(
+            stub_config(observation_timeout=2.0),
+            "meshcore:lxmf",
+            0,
+            tmp_path,
+            5.0,
+        )
+    )
+    assert ok is False
+    verdict = json.loads((tmp_path / "baseline-verdict.json").read_text())
+    assert verdict["pass"] is False
+    assert "not observed pending" in verdict["error"]
+    assert "head statuses ['sent']" in verdict["error"]
+    assert harness.window_closed is True
+    assert harness.tail_finished.is_set()
+    assert app.stopped is True
+    assert all(not listener.active for listener in StubListener.instances)
+
+
+def test_capture_refuses_to_release_tail_without_head_boundary(
+    tmp_path, monkeypatch, fast_polls
+):
+    """The tail is never released before the head's boundary is durable.
+
+    A head that is ingested but never reserved (no claimed pre-handoff row)
+    must not trigger a tail release; the gate fails honestly and no burst
+    tail is ever sent.
+    """
+    state = {"connected": True, "reconnect_attempts": 0, "reconnecting": False}
+    app = StubApp(diagnostics=scripted_session(tmp_path, state))
+    harness = Harness(monkeypatch, app, tmp_path, burst_mode="head_unreserved")
+
+    ok = run_async(
+        lambda: continuity.run_baseline(
+            stub_config(), "meshcore:lxmf", 0, tmp_path, 5.0
+        )
+    )
+    assert ok is False
+    verdict = json.loads((tmp_path / "baseline-verdict.json").read_text())
+    assert verdict["pass"] is False
+    assert "never observed claimed and pre-handoff" in verdict["error"]
+    # Only the head was sent; the tail release is gated on durable evidence.
+    assert len(harness.sent) == 5
+    assert harness.tail_started.is_set() is False
+    assert app.stopped is True
+    assert all(not listener.active for listener in StubListener.instances)
+
+
+def test_cancelled_capture_drains_in_flight_tail_sender(
+    tmp_path, monkeypatch, fast_polls
+):
+    """Cancellation during the concurrent capture retires the owned send."""
+    state = {"connected": True, "reconnect_attempts": 0, "reconnecting": False}
+    app = StubApp(diagnostics=scripted_session(tmp_path, state))
+    harness = Harness(monkeypatch, app, tmp_path, burst_mode="concurrent")
+
+    async def scenario():
+        task = asyncio.create_task(
+            continuity.run_baseline(
+                stub_config(observation_timeout=5.0),
+                "meshcore:lxmf",
+                0,
+                tmp_path,
+                5.0,
+            )
+        )
+        while not harness.tail_started.is_set():
+            await asyncio.sleep(0.02)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    # The owned tail send drained to completion; it was never left detached.
+    assert harness.tail_finished.is_set()
+    verdict = json.loads((tmp_path / "baseline-verdict.json").read_text())
+    assert verdict["cancelled"] is True
+    assert verdict["pass"] is False
     assert app.stopped is True
     assert all(not listener.active for listener in StubListener.instances)
 

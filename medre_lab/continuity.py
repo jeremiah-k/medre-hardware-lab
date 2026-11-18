@@ -22,13 +22,17 @@ short-check semantics. The case runs in two owned worker processes:
 Physical interruption and MEDRE shutdown are separate, individually
 evidenced actions. The interrupt stage polls real adapter diagnostics and
 times out honestly; nothing tunes deadlines to obtain a pass. The pending
-capture uses the lab runtime's real send pacing: a second burst message
-lands in the outbox while the first one still holds the MeshCore session's
-serialized pre-send pacing, so at stop one burst message is pending (never
-claimed, no native handoff evidence) and the other is genuinely uncertain
-(claimed, pacing interrupted before the native send boundary). Core's own
-replay authority decides their post-reopen disposition; the case records
-what actually happens and asserts only against the committed contract.
+capture uses the lab runtime's real send pacing: the burst tail is released
+only after the burst head's claimed, reserved, pre-handoff outbox row is
+observed, and the capture then polls durable state concurrently with the
+still-running tail send, so the tail lands in the outbox while the head
+still holds the MeshCore session's serialized pre-send pacing even when the
+independent sender spends seconds on its own teardown. At stop one burst
+message is pending (never claimed, no native handoff evidence) and the
+other is genuinely uncertain (claimed, pacing interrupted before the native
+send boundary). Core's own replay authority decides their post-reopen
+disposition; the case records what actually happens and asserts only
+against the committed contract.
 """
 
 from __future__ import annotations
@@ -53,8 +57,12 @@ from .runtime import build
 #: Send pacing used while the continuity runtime is assembled. The real
 #: adapter pacing (sleep before the native send, serialized per session)
 #: creates the bounded pre-handoff window the pending capture needs; the
-#: ordinary short check keeps its own 2.5 s value.
-CONTINUITY_MESSAGE_DELAY_SECONDS = 12.0
+#: ordinary short check keeps its own 2.5 s value. The continuity value is
+#: sized so the window outlasts the burst tail's measured route ingestion
+#: (~7-11 s over the two-transport link) plus the stop's own bounded
+#: teardown (drain abandonment plus adapter/pipeline shutdown), which is
+#: what keeps the captured head mid-window until the stop cancels it.
+CONTINUITY_MESSAGE_DELAY_SECONDS = 24.0
 
 #: How long the baseline waits for someone to disconnect the declared link.
 DEFAULT_INTERRUPT_WAIT_SECONDS = 300.0
@@ -66,7 +74,23 @@ RECONCILE_WAIT_SECONDS = 180.0
 UNCERTAIN_SETTLE_WAIT_SECONDS = 120.0
 
 _STOP_BUDGET_SECONDS = 30.0
+
+#: Bounded in-flight drain for the owner stop. Core's shutdown drain waits
+#: for in-flight deliveries to complete (up to its configured limit), which
+#: would finish the captured burst head's native send during the stop and
+#: erase the uncertain state the case preserves. The bounded deadline ends
+#: that wait while the burst head is still mid-window, so the pipeline
+#: teardown cancels it claimed and pre-handoff, resumable after reopen.
+_STOP_DRAIN_DEADLINE_SECONDS = 1.0
+
+#: Bounded post-stop window in which SDK children may finish their own
+#: asynchronous retirement (e.g. the LXMF native worker's SDK/RNS
+#: teardown) before the leak measurement reports survivors.
+_SDK_CHILD_RETIRE_WAIT_SECONDS = 5.0
 _DB_POLL_INTERVAL = 0.2
+
+#: Bounded wait for the burst head's claimed, reserved, pre-handoff boundary.
+_HEAD_BOUNDARY_WAIT_SECONDS = 15.0
 
 _PENDING_STATUSES = ("pending", "retry_wait")
 
@@ -402,8 +426,28 @@ def _child_pids() -> list[int]:
     return children
 
 
+def _cmdline(pid: int) -> str:
+    """Read one process command line for survivor evidence; never raises."""
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+        return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()[:200]
+    except OSError:
+        return ""
+
+
 async def _teardown_owner(app, result: dict, armed: dict) -> None:
-    """Bounded stop of the MEDRE owner plus SDK-child teardown evidence."""
+    """Bounded stop of the MEDRE owner plus SDK-child teardown evidence.
+
+    The stop passes a bounded in-flight drain deadline: core's default
+    shutdown drain waits for in-flight deliveries to complete, which would
+    finish the captured burst head's native send during the stop instead of
+    freezing it claimed and pre-handoff. With the bounded deadline the stop
+    cancels that delivery mid-window and leaves the row resumable for the
+    reopen phase. SDK children may retire asynchronously shortly after
+    ``stop()`` returns (the LXMF native worker finishes its own SDK/RNS
+    teardown), so the leak measurement gives that retirement a bounded,
+    recorded window before reporting survivors with their command lines.
+    """
     if app is None:
         return
     peer_pids = {
@@ -413,9 +457,28 @@ async def _teardown_owner(app, result: dict, armed: dict) -> None:
         and owner.proc is not None
     }
     started = time.monotonic()
-    await asyncio.wait_for(app.stop(), _STOP_BUDGET_SECONDS)
+    await asyncio.wait_for(
+        app.stop(drain_deadline=time.monotonic() + _STOP_DRAIN_DEADLINE_SECONDS),
+        _STOP_BUDGET_SECONDS,
+    )
     result["stop_seconds"] = round(time.monotonic() - started, 3)
-    result["surviving_sdk_children"] = sorted(set(_child_pids()) - peer_pids)
+    result["stop_drain_deadline_seconds"] = _STOP_DRAIN_DEADLINE_SECONDS
+    retire_started = time.monotonic()
+    survivors: list[int] = []
+    while True:
+        survivors = sorted(set(_child_pids()) - peer_pids)
+        if not survivors or time.monotonic() - retire_started >= (
+            _SDK_CHILD_RETIRE_WAIT_SECONDS
+        ):
+            break
+        await asyncio.sleep(0.2)
+    result["sdk_children_retire_wait_seconds"] = round(
+        time.monotonic() - retire_started, 3
+    )
+    result["surviving_sdk_children"] = survivors
+    result["surviving_sdk_children_cmdlines"] = {
+        str(pid): _cmdline(pid) for pid in survivors
+    }
 
 
 async def run_baseline(
@@ -468,6 +531,7 @@ async def _run_baseline_owned(
     }
     app = None
     armed: dict = {}
+    tail_send: "asyncio.Future[dict] | None" = None
     state = _read_state(run)
     state.update(
         phase="baseline",
@@ -578,7 +642,7 @@ async def _run_baseline_owned(
             await _select_listener(
                 armed, listeners, "meshcore", _listener_lifetime(hw, interrupt_wait)
             )
-            result["pending_capture"] = await _pending_capture(
+            result["pending_capture"], tail_send = await _pending_capture(
                 run, hw, senders, transports, timeline
             )
             state["pending_capture"] = result["pending_capture"]
@@ -591,6 +655,11 @@ async def _run_baseline_owned(
             # observers. Teardown remains bounded either way.
             await _teardown_owner(app, result, armed)
             app = None
+            # The stop froze the burst rows; the independent tail sender may
+            # still be finishing its own teardown. Collect its evidence now —
+            # the capture itself never waited for the sender to retire.
+            result["pending_capture"]["pending"]["native_send"] = await tail_send
+            tail_send = None
             _stale_backlog_observation(run, result["legs"])
             _verify_stopped_capture(run, result["pending_capture"])
             state["pending_capture"] = result["pending_capture"]
@@ -618,6 +687,11 @@ async def _run_baseline_owned(
         result["error"] = type(exc).__name__ + ": " + str(exc)[-1600:]
         result["cancelled"] = isinstance(exc, asyncio.CancelledError)
         result["timeline"] = timeline
+        if tail_send is not None and not tail_send.done():
+            # The burst capture released the tail but never reached its
+            # collector; retire the owned send before releasing endpoints.
+            await _drain_send(tail_send)
+            tail_send = None
         try:
             if app is not None:
                 await _teardown_owner(app, result, armed)
@@ -823,6 +897,52 @@ def _never_claimed(row: dict) -> bool:
     )
 
 
+def _head_boundary_state(snapshot: dict, destination: str) -> bool:
+    """True while the burst head is claimed, reserved and pre-handoff.
+
+    The single destination row must be ``in_progress`` with one active
+    attempt reserved and radio progress that has not handed off yet: the
+    exact durable shape of a send holding the meshcore adapter's serialized
+    pre-send pacing window.
+    """
+    head = _single_destination_row(snapshot, destination)
+    return (
+        head is not None
+        and head["status"] == "in_progress"
+        and head["active_attempt"] == 1
+        and head["attempt_number"] == 0
+        and _pre_handoff(head)
+        and not snapshot["events"][0]["receipts"]
+    )
+
+
+def _tail_pending_state(snapshot: dict, destination: str) -> bool:
+    """True while the burst tail is staged pending behind the active head."""
+    tail = _single_destination_row(snapshot, destination)
+    return (
+        tail is not None
+        and _never_claimed(tail)
+        and not snapshot["events"][0]["receipts"]
+    )
+
+
+async def _drain_send(task: "asyncio.Future[dict]") -> dict | BaseException | None:
+    """Retire an owned send on every exit path; never leave it detached.
+
+    Cancels the awaiting side while the native operation drains to
+    completion (the same ownership contract as :func:`owned_blocking`).
+    Returns the send's result, its exception when it failed, or ``None``
+    when it retired cancelled.
+    """
+    task.cancel()
+    try:
+        return await task
+    except asyncio.CancelledError:
+        return None
+    except Exception as exc:
+        return exc
+
+
 def _verify_stopped_capture(run: Path, capture: dict) -> None:
     head, tail = capture_nonce_states(
         run / "state.sqlite", capture["uncertain"]["nonce"], capture["pending"]["nonce"]
@@ -852,7 +972,7 @@ def _verify_stopped_capture(run: Path, capture: dict) -> None:
 
 async def _pending_capture(
     run: Path, hw: dict, senders: dict, transports: tuple[str, str], timeline: list
-) -> dict:
+) -> tuple[dict, "asyncio.Future[dict] | None"]:
     """Create and capture one reconcilable pending case before shutdown.
 
     Two burst messages are sent toward the MeshCore destination back to
@@ -860,9 +980,20 @@ async def _pending_capture(
     send boundary while holding its send lock, so the first burst message is
     claimed but pre-handoff, and the second lands in the outbox as genuine
     pending work (the dispatcher never claims rows behind an active send
-    for the same adapter). Both durable states are captured while the owner
-    is still alive; the disposition authority after reopen is core's own
-    replay contract.
+    for the same adapter).
+
+    Both waits are event-driven on durable state. The burst tail is released
+    only after the head's claimed, reserved, pre-handoff row is observed,
+    and the capture then polls the database concurrently with the
+    still-running tail send: the honest boundary (tail ingested while the
+    head holds its pacing window) is observable while the independent
+    sender is finishing its own teardown, instead of only after the sender
+    retires — a sender that returns seconds after delivery must not consume
+    the head's pacing window. The caller stops the owner while the capture
+    holds and collects the tail sender's evidence afterwards; the tail task
+    is drained on every exit path here. Both durable states are captured
+    while the owner is still alive; the disposition authority after reopen
+    is core's own replay contract.
     """
     if "meshcore" not in transports:
         raise ValueError("pending capture requires the meshcore transport")
@@ -873,50 +1004,72 @@ async def _pending_capture(
     burst_pending = _nonce()
 
     sent_first = await owned_blocking(senders[source], burst_uncertain)
-    ok, _ = await _wait_for(
-        lambda: bool(capture_nonce_state(db, burst_uncertain)["events"]), 15.0
+
+    def head_boundary() -> bool:
+        return _head_boundary_state(
+            capture_nonce_state(db, burst_uncertain), destination
+        )
+
+    ok, waited = await _wait_for(
+        head_boundary, _HEAD_BOUNDARY_WAIT_SECONDS, _DB_POLL_INTERVAL
     )
     if not ok:
-        raise AssertionError("burst head was never ingested by the owner")
-    sent_second = await owned_blocking(senders[source], burst_pending)
+        raise AssertionError(
+            "burst head was never observed claimed and pre-handoff "
+            f"(statuses {_outbox_statuses(capture_nonce_state(db, burst_uncertain))})"
+        )
+    timeline.append(
+        {
+            "stage": "head-claimed-pre-handoff",
+            "at": _now(),
+            "wait_seconds": round(waited, 3),
+        }
+    )
+
+    # Release the tail behind the observed boundary without waiting for the
+    # sender process to retire. The owned send is drained on every exit path.
+    tail_send = asyncio.create_task(owned_blocking(senders[source], burst_pending))
+
     head_state, pending_state = {}, {}
 
-    def captured():
+    def captured() -> bool:
         nonlocal head_state, pending_state
         head_state, pending_state = capture_nonce_states(
             db, burst_uncertain, burst_pending
         )
-        head = _single_destination_row(head_state, destination)
-        tail = _single_destination_row(pending_state, destination)
-        return (
-            head is not None
-            and head["status"] == "in_progress"
-            and head["active_attempt"] == 1
-            and head["attempt_number"] == 0
-            and _pre_handoff(head)
-            and tail is not None
-            and _never_claimed(tail)
-            and not head_state["events"][0]["receipts"]
-            and not pending_state["events"][0]["receipts"]
+        return _head_boundary_state(head_state, destination) and _tail_pending_state(
+            pending_state, destination
         )
 
-    ok, _ = await _wait_for(captured, hw["observation_timeout"], _DB_POLL_INTERVAL)
+    try:
+        ok, waited = await _wait_for(
+            captured, hw["observation_timeout"], _DB_POLL_INTERVAL
+        )
+    except BaseException:
+        await _drain_send(tail_send)
+        raise
     if not ok:
-        raise AssertionError("burst was not observed pending behind an active head")
+        tail_failure = await _drain_send(tail_send)
+        detail = "" if tail_failure is None else f"; tail send failed: {tail_failure}"
+        raise AssertionError(
+            "burst was not observed pending behind an active head "
+            f"(head statuses {_outbox_statuses(head_state)}, "
+            f"tail statuses {_outbox_statuses(pending_state)}){detail}"
+        )
     timeline.append(
         {
             "stage": "pending-captured",
             "at": _now(),
+            "wait_seconds": round(waited, 3),
             "pending_statuses": _outbox_statuses(pending_state),
             "head_statuses": _outbox_statuses(head_state),
         }
     )
-    return {
+    capture = {
         "captured": True,
         "destination": destination,
         "pending": {
             "nonce": burst_pending,
-            "native_send": sent_second,
             "state": pending_state,
         },
         "uncertain": {
@@ -925,6 +1078,7 @@ async def _pending_capture(
             "state": head_state,
         },
     }
+    return capture, tail_send
 
 
 async def run_reopen(config: dict, selection: str, role: int, run: Path) -> bool:
