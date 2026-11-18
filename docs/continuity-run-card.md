@@ -11,18 +11,43 @@ client-connection interruption and a MEDRE process reopen. The ordinary
 - MeshCore boards are healthy: both configured boards advertise, connect
   over BLE, and deliver channel traffic between themselves in both
   directions (`<owned-board>`, `<peer-board>`, channel 1).
+- CORRECTION of the earlier "boards refuse rapid BLE reconnection and
+  recover only after idle" claim: a bounded diagnostic (scan-find,
+  connect, 2 s hold, clean disconnect, repeated at 2-10 s gaps) connected
+  five out of five rounds with connect times of 1.4-1.8 s, and the boards
+  resumed advertising 1.1-1.2 s after every clean disconnect. Rapid
+  reconnect at seconds-level pacing is the normal case; the peer child's
+  connect retry budget rides out a transient advertising gap of about
+  half a minute before failing honestly. One transient remains
+  unexplained and is recorded as an open finding: three consecutive 8 s
+  scans found a board invisible roughly sixteen minutes after a clean
+  disconnect, with visibility restored by the next check; no lab or board
+  cause has been established for that single event.
 - The RAK4631 Meshtastic board is connectable; the T1000-E is in BOOT
   loader mode and must be recovered by the operator before any Meshtastic
   pair can run. Do not reflash from the lab.
-- The two RNode radios power up with matching firmware-reported radio
-  configuration (916.0 MHz, 125 kHz, 8 dBm, SF8, CR5) but neither hears the
-  other's announces, and direct LXMF delivery cancels. The lxmf transport
-  is therefore unusable until this is resolved (antennas, hardware, or RF
-  environment — operator inspection). This blocked the full pair run.
-- A reduced continuity run on the MeshCore board link alone passed and its
-  evidence is in the campaign workspace (ingress over the board RF channel,
-  real BLE disconnect/rejoin with recovery-loop evidence, fresh-process
-  reopen with retained identities and an unprogressed uncertain row).
+- CORRECTION of the earlier "RNode RF link is dead" finding: the two RNode
+  radios power up with matching firmware-reported radio configuration
+  (916.0 MHz, 125 kHz, 8 dBm, SF8, CR5) and the serial-only RNode RF link
+  carries two-way LXMF delivery. At the strengthened head the full-pair
+  short check passed with one message per direction, terminal lxmf
+  `DELIVERED` (state 8), far-side observation of each nonce, and
+  failure-free durable receipts; the RNS profiles contain only
+  RNodeInterface entries on the two distinct CH340 serial ports, so the
+  deliveries crossed the physical RF link. The lxmf transport is usable.
+- Probe-design warning for announce-visibility checks: the earlier probe
+  that "heard 0 announces both ways" was flawed — each side registered the
+  RNS announce handler on its OWN destination identity, so it could never
+  observe the other side's announce regardless of RF conditions. The same
+  structure existed in the prior campaign's `rf_visibility.py`. Treat
+  announce-listen results from that pattern as non-evidence; a passed
+  two-way delivery is the authoritative RF evidence. (The flawed pattern
+  is not present in the committed lab package; it lived only in private
+  campaign probe scripts.)
+- A reduced continuity run on the MeshCore board link alone passed in the
+  earlier campaign, but the reduced form is not a qualification: current
+  lab heads refuse single-transport pairs during validation, and the full
+  `meshcore:lxmf` pair is the qualified shape (and is proven usable above).
 
 ## Prerequisites (operator-owned)
 
@@ -86,11 +111,17 @@ Baseline phase (`baseline-verdict.json`):
    markers. Ingress re-observation is not instrumented, so absence of a
    duplicate is not proof that a stale packet was received and suppressed.
 6. `pending-captured` — two burst messages toward the MeshCore destination:
-   the exact burst tail must be pending and never claimed while the burst
-   head is claimed with pre-handoff radio progress. Recheck their identities
-   and stopped evidence after retirement.
-7. `owner-stopped` — bounded graceful stop; the independent peer listeners
-   close afterwards. `surviving_sdk_children` must be empty.
+   the burst tail is released only after the burst head's claimed, reserved,
+   pre-handoff outbox row is observed, and the boundary (tail pending and
+   never claimed behind that head) is polled while the tail send is still in
+   flight, so the honest state is observable on links where the independent
+   sender's own teardown takes seconds. Recheck their identities and stopped
+   evidence after retirement.
+7. `owner-stopped` — bounded graceful stop with a bounded in-flight drain
+   (the stop abandons the captured head mid-window and core records its own
+   `shutdown_rejection` receipt; the head row stays claimed, pre-handoff and
+   resumable); the independent peer listeners close afterwards.
+   `surviving_sdk_children` must be empty.
 
 Reopen phase (`reopen-verdict.json`), a fresh process:
 
