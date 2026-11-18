@@ -51,3 +51,19 @@ def test_renovate_extracts_every_annotated_tool_pin():
     registry = config["customDatasources"]["trunk-cli"]["defaultRegistryUrlTemplate"]
     assert registry in (ROOT / ".trunk/trunk").read_text()
     assert config["customDatasources"]["trunk-cli"]["format"] == "yaml"
+
+
+def test_local_native_wrappers_never_pull_and_skip_build_preflights():
+    compose = yaml.safe_load((ROOT / "compose.yaml").read_text())
+    wrappers = {"medre-lab/synapse-lab:latest", "medre-lab/meshtasticd-lab:latest"}
+    services = [
+        service
+        for service in compose["services"].values()
+        if service.get("image") in wrappers
+    ]
+    assert {service["image"] for service in services} == wrappers
+    assert all(service["pull_policy"] == "never" for service in services)
+    script = (ROOT / "lab/up.sh").read_text()
+    assert script.index('docker image inspect "${image}"') < script.index(
+        "docker compose --profile medre stop"
+    )

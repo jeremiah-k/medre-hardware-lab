@@ -98,8 +98,24 @@ x-mmrelay-common: &mmrelay-common
 # meshtasticd nodes run WITHOUT -s: the -s flag short-circuits config-file
 # loading (PortduinoGlue force_simradio branch), which would silently disable
 # Config.EnableUDP and thus all cross-node sim-radio meshing.
+#
+# Unprivileged runtime: upstream meshtasticd ships no /data and runs as root.
+# The derived image (lab/meshtasticd/Dockerfile, digest-pinned FROM the
+# upstream daily) pre-owns /data and /var/lib/meshtasticd for uid 1000, so
+# fresh named volumes seed 1000-owned state and meshtasticd writes
+# (--fsdir=/data) as uid 1000 with no root anywhere in the bring-up path.
+# The tmpfs over /var/lib/meshtasticd (unused when --fsdir=/data) also stops
+# the image's VOLUME declaration minting an orphaned anonymous volume per
+# container.
 x-meshtasticd-common: &meshtasticd-common
-  image: meshtastic/meshtasticd@sha256:68694cd2b704a1f4ed3bc6739e8edb7b519ce5798ac2dbab1a6352f90a632e3f # daily 2.8.3.b78db83
+  build:
+    context: lab/meshtasticd
+    dockerfile: Dockerfile
+  image: medre-lab/meshtasticd-lab:latest
+  pull_policy: never
+  user: "1000:1000"
+  tmpfs:
+    - /var/lib/meshtasticd
   restart: unless-stopped
   healthcheck:
     # NEVER probe the TCP API port: the API server keeps a single client
@@ -118,7 +134,19 @@ x-meshtasticd-common: &meshtasticd-common
 
 services:
   synapse:
-    image: matrixdotorg/synapse@sha256:f223f5fc532600801284fededefca82288fb71551bf4fcc89cd0b3363a3461cc # v1.149.0
+    # Unprivileged runtime: upstream Synapse ships no /data and its start.py
+    # bootstraps state via root chown+gosu (991:991). The derived image
+    # (lab/synapse/Dockerfile, digest-pinned FROM the upstream v1.149.0)
+    # pre-owns /data as 991:991 — the image's documented runtime user — so the
+    # entrypoint runs directly as 991:991 (with a non-root uid start.py skips
+    # the chown/gosu entirely) and fresh named volumes seed 991-owned state.
+    # Reused volumes must be writable by the configured service identity.
+    build:
+      context: lab/synapse
+      dockerfile: Dockerfile
+    image: medre-lab/synapse-lab:latest
+    pull_policy: never
+    user: "991:991"
     container_name: medre-lab-synapse
     restart: unless-stopped
     environment:

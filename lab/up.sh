@@ -130,6 +130,15 @@ echo "  ref:    ${MMRELAY_BAKE_CORE_REF} (baked into mmrelay images only)"
 COMPOSE=(docker compose)
 RELAYS=(a b)
 
+# Derived images are local build artifacts, not registry images. Fail before
+# stopping running services or resetting durable state when reuse is impossible.
+if ((SKIP_BUILD)); then
+	for image in medre-lab/synapse-lab:latest medre-lab/meshtasticd-lab:latest; do
+		docker image inspect "${image}" >/dev/null 2>&1 ||
+			die "Missing local wrapper ${image}; rerun without --skip-build"
+	done
+fi
+
 # --- MEDRE bridge profile -----------------------------------------------------
 # Adds: dedicated meshtasticd-a-medre (AlphaLab) + meshtasticd-b-medre
 # (BetaLab) nodes and one medre-relay runtime (bot @medre:lab.test, matrix
@@ -218,8 +227,8 @@ fi
 
 # --- Build -------------------------------------------------------------------
 if ((! SKIP_BUILD)); then
-	log "Building images (mmrelay dev + lab-tools)"
-	"${COMPOSE[@]}" build mmrelay-a mmrelay-b lab-tools
+	log "Building images (mmrelay dev + lab-tools + unprivileged synapse/meshtasticd wrappers)"
+	"${COMPOSE[@]}" build mmrelay-a mmrelay-b lab-tools synapse meshtasticd-a
 	if ((WITH_MEDRE)); then
 		log "Building image (medre dev)"
 		"${COMPOSE[@]}" build medre-relay
@@ -989,7 +998,12 @@ if ((WITH_NORMAL)); then
 fi
 echo "  logs: ${LOG_DIR}/bringup-${TS}.log (+ per-relay logs)"
 
-MESHTASTICD_REF="$(docker image inspect meshtastic/meshtasticd:daily --format '{{index .RepoDigests 0}}')"
+MESHTASTICD_REF="$(awk '$1 == "FROM" {print $2; exit}' lab/meshtasticd/Dockerfile)"
+SYNAPSE_REF="$(awk '$1 == "FROM" {print $2; exit}' lab/synapse/Dockerfile)"
+# Record the running containers' image IDs as well as the declared bases. With
+# --skip-build a previously built wrapper need not match the current FROM.
+MESHTASTICD_IMAGE_ID="$(docker inspect --type container --format '{{.Image}}' medre-lab-mesh-a)"
+SYNAPSE_IMAGE_ID="$(docker inspect --type container --format '{{.Image}}' medre-lab-synapse)"
 cat >lab/VERSION <<EOF
 # hardware-lab version record (rewritten by lab/up.sh at each bring-up)
 recorded_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -998,10 +1012,13 @@ mmrelay:
   branch: ${BRANCH}
   head: ${HEAD_SHA}
 images:
-  meshtasticd: ${MESHTASTICD_REF} # meshtastic/meshtasticd:daily (owner directive: track daily channel)
-  meshtasticd_firmware: $(docker run --rm --entrypoint sh meshtastic/meshtasticd:daily -c 'meshtasticd -V 2>/dev/null' 2>/dev/null | tail -1)
+  meshtasticd_declared_base: ${MESHTASTICD_REF}
+  meshtasticd_local_image_id: ${MESHTASTICD_IMAGE_ID}
+  meshtasticd_firmware: $(docker exec medre-lab-mesh-a meshtasticd -V 2>/dev/null | tail -1)
   meshtasticd_fallback: meshtastic/meshtasticd@sha256:23e92b1331a3a471eaef0c63cbca4365ca40b3111a9781cfdbe5a5114e5773d4 # 2.7.26, last stable that passed the mesh probe; pin here temporarily if a daily breaks bring-up
-  synapse: matrixdotorg/synapse@sha256:f223f5fc532600801284fededefca82288fb71551bf4fcc89cd0b3363a3461cc # v1.149.0
+  synapse_declared_base: ${SYNAPSE_REF}
+  synapse_local_image_id: ${SYNAPSE_IMAGE_ID}
+  meshtasticd_runtime: medre-lab/meshtasticd-lab:latest (runtime user 1000:1000; declared base above, actual local image ID recorded)
   mmrelay-dev: medre-lab/mmrelay-dev:latest (built from lab/mmrelay/Dockerfile; deps baked from mmrelay pyproject ".[e2e]")
   lab-tools: medre-lab/lab-tools:latest (built from lab/tools/Dockerfile)
 topology: AlphaLab = meshtasticd-a + meshtasticd-a-peer (mmrelay-a); BetaLab = meshtasticd-b + meshtasticd-b-peer (mmrelay-b)
