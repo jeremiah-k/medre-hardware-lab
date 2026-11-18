@@ -76,11 +76,13 @@ Baseline phase (`baseline-verdict.json`):
 4. `link-rejoined` — connected again with the recovery loop finished; the
    peak reconnect-attempt counter is recorded as evidence only (the session
    resets it to zero on success).
-5. Two fresh legs on the rejoined link; stale-replay observation recorded
-   (suppression is asserted only for markers actually re-observed).
+5. Two fresh legs on the rejoined link; compare durable effects of previous
+   markers. Ingress re-observation is not instrumented, so absence of a
+   duplicate is not proof that a stale packet was received and suppressed.
 6. `pending-captured` — two burst messages toward the MeshCore destination:
-   the burst tail must be observed with a claimable outbox row while the
-   burst head holds the serialized pre-send pacing window.
+   the exact burst tail must be pending and never claimed while the burst
+   head is claimed with pre-handoff radio progress. Recheck their identities
+   and stopped evidence after retirement.
 7. `owner-stopped` — bounded graceful stop; the independent peer listeners
    close afterwards. `surviving_sdk_children` must be empty.
 
@@ -88,13 +90,16 @@ Reopen phase (`reopen-verdict.json`), a fresh process:
 
 1. Run lock acquired (fails fast while the baseline owner lives).
 2. `persisted-verified` — completed sibling identities match the baseline
-   record exactly (same event ids, same sent receipts).
+   record exactly (same canonical events, outbox rows and receipts); the
+   successful baseline verdict, selected pair, role, configuration digest
+   and installed-package provenance must also match.
 3. `owner-restarted` — the same campaign database and profiles.
 4. `pending-disposition` — the pending case progresses only if core's own
    replay authority allows it; the uncertain case's outcome is recorded
    without assertion. Both final outbox/receipt states are captured.
 5. One fresh marker per direction after reopen proves peer observation
-   still functions.
+   still functions. After retirement, recheck completed and replayed
+   obligations and the fresh legs for unexpected durable changes.
 
 ## Safe stop
 

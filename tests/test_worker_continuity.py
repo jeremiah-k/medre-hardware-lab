@@ -389,6 +389,30 @@ def test_baseline_missing_pending_capture_fails(tmp_path, monkeypatch, fast_poll
     assert all(not listener.active for listener in StubListener.instances)
 
 
+def _publish_baseline(run, *, passed=True):
+    state = continuity._read_state(run)
+    state.update(
+        pair=["meshcore", "lxmf"],
+        role="a",
+        config_sha256=continuity._config_fingerprint(stub_config()),
+    )
+    for leg in state["completed_legs"]:
+        leg["durable"] = continuity.capture_nonce_state(
+            run / "state.sqlite", leg["nonce"]
+        )
+    continuity._write_state(run, state)
+    continuity._write_json(
+        run / "baseline-verdict.json",
+        {
+            "phase": "baseline",
+            "pass": passed,
+            "legs": state["completed_legs"],
+            "pending_capture": state["pending_capture"],
+            "packages": {"stub": {"version": "0"}},
+        },
+    )
+
+
 def test_reopen_reconciles_pending_and_records_uncertain(
     tmp_path, monkeypatch, fast_polls
 ):
@@ -433,6 +457,7 @@ def test_reopen_reconciles_pending_and_records_uncertain(
         )
     )
 
+    _publish_baseline(tmp_path)
     reconciled = {"done": False}
 
     def on_start():
@@ -441,7 +466,7 @@ def test_reopen_reconciles_pending_and_records_uncertain(
         if not reconciled["done"]:
             reconciled["done"] = True
             con.execute(
-                "UPDATE delivery_outbox SET status='sent' WHERE event_id=?",
+                "UPDATE delivery_outbox SET status='sent', attempt_number=1 WHERE event_id=?",
                 (f"ev-{pending}",),
             )
             con.execute(
@@ -515,6 +540,7 @@ def test_reopen_fails_when_completed_identity_lost(tmp_path, monkeypatch, fast_p
             }
         )
     )
+    _publish_baseline(tmp_path)
     app = StubApp()
     Harness(monkeypatch, app, tmp_path)
 
@@ -760,3 +786,48 @@ def test_contender_leaves_owner_evidence_untouched(tmp_path):
         )
     assert state.read_text() == "owner evidence"
     assert not (tmp_path / "baseline-verdict.json").exists()
+
+
+@pytest.mark.parametrize(
+    "failure", ["failed-baseline", "config-drift", "package-drift"]
+)
+def test_reopen_refuses_inconsistent_baseline_before_native_start(
+    tmp_path, monkeypatch, failure
+):
+    make_db(tmp_path)
+    continuity._write_state(tmp_path, {"completed_legs": [], "pending_capture": {}})
+    _publish_baseline(tmp_path, passed=failure != "failed-baseline")
+    app = StubApp()
+    Harness(monkeypatch, app, tmp_path)
+    config = stub_config(send_timeout=8) if failure == "config-drift" else stub_config()
+    if failure == "package-drift":
+        monkeypatch.setattr(worker, "provenance", lambda _: {"stub": {"version": "1"}})
+    assert not run_async(
+        lambda: continuity.run_reopen(config, "meshcore:lxmf", 0, tmp_path)
+    )
+    assert not app.started
+    verdict = json.loads((tmp_path / "reopen-verdict.json").read_text())
+    assert "baseline" in verdict["error"] or "provenance" in verdict["error"]
+
+
+@pytest.mark.parametrize(
+    "column,value",
+    [
+        ("target_channel", "wrong"),
+        ("delivery_plan_id", "wrong"),
+        ("attempt_number", 2),
+        ("outbox_id", "wrong"),
+    ],
+)
+def test_unrelated_sent_receipt_cannot_qualify_leg(tmp_path, column, value):
+    con = make_db(tmp_path)
+    insert_event(con, "marker", "meshcore", receipt_status="sent", outbox_status="sent")
+    con.execute(f"UPDATE delivery_receipts SET {column}=?", (value,))
+    con.commit()
+    assert (
+        continuity._sent_receipt_event_id(
+            continuity.capture_nonce_state(tmp_path / "state.sqlite", "marker"),
+            "meshcore",
+        )
+        is None
+    )

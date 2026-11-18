@@ -34,6 +34,7 @@ what actually happens and asserts only against the committed contract.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -74,6 +75,12 @@ def _nonce() -> str:
 
 def _now() -> float:
     return time.time()
+
+
+def _config_fingerprint(config: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _read_state(run: Path) -> dict:
@@ -170,27 +177,32 @@ def _sent_receipt_event_id(
     """Return the canonical event id with one failure-free sent receipt."""
     if len(snapshot["events"]) != 1:
         return None
-    for event in snapshot["events"]:
-        sent = [
-            r
-            for r in event["receipts"]
-            if r["receipt_kind"] == "attempt"
-            and r["status"] == "sent"
-            and r["target_adapter"] == destination
-        ]
-        bad = [
-            r
-            for r in event["receipts"]
-            if r["failure_kind"] is not None
-            or r["status"] in ("failed", "dead_lettered", "denied")
-        ]
-        if (
-            len(sent) == 1
-            and not bad
-            and (outbox_id is None or sent[0]["outbox_id"] == outbox_id)
-        ):
-            return event["event_id"]
-    return None
+    event = snapshot["events"][0]
+    sent = [
+        r
+        for r in event["receipts"]
+        if r["receipt_kind"] == "attempt"
+        and r["status"] == "sent"
+        and r["target_adapter"] == destination
+    ]
+    bad = [
+        r
+        for r in event["receipts"]
+        if r["failure_kind"] is not None
+        or r["status"] in ("failed", "dead_lettered", "denied")
+    ]
+    row = _single_destination_row(snapshot, destination)
+    if len(sent) != 1 or bad or row is None or row["status"] != "sent":
+        return None
+    receipt = sent[0]
+    if outbox_id is not None and row["outbox_id"] != outbox_id:
+        return None
+    if any(
+        receipt[key] != row[key]
+        for key in ("outbox_id", "delivery_plan_id", "target_channel", "attempt_number")
+    ):
+        return None
+    return event["event_id"]
 
 
 def _sent_receipt_identity(snapshot: dict, destination: str) -> tuple[str, str] | None:
@@ -425,6 +437,7 @@ async def _run_baseline_owned(
         pair=list(transports),
         role=result["role"],
         message_delay_seconds=CONTINUITY_MESSAGE_DELAY_SECONDS,
+        config_sha256=_config_fingerprint(config),
         started_at=_now(),
     )
     _write_state(run, state)
@@ -541,6 +554,7 @@ async def _run_baseline_owned(
             # observers. Teardown remains bounded either way.
             await _teardown_owner(app, result, armed)
             app = None
+            _stale_backlog_observation(run, result["legs"])
             _verify_stopped_capture(run, result["pending_capture"])
             state["pending_capture"] = result["pending_capture"]
             _write_state(run, state)
@@ -761,7 +775,8 @@ def _verify_stopped_capture(run: Path, capture: dict) -> None:
         or not _never_claimed(current_tail)
         or current_head["status"] in ("sent", "queued")
         or not _pre_handoff(current_head)
-        or _sent_receipt_event_id(head, "meshcore") is not None
+        or any(r["status"] == "sent" for r in head["events"][0]["receipts"])
+        or bool(tail["events"][0]["receipts"])
     ):
         raise AssertionError(
             "stopped burst no longer retains the captured head/tail identities and unfinished tail"
@@ -884,7 +899,24 @@ async def _run_reopen_owned(config, selection, role, run, configured) -> bool:
                 "reopen requires a baseline state file with the captured "
                 "pending case and completed legs; baseline did not record one"
             )
+        baseline = json.loads((run / "baseline-verdict.json").read_text())
+        if (
+            baseline.get("phase") != "baseline"
+            or baseline.get("pass") is not True
+            or state.get("pair") != list(transports)
+            or state.get("role") != result["role"]
+            or state.get("config_sha256") != _config_fingerprint(config)
+            or state.get("completed_legs") != baseline.get("legs")
+            or state.get("pending_capture") != baseline.get("pending_capture")
+        ):
+            raise RuntimeError(
+                "reopen requires matching successful baseline evidence and configuration"
+            )
         result["packages"] = provenance(transports)
+        if result["packages"] != baseline.get("packages"):
+            raise RuntimeError(
+                "installed package provenance changed between continuity phases"
+            )
         pending_nonce = state["pending_capture"]["pending"]["nonce"]
         uncertain_nonce = state["pending_capture"]["uncertain"]["nonce"]
         completed = state["completed_legs"]
@@ -901,9 +933,13 @@ async def _run_reopen_owned(config, selection, role, run, configured) -> bool:
         persisted_ok = True
         for leg in completed:
             snapshot = before[leg["nonce"]]
-            if _sent_receipt_identity(snapshot, leg["destination"]) != (
-                leg["event_id"],
-                leg["receipt_id"],
+            if (
+                _sent_receipt_identity(snapshot, leg["destination"])
+                != (
+                    leg["event_id"],
+                    leg["receipt_id"],
+                )
+                or snapshot != leg["durable"]
             ):
                 persisted_ok = False
         result["persisted"] = {
@@ -1002,7 +1038,14 @@ async def _run_reopen_owned(config, selection, role, run, configured) -> bool:
                     await _disarm_listeners(armed)
             else:
                 await _disarm_listeners(armed)
+        # Recheck after every later send and owner retirement. A delayed
+        # duplicate/receipt change must not be hidden by the earlier snapshot.
+        _stale_backlog_observation(run, completed + result["legs"])
         result["pending_after"] = capture_nonce_state(db, pending_nonce)
+        if result["pending_after"] != result["disposition"]["pending_after"]:
+            raise AssertionError(
+                "pending replay durable state changed after observation"
+            )
         result["uncertain_after"] = capture_nonce_state(db, uncertain_nonce)
         result["timeline"] = timeline
         result["pass"] = (
@@ -1069,7 +1112,6 @@ async def _disposition(
         _DB_POLL_INTERVAL,
     )
     pending_reconciled = ok
-    pending_after = capture_nonce_state(db, pending_nonce)
     if pending_reconciled:
         observed = await asyncio.to_thread(
             _observe_window,
@@ -1104,7 +1146,16 @@ async def _disposition(
         UNCERTAIN_SETTLE_WAIT_SECONDS,
         _DB_POLL_INTERVAL,
     )
-    uncertain_after = capture_nonce_state(db, uncertain_nonce)
+    pending_after, uncertain_after = capture_nonce_states(
+        db, pending_nonce, uncertain_nonce
+    )
+    pending_reconciled = (
+        pending_reconciled
+        and _sent_receipt_event_id(
+            pending_after, destination, outbox_id=pending_outbox_id
+        )
+        is not None
+    )
     return {
         "pending_reconciled": pending_reconciled,
         "pending_after": pending_after,
