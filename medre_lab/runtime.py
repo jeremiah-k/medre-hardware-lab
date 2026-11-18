@@ -4,7 +4,12 @@ from pathlib import Path
 
 
 def build(
-    config: dict, transports: tuple[str, str], role: int, run: Path, destinations: dict
+    config: dict,
+    transports: tuple[str, str],
+    role: int,
+    run: Path,
+    destinations: dict,
+    message_delay_seconds: float = 2.5,
 ):
     from medre.config.model import (
         AdapterConfigSet,
@@ -22,7 +27,9 @@ def build(
     for kind in transports:
         entry = hw[kind]
         common = dict(
-            adapter_id=kind, message_delay_seconds=2.5, relay_prefix="{sender}: "
+            adapter_id=kind,
+            message_delay_seconds=message_delay_seconds,
+            relay_prefix="{sender}: ",
         )
         if kind == "meshtastic":
             from medre.config.adapters.meshtastic import MeshtasticConfig

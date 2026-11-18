@@ -348,12 +348,35 @@ async def run_pair(config, transports, role, run):
     return result["pass"]
 
 
-def main():
-    path, selection, role, output = sys.argv[1:]
-    ok = asyncio.run(
-        run_pair(load(Path(path)), pair(selection), int(role), Path(output))
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if len(args) == 4:
+        path, selection, role, output = args
+        ok = asyncio.run(
+            run_pair(load(Path(path)), pair(selection), int(role), Path(output))
+        )
+        return 0 if ok else 1
+    if len(args) in (5, 6):
+        path, selection, role, output, phase = args[:5]
+        from .continuity import DEFAULT_INTERRUPT_WAIT_SECONDS, run_baseline, run_reopen
+
+        config = load(Path(path))
+        run = Path(output)
+        if phase == "baseline":
+            interrupt_wait = (
+                float(args[5]) if len(args) == 6 else DEFAULT_INTERRUPT_WAIT_SECONDS
+            )
+            ok = asyncio.run(
+                run_baseline(config, selection, int(role), run, interrupt_wait)
+            )
+        elif phase == "reopen":
+            ok = asyncio.run(run_reopen(config, selection, int(role), run))
+        else:
+            raise SystemExit(f"unknown continuity phase: {phase}")
+        return 0 if ok else 1
+    raise SystemExit(
+        "worker requires [config pair role run] or [config pair role run phase [interrupt_wait]]"
     )
-    return 0 if ok else 1
 
 
 if __name__ == "__main__":
