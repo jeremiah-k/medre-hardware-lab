@@ -112,6 +112,7 @@ x-meshtasticd-common: &meshtasticd-common
     context: lab/meshtasticd
     dockerfile: Dockerfile
   image: medre-lab/meshtasticd-lab:latest
+  pull_policy: never
   user: "1000:1000"
   tmpfs:
     - /var/lib/meshtasticd
@@ -144,6 +145,7 @@ services:
       context: lab/synapse
       dockerfile: Dockerfile
     image: medre-lab/synapse-lab:latest
+    pull_policy: never
     user: "991:991"
     container_name: medre-lab-synapse
     restart: unless-stopped

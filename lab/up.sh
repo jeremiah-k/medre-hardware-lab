@@ -130,6 +130,15 @@ echo "  ref:    ${MMRELAY_BAKE_CORE_REF} (baked into mmrelay images only)"
 COMPOSE=(docker compose)
 RELAYS=(a b)
 
+# Derived images are local build artifacts, not registry images. Fail before
+# stopping running services or resetting durable state when reuse is impossible.
+if ((SKIP_BUILD)); then
+	for image in medre-lab/synapse-lab:latest medre-lab/meshtasticd-lab:latest; do
+		docker image inspect "${image}" >/dev/null 2>&1 ||
+			die "Missing local wrapper ${image}; rerun without --skip-build"
+	done
+fi
+
 # --- MEDRE bridge profile -----------------------------------------------------
 # Adds: dedicated meshtasticd-a-medre (AlphaLab) + meshtasticd-b-medre
 # (BetaLab) nodes and one medre-relay runtime (bot @medre:lab.test, matrix
