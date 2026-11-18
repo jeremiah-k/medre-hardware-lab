@@ -29,7 +29,12 @@ async def _connect():
     from meshcore import EventType
     from meshcore import MeshCore
     last = None
-    for attempt in range(3):
+    # Sizing from measured board behavior: the boards resume advertising
+    # ~1.1 s after a clean disconnect and connect in ~1.5-1.8 s, so a scan
+    # finds a healthy board in under a second. The retry budget exists to
+    # ride out a transient advertising gap of about half a minute before
+    # failing honestly; each attempt reports its failure to stderr.
+    for attempt in range(4):
         if attempt:  # remedy only after a failed attempt, not proactively
             pass  # caller owns controller selection and recovery
             await asyncio.sleep(1.5)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import tomllib
@@ -107,3 +108,24 @@ def pair(value: str) -> tuple[str, str]:
         )
     # Keep ordering stable across CLI spelling; roles still select endpoint indices.
     return tuple(sorted(parts, key=TRANSPORTS.index))
+
+
+def write_effective_config(path: Path, config: dict) -> None:
+    """Write the validated, resolved settings in the private campaign directory."""
+    hw = config["hardware"]
+    lines = ["[hardware]"]
+    for key, value in sorted(hw.items()):
+        if not isinstance(value, dict):
+            lines.append(f"{key} = {json.dumps(value, ensure_ascii=False)}")
+    for kind in TRANSPORTS:
+        if kind in hw:
+            lines.extend(("", f"[hardware.{kind}]"))
+            for key, value in sorted(hw[kind].items()):
+                lines.append(f"{key} = {json.dumps(value, ensure_ascii=False)}")
+    with path.open("x", encoding="utf-8") as stream:
+        path.chmod(0o600)
+        stream.write("\n".join(lines) + "\n")
+    if load(path) != config:
+        raise ValueError(
+            "effective configuration snapshot differs from validated settings"
+        )

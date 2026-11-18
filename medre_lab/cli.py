@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import signal
@@ -14,6 +15,7 @@ import uuid
 from pathlib import Path
 
 from .config import load, pair
+from .continuity import _write_json
 
 
 def root_path(value):
@@ -59,23 +61,62 @@ def doctor(config):
     return 1 if result.get("problems") else 0
 
 
-def hardware(root, config, selected, role):
+def _spawn_worker(argv: list[str], log_path: Path, timeout: float) -> int:
+    """Run one owned worker subprocess with a bounded interrupt/kill ladder."""
+    with log_path.open("w") as log:
+        child = subprocess.Popen(
+            argv,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            return child.wait(timeout=timeout)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
+            os.killpg(child.pid, signal.SIGINT)
+            try:
+                child.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+            return 130 if isinstance(exc, KeyboardInterrupt) else 1
+
+
+def _hardware_run_dir(root: Path, transports, role: str, run_root: Path | None) -> Path:
+    base = run_root if run_root is not None else root / "evidence"
+    return base / (
+        time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        + "-"
+        + "-".join(transports)
+        + "-"
+        + role
+        + "-"
+        + uuid.uuid4().hex[:6]
+    )
+
+
+def _write_worker_absent_verdict(run: Path, name: str, phase: str, code: int) -> None:
+    path = run / name
+    if not path.exists():
+        _write_json(
+            path,
+            {
+                "phase": phase,
+                "pass": False,
+                "stage": "worker-exited-before-verdict",
+                "exit_code": code,
+                "details": "See private worker log; no qualification claim.",
+            },
+        )
+
+
+def hardware(root, config, selected, role, run_root: str | None = None):
     cfg = load(config)
     transports = pair(selected)
     if any(t not in cfg["hardware"] for t in transports):
         raise ValueError("configure both transports before running this pair")
-    run = (
-        root
-        / "evidence"
-        / (
-            time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-            + "-"
-            + "-".join(transports)
-            + "-"
-            + role
-            + "-"
-            + uuid.uuid4().hex[:6]
-        )
+    run = _hardware_run_dir(
+        root, transports, role, Path(run_root) if run_root else None
     )
     run.mkdir(parents=True, mode=0o700)
     timeout = (
@@ -83,47 +124,121 @@ def hardware(root, config, selected, role):
         + 2 * (cfg["hardware"]["send_timeout"] + cfg["hardware"]["observation_timeout"])
         + 180
     )
-    with (run / "worker.log").open("w") as log:
-        child = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "medre_lab.worker",
-                str(config.resolve()),
-                ":".join(transports),
-                str(0 if role == "a" else 1),
-                str(run),
-            ],
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        try:
-            code = child.wait(timeout=timeout)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt):
-            os.killpg(child.pid, signal.SIGINT)
-            try:
-                child.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
-                child.wait()
-            code = 1
+    code = _spawn_worker(
+        [
+            sys.executable,
+            "-m",
+            "medre_lab.worker",
+            str(config.resolve()),
+            ":".join(transports),
+            str(0 if role == "a" else 1),
+            str(run),
+        ],
+        run / "worker.log",
+        timeout,
+    )
     if not (run / "verdict.json").exists():
-        (run / "verdict.json").write_text(
-            json.dumps(
-                {
-                    "pass": False,
-                    "stage": "worker-exited-before-verdict",
-                    "exit_code": code,
-                    "details": "See private worker.log; no qualification claim.",
-                },
-                indent=2,
-            )
-            + "\n"
-        )
-        code = 1
+        _write_worker_absent_verdict(run, "verdict.json", "hardware", code)
+        if code != 130:
+            code = 1
     print(json.dumps({"pass": code == 0, "evidence": str(run)}))
     return code
+
+
+def continuity(
+    root,
+    config,
+    selected,
+    role,
+    interrupt_wait: float,
+    auto_disconnect: bool,
+    run_root: str | None,
+):
+    """Two-phase continuity case: baseline owner, then fresh-process reopen."""
+    if not math.isfinite(interrupt_wait) or interrupt_wait <= 0:
+        raise ValueError("interrupt wait must be finite and positive")
+    cfg = load(config)
+    transports = pair(selected)
+    if any(t not in cfg["hardware"] for t in transports):
+        raise ValueError("configure both transports before running this pair")
+    if "meshcore" not in transports:
+        raise ValueError(
+            "continuity link interruption currently supports the meshcore BLE host link"
+        )
+    run = _hardware_run_dir(
+        root, transports, role, Path(run_root) if run_root else None
+    )
+    run.mkdir(parents=True, mode=0o700)
+    # Both workers use a private, resolved copy of the validated settings.
+    # The original operator TOML may change while the baseline is running.
+    from .config import write_effective_config
+
+    snapshot = run / "effective-config.toml"
+    write_effective_config(snapshot, cfg)
+    hw = cfg["hardware"]
+    baseline_timeout = (
+        hw["startup_timeout"]
+        + 3 * (hw["send_timeout"] + hw["observation_timeout"])
+        + interrupt_wait
+        + 700
+    )
+    reopen_timeout = (
+        hw["startup_timeout"]
+        + 2 * (hw["send_timeout"] + hw["observation_timeout"])
+        + 900
+    )
+    boundary: dict = {}
+    phases_ok = True
+    for phase, timeout in (("baseline", baseline_timeout), ("reopen", reopen_timeout)):
+        argv = [
+            sys.executable,
+            "-m",
+            "medre_lab.worker",
+            str(snapshot),
+            ":".join(transports),
+            str(0 if role == "a" else 1),
+            str(run),
+            phase,
+        ]
+        if phase == "baseline":
+            argv.append(str(interrupt_wait))
+            if auto_disconnect:
+                argv.append("--auto-disconnect")
+        started = time.time()
+        code = _spawn_worker(argv, run / f"{phase}-worker.log", timeout)
+        boundary[phase] = {
+            "exit_code": code,
+            "started_at": started,
+            "ended_at": time.time(),
+            "timeout_seconds": timeout,
+            "pass": False,
+            "log": str(run / f"{phase}-worker.log"),
+        }
+        _write_worker_absent_verdict(run, f"{phase}-verdict.json", phase, code)
+        try:
+            verdict = json.loads((run / f"{phase}-verdict.json").read_text())
+            if not isinstance(verdict, dict) or verdict.get("phase") != phase:
+                raise ValueError("invalid phase verdict")
+            boundary[phase]["worker_verdict_pass"] = verdict.get("pass") is True
+        except (ValueError, OSError) as exc:
+            boundary[phase]["worker_verdict_pass"] = False
+            boundary[phase]["verdict_error"] = type(exc).__name__
+        boundary[phase]["pass"] = code == 0 and boundary[phase]["worker_verdict_pass"]
+        phases_ok = phases_ok and boundary[phase]["pass"]
+        if not boundary[phase]["pass"]:
+            break  # Never open a replacement after cancellation or failed retirement.
+    merged = {
+        "case": "reconnect-reopen-continuity",
+        "pass": phases_ok,
+        "pair": list(transports),
+        "role": role,
+        "process_boundary": boundary,
+        "scope": "Two-phase continuity case; physical interruption and MEDRE "
+        "shutdown are separate evidenced actions.",
+    }
+    _write_json(run / "continuity-verdict.json", merged)
+    print(json.dumps({"pass": phases_ok, "evidence": str(run)}))
+    return 130 if code == 130 else (0 if phases_ok else 1)
 
 
 def main(argv=None):
@@ -153,6 +268,33 @@ def main(argv=None):
     run = hw.add_parser("run")
     run.add_argument("--pair", required=True)
     run.add_argument("--role", choices=("a", "b"), default="a")
+    run.add_argument(
+        "--run-root",
+        default=None,
+        help="private directory for the run (default: <root>/evidence)",
+    )
+    cont = hw.add_parser(
+        "continuity",
+        help="opt-in disconnect/reopen continuity case (two owned phases)",
+    )
+    cont.add_argument("--pair", required=True)
+    cont.add_argument("--role", choices=("a", "b"), default="a")
+    cont.add_argument(
+        "--interrupt-wait",
+        type=float,
+        default=300.0,
+        help="seconds the baseline waits for the declared link to be disconnected",
+    )
+    cont.add_argument(
+        "--no-auto-disconnect",
+        action="store_true",
+        help="leave the interruption to the operator; the harness only records",
+    )
+    cont.add_argument(
+        "--run-root",
+        default=None,
+        help="private directory for the run (default: <root>/evidence)",
+    )
     args = parser.parse_args(argv)
     try:
         root = root_path(args.root)
@@ -167,7 +309,17 @@ def main(argv=None):
         if args.command == "doctor":
             return doctor(config)
         if args.command == "hardware":
-            return hardware(root, config, args.pair, args.role)
+            if args.action == "run":
+                return hardware(root, config, args.pair, args.role, args.run_root)
+            return continuity(
+                root,
+                config,
+                args.pair,
+                args.role,
+                args.interrupt_wait,
+                not args.no_auto_disconnect,
+                args.run_root,
+            )
         from . import docker as rig
 
         if args.command == "sources":
