@@ -1,7 +1,4 @@
 # checkov:skip=CKV_DOCKER_2:Compose probes service health (urllib versions endpoint).
-# checkov:skip=CKV_DOCKER_3:Compose runs the service as 991:991; the upstream
-#   start.py entrypoint requires the image default (root) user so a plain
-#   `docker run` keeps its documented UID/GID-env demotion path.
 # =============================================================================
 # Synapse lab image: unprivileged-runtime wrapper around the pinned upstream
 # matrixdotorg/synapse image.
@@ -24,3 +21,5 @@
 FROM matrixdotorg/synapse@sha256:f223f5fc532600801284fededefca82288fb71551bf4fcc89cd0b3363a3461cc
 
 RUN mkdir -p /data && chown 991:991 /data
+
+USER 991:991

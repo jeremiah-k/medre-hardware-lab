@@ -139,8 +139,7 @@ services:
     # pre-owns /data as 991:991 — the image's documented runtime user — so the
     # entrypoint runs directly as 991:991 (with a non-root uid start.py skips
     # the chown/gosu entirely) and fresh named volumes seed 991-owned state.
-    # The operator's existing synapse-data volume is already 991-owned, so the
-    # switch is state-compatible with the legacy root-era rig.
+    # Reused volumes must be writable by the configured service identity.
     build:
       context: lab/synapse
       dockerfile: Dockerfile

@@ -1,6 +1,4 @@
 # checkov:skip=CKV_DOCKER_2:Compose probes service health (/proc process scan).
-# checkov:skip=CKV_DOCKER_3:Compose runs the service as 1000:1000; the image
-#   stays userless so plain `docker run` keeps upstream semantics.
 # =============================================================================
 # meshtasticd lab image: unprivileged-runtime wrapper around the pinned
 # upstream meshtastic/meshtasticd daily image.
@@ -23,3 +21,5 @@
 FROM meshtastic/meshtasticd@sha256:68694cd2b704a1f4ed3bc6739e8edb7b519ce5798ac2dbab1a6352f90a632e3f
 
 RUN mkdir -p /data /var/lib/meshtasticd && chown -R 1000:1000 /data /var/lib/meshtasticd
+
+USER 1000:1000
