@@ -218,8 +218,8 @@ fi
 
 # --- Build -------------------------------------------------------------------
 if ((! SKIP_BUILD)); then
-	log "Building images (mmrelay dev + lab-tools)"
-	"${COMPOSE[@]}" build mmrelay-a mmrelay-b lab-tools
+	log "Building images (mmrelay dev + lab-tools + unprivileged synapse/meshtasticd wrappers)"
+	"${COMPOSE[@]}" build mmrelay-a mmrelay-b lab-tools synapse meshtasticd-a
 	if ((WITH_MEDRE)); then
 		log "Building image (medre dev)"
 		"${COMPOSE[@]}" build medre-relay
@@ -999,9 +999,10 @@ mmrelay:
   head: ${HEAD_SHA}
 images:
   meshtasticd: ${MESHTASTICD_REF} # meshtastic/meshtasticd:daily (owner directive: track daily channel)
-  meshtasticd_firmware: $(docker run --rm --entrypoint sh meshtastic/meshtasticd:daily -c 'meshtasticd -V 2>/dev/null' 2>/dev/null | tail -1)
+  meshtasticd_firmware: $(docker run --rm --user 1000:1000 --entrypoint sh meshtastic/meshtasticd:daily -c 'meshtasticd -V 2>/dev/null' 2>/dev/null | tail -1)
   meshtasticd_fallback: meshtastic/meshtasticd@sha256:23e92b1331a3a471eaef0c63cbca4365ca40b3111a9781cfdbe5a5114e5773d4 # 2.7.26, last stable that passed the mesh probe; pin here temporarily if a daily breaks bring-up
-  synapse: matrixdotorg/synapse@sha256:f223f5fc532600801284fededefca82288fb71551bf4fcc89cd0b3363a3461cc # v1.149.0
+  synapse: matrixdotorg/synapse@sha256:f223f5fc532600801284fededefca82288fb71551bf4fcc89cd0b3363a3461cc # v1.149.0 (base of medre-lab/synapse-lab:latest, runtime user 991:991)
+  meshtasticd_runtime: medre-lab/meshtasticd-lab:latest (FROM the pinned meshtastic/meshtasticd daily digest above; runtime user 1000:1000)
   mmrelay-dev: medre-lab/mmrelay-dev:latest (built from lab/mmrelay/Dockerfile; deps baked from mmrelay pyproject ".[e2e]")
   lab-tools: medre-lab/lab-tools:latest (built from lab/tools/Dockerfile)
 topology: AlphaLab = meshtasticd-a + meshtasticd-a-peer (mmrelay-a); BetaLab = meshtasticd-b + meshtasticd-b-peer (mmrelay-b)
