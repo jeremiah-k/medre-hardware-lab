@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS event_body_content (event_id TEXT NOT NULL, body TEXT
 CREATE TABLE IF NOT EXISTS delivery_receipts (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     receipt_id TEXT UNIQUE,
+    outbox_id TEXT,
     event_id TEXT NOT NULL,
     delivery_plan_id TEXT NOT NULL DEFAULT '',
     target_adapter TEXT NOT NULL,
@@ -41,12 +42,15 @@ CREATE TABLE IF NOT EXISTS delivery_outbox (
     target_adapter TEXT NOT NULL,
     target_channel TEXT,
     status TEXT NOT NULL,
-    attempt_number INTEGER NOT NULL DEFAULT 1,
+    attempt_number INTEGER NOT NULL DEFAULT 0,
+    active_attempt INTEGER,
+    locked_at TEXT,
     lease_until TEXT,
     worker_id TEXT,
     updated_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS radio_attempt_progress (outbox_id TEXT, attempt_number INTEGER, parts_json TEXT);
 """
 
 
@@ -64,16 +68,30 @@ def insert_event(con, nonce, adapter, *, receipt_status=None, outbox_status=None
     )
     if receipt_status is not None:
         con.execute(
-            "INSERT INTO delivery_receipts (receipt_id, event_id, target_adapter,"
-            " status) VALUES (?, ?, ?, ?)",
-            (f"rc-{nonce}", f"ev-{nonce}", adapter, receipt_status),
+            "INSERT INTO delivery_receipts (receipt_id, outbox_id, event_id, target_adapter,"
+            " status) VALUES (?, ?, ?, ?, ?)",
+            (f"rc-{nonce}", f"ob-{nonce}", f"ev-{nonce}", adapter, receipt_status),
         )
     if outbox_status is not None:
         con.execute(
-            "INSERT INTO delivery_outbox (outbox_id, event_id, target_adapter,"
-            " status) VALUES (?, ?, ?, ?)",
-            (f"ob-{nonce}", f"ev-{nonce}", adapter, outbox_status),
+            "INSERT INTO delivery_outbox (outbox_id, event_id, target_adapter, status, attempt_number, active_attempt) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                f"ob-{nonce}",
+                f"ev-{nonce}",
+                adapter,
+                outbox_status,
+                int(outbox_status == "sent"),
+                1 if outbox_status == "in_progress" else None,
+            ),
         )
+        if outbox_status == "in_progress":
+            con.execute(
+                "INSERT INTO radio_attempt_progress VALUES (?, 1, ?)",
+                (
+                    f"ob-{nonce}",
+                    json.dumps([{"ordinal": 0, "state": "unsent", "handoff_id": None}]),
+                ),
+            )
     con.commit()
 
 
@@ -143,7 +161,7 @@ class StubApp:
 
 
 def stub_config(**overrides):
-    hw = {"startup_timeout": 5, "send_timeout": 5, "observation_timeout": 5}
+    hw = {"startup_timeout": 5, "send_timeout": 5, "observation_timeout": 0.1}
     hw.update(overrides)
     return {"hardware": hw}
 
@@ -181,6 +199,10 @@ class Harness:
                 destination = "lxmf" if source == "meshcore" else "meshcore"
 
                 def send(nonce):
+                    assert not any(
+                        listener.active and listener.kind == source
+                        for listener in StubListener.instances
+                    )
                     self.sent.append(nonce)
                     self.send_count += 1
                     if self.send_count <= 4:
@@ -261,18 +283,19 @@ def scripted_session(tmp_path, state):
     behavior), so the rejoin must be detected without requiring the
     counter to stay elevated.
     """
-    calls = {"n": 0}
+    import time
+
+    armed_at = None
 
     def diagnostics():
-        calls["n"] += 1
-        sentinel = (tmp_path / "interrupt-armed.json").exists()
-        if sentinel and state["connected"] and calls["n"] > 1:
-            state.update(connected=False, reconnecting=True)
-            return {"session": dict(state)}
-        if sentinel and not state["connected"]:
-            # The recovery loop completed between polls and already reset its
-            # attempt counter to zero: the rejoin must still be detected.
-            state.update(connected=True, reconnecting=False, reconnect_attempts=0)
+        nonlocal armed_at
+        if (tmp_path / "interrupt-armed.json").exists():
+            if armed_at is None:
+                armed_at = time.monotonic()
+            if time.monotonic() - armed_at < 0.7:
+                state.update(connected=False, reconnecting=True)
+            else:
+                state.update(connected=True, reconnecting=False, reconnect_attempts=0)
         return {"session": dict(state)}
 
     return diagnostics
@@ -282,6 +305,13 @@ def test_baseline_completes_all_stages_in_order(tmp_path, monkeypatch, fast_poll
     state = {"connected": True, "reconnect_attempts": 0, "reconnecting": False}
     app = StubApp(diagnostics=scripted_session(tmp_path, state))
     harness = Harness(monkeypatch, app, tmp_path)
+    original_stop = app.stop
+
+    async def stop_with_listener():
+        assert any(listener.active for listener in StubListener.instances)
+        await original_stop()
+
+    app.stop = stop_with_listener
 
     ok = run_async(
         lambda: continuity.run_baseline(
@@ -298,11 +328,12 @@ def test_baseline_completes_all_stages_in_order(tmp_path, monkeypatch, fast_poll
     assert "link-rejoined" in stages
     assert "pending-captured" in stages
     assert "owner-stopped" in stages
-    # The owner stops while both peer listeners are still armed; the
-    # independent listeners close afterwards in bounded teardown.
+    # The destination listener retires after the MEDRE owner stops.
     assert app.events == ["start", "stop"]
     assert all(not listener.active for listener in StubListener.instances)
     assert verdict["interrupt"]["rejoined"] is True
+    assert verdict["interrupt"]["disconnect_diagnostics"]["connected"] is False
+    assert verdict["interrupt"]["rejoin_diagnostics"]["connected"] is True
     # The recovery loop already reset its counter between polls; the rejoin
     # evidence records the peak counter without requiring it to stay elevated.
     assert verdict["interrupt"]["rejoin_diagnostics"]["reconnect_attempts"] == 0
@@ -380,9 +411,22 @@ def test_reopen_reconciles_pending_and_records_uncertain(
                 "pending_capture": {
                     "pending": {"nonce": pending},
                     "uncertain": {"nonce": uncertain},
+                    "stopped": {
+                        "pending": continuity.capture_nonce_state(
+                            tmp_path / "state.sqlite", pending
+                        ),
+                        "uncertain": continuity.capture_nonce_state(
+                            tmp_path / "state.sqlite", uncertain
+                        ),
+                    },
                 },
                 "completed_legs": [
-                    {"nonce": nonce, "destination": dest, "event_id": f"ev-{nonce}"}
+                    {
+                        "nonce": nonce,
+                        "destination": dest,
+                        "event_id": f"ev-{nonce}",
+                        "receipt_id": f"rc-{nonce}",
+                    }
                     for nonce, dest in legs
                 ],
             }
@@ -401,23 +445,15 @@ def test_reopen_reconciles_pending_and_records_uncertain(
                 (f"ev-{pending}",),
             )
             con.execute(
-                "INSERT INTO delivery_receipts (receipt_id, event_id,"
-                " target_adapter, status) VALUES (?, ?, 'meshcore', 'sent')",
-                (f"rc-{pending}-2", f"ev-{pending}"),
+                "INSERT INTO delivery_receipts (receipt_id, outbox_id, event_id,"
+                " target_adapter, status) VALUES (?, ?, ?, 'meshcore', 'sent')",
+                (f"rc-{pending}-2", f"ob-{pending}", f"ev-{pending}"),
             )
             con.commit()
+            Harness.deliver("meshcore", pending)
 
     app = StubApp(on_start=on_start)
     Harness(monkeypatch, app, tmp_path)
-
-    real_arm = continuity._arm_listeners
-
-    async def arm_with_preset(listeners, lifetime):
-        armed = await real_arm(listeners, lifetime)
-        armed["meshcore"]["peer"].receive(pending)
-        return armed
-
-    monkeypatch.setattr(continuity, "_arm_listeners", arm_with_preset)
 
     ok = run_async(
         lambda: continuity.run_reopen(stub_config(), "meshcore:lxmf", 0, tmp_path)
@@ -432,7 +468,7 @@ def test_reopen_reconciles_pending_and_records_uncertain(
     assert verdict["uncertain_after"]["events"]
     assert "uncertain_progressed" in verdict["disposition"]
     # A fresh marker still flows after reopen.
-    assert len(verdict["legs"]) == 1
+    assert len(verdict["legs"]) == 2
     assert verdict["legs"][0]["observed_once"] is True
     assert app.events == ["start", "stop"]
 
@@ -469,7 +505,12 @@ def test_reopen_fails_when_completed_identity_lost(tmp_path, monkeypatch, fast_p
                     "uncertain": {"nonce": uncertain},
                 },
                 "completed_legs": [
-                    {"nonce": leg, "destination": "lxmf", "event_id": f"ev-{leg}"}
+                    {
+                        "nonce": leg,
+                        "destination": "lxmf",
+                        "event_id": f"ev-{leg}",
+                        "receipt_id": f"rc-{leg}",
+                    }
                 ],
             }
         )
@@ -554,7 +595,7 @@ def _lab_config(tmp_path) -> "object":
         "[hardware]\n"
         "startup_timeout=5\nsend_timeout=5\nobservation_timeout=5\n"
         "[hardware.meshcore]\n"
-        'channel=1\naddresses=["C4:4F:33:6A:AE:A7", "C4:4F:33:6A:A5:2B"]\n'
+        'channel=1\naddresses=["AA:BB:CC:DD:EE:01", "AA:BB:CC:DD:EE:02"]\n'
         "[hardware.lxmf]\n"
         'profiles=["p-a", "p-b"]\nidentities=["i-a", "i-b"]\n'
     )
@@ -630,7 +671,92 @@ def test_capture_nonce_state_reports_outbox_and_receipts(tmp_path):
     assert snapshot["events"][0]["receipts"][0]["status"] == "sent"
     assert snapshot["events"][0]["outbox"][0]["status"] == "sent"
     assert continuity._sent_receipt_event_id(snapshot, "meshcore") == "ev-MLAB-x"
+    assert (
+        continuity._sent_receipt_event_id(snapshot, "meshcore", outbox_id="ob-MLAB-x")
+        == "ev-MLAB-x"
+    )
+    assert (
+        continuity._sent_receipt_event_id(
+            snapshot, "meshcore", outbox_id="replacement-generation"
+        )
+        is None
+    )
     assert continuity._has_pending_outbox(snapshot) is False
     missing = continuity.capture_nonce_state(tmp_path / "state.sqlite", "MLAB-nope")
     assert missing["events"] == []
     assert continuity._sent_receipt_event_id(missing, "meshcore") is None
+
+
+@pytest.mark.parametrize(
+    "raw,exit_code,expected",
+    [
+        ("{", 0, 1),
+        ('{"phase":"baseline","pass":true}', 1, 1),
+        ('{"phase":"baseline","pass":true}', 130, 130),
+    ],
+)
+def test_cli_never_reopens_failed_or_cancelled_worker(
+    tmp_path, monkeypatch, raw, exit_code, expected
+):
+    config = _lab_config(tmp_path)
+    calls = []
+
+    def spawn(argv, log_path, timeout, watch=None):
+        calls.append(argv[7])
+        (log_path.parent / "baseline-verdict.json").write_text(raw)
+        return exit_code
+
+    monkeypatch.setattr(cli, "_spawn_worker", spawn)
+    assert (
+        cli.continuity(
+            tmp_path, config, "meshcore:lxmf", "a", 5, False, str(tmp_path / "runs")
+        )
+        == expected
+    )
+    assert calls == ["baseline"]
+    report = json.loads(
+        next((tmp_path / "runs").iterdir())
+        .joinpath("continuity-verdict.json")
+        .read_text()
+    )
+    assert report["pass"] is False
+
+
+@pytest.mark.parametrize("wait", [float("nan"), float("inf"), 0, -1])
+def test_cli_rejects_invalid_interrupt_wait(tmp_path, wait):
+    config = _lab_config(tmp_path)
+    with pytest.raises(ValueError, match="finite and positive"):
+        cli.continuity(
+            tmp_path, config, "meshcore:lxmf", "a", wait, False, str(tmp_path / "runs")
+        )
+    assert not (tmp_path / "runs").exists()
+
+
+def test_duplicate_canonical_marker_is_not_credited(tmp_path):
+    con = make_db(tmp_path)
+    insert_event(con, "marker", "meshcore", receipt_status="sent")
+    con.execute("INSERT INTO event_body_content VALUES ('duplicate', 'marker')")
+    con.commit()
+    assert (
+        continuity._sent_receipt_event_id(
+            continuity.capture_nonce_state(tmp_path / "state.sqlite", "marker"),
+            "meshcore",
+        )
+        is None
+    )
+
+
+def test_contender_leaves_owner_evidence_untouched(tmp_path):
+    state = tmp_path / "continuity-state.json"
+    state.write_text("owner evidence")
+    with (
+        ownership.own_run(tmp_path),
+        pytest.raises(RuntimeError, match="live MEDRE owner"),
+    ):
+        run_async(
+            lambda: continuity.run_baseline(
+                stub_config(), "meshcore:lxmf", 0, tmp_path, 5
+            )
+        )
+    assert state.read_text() == "owner evidence"
+    assert not (tmp_path / "baseline-verdict.json").exists()

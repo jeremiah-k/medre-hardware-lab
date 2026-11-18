@@ -17,7 +17,7 @@ short-check semantics. The case runs in two owned worker processes:
     after the baseline owner retired (enforced by a run lock), verifies the
     persisted identities, records the disposition of the captured pending
     and uncertain work, and proves peer observation still functions with a
-    fresh marker.
+    fresh marker per direction.
 
 Physical interruption and MEDRE shutdown are separate, individually
 evidenced actions. The interrupt stage polls real adapter diagnostics and
@@ -35,10 +35,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import sqlite3
 import time
 import uuid
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 from .config import pair as pair_selection
@@ -81,10 +83,17 @@ def _read_state(run: Path) -> dict:
     return json.loads(path.read_text())
 
 
+def _write_json(path: Path, data: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(data, indent=2, default=str) + "\n")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _write_state(run: Path, state: dict) -> None:
-    (run / "continuity-state.json").write_text(
-        json.dumps(state, indent=2, default=str) + "\n"
-    )
+    _write_json(run / "continuity-state.json", state)
 
 
 def capture_nonce_state(db: Path, nonce: str) -> dict:
@@ -93,48 +102,74 @@ def capture_nonce_state(db: Path, nonce: str) -> dict:
     Uses a read-only connection (never ``immutable=1`` on a live database)
     so the snapshot cannot disturb the running owner's writer.
     """
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    return capture_nonce_states(db, nonce)[0]
+
+
+def capture_nonce_states(db: Path, *nonces: str) -> list[dict]:
+    """Pin one read snapshot across all events and their durable evidence."""
+    con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     try:
-        events = con.execute(
-            "SELECT DISTINCT event_id FROM event_body_content WHERE instr(body,?)>0",
-            (nonce,),
-        ).fetchall()
-        out: dict = {"nonce": nonce, "events": []}
-        for row in events:
-            event_id = row["event_id"]
-            out["events"].append(
-                {
-                    "event_id": event_id,
-                    "receipts": [
-                        dict(r)
-                        for r in con.execute(
-                            "SELECT receipt_id,delivery_plan_id,target_adapter,"
-                            "target_channel,status,receipt_kind,failure_kind,"
-                            "attempt_number,confirmation_level,created_at "
-                            "FROM delivery_receipts WHERE event_id=? ORDER BY sequence",
-                            (event_id,),
-                        ).fetchall()
-                    ],
-                    "outbox": [
-                        dict(r)
-                        for r in con.execute(
-                            "SELECT outbox_id,delivery_plan_id,target_adapter,"
-                            "target_channel,status,attempt_number,lease_until,"
-                            "worker_id,updated_at FROM delivery_outbox "
-                            "WHERE event_id=? ORDER BY created_at",
-                            (event_id,),
-                        ).fetchall()
-                    ],
-                }
-            )
-        return out
+        con.execute("BEGIN")
+        return [_capture_nonce_state(con, nonce) for nonce in nonces]
     finally:
         con.close()
 
 
-def _sent_receipt_event_id(snapshot: dict, destination: str) -> str | None:
+def _capture_nonce_state(con: sqlite3.Connection, nonce: str) -> dict:
+    events = con.execute(
+        "SELECT DISTINCT event_id FROM event_body_content WHERE instr(body,?)>0",
+        (nonce,),
+    ).fetchall()
+    out: dict = {"nonce": nonce, "events": []}
+    for row in events:
+        event_id = row["event_id"]
+        out["events"].append(
+            {
+                "event_id": event_id,
+                "receipts": [
+                    dict(r)
+                    for r in con.execute(
+                        "SELECT receipt_id,outbox_id,delivery_plan_id,target_adapter,"
+                        "target_channel,status,receipt_kind,failure_kind,"
+                        "attempt_number,confirmation_level,created_at "
+                        "FROM delivery_receipts WHERE event_id=? ORDER BY sequence",
+                        (event_id,),
+                    ).fetchall()
+                ],
+                "outbox": [
+                    dict(r)
+                    for r in con.execute(
+                        "SELECT outbox_id,delivery_plan_id,target_adapter,"
+                        "target_channel,status,attempt_number,active_attempt,locked_at,lease_until,"
+                        "worker_id,updated_at FROM delivery_outbox "
+                        "WHERE event_id=? ORDER BY created_at,outbox_id",
+                        (event_id,),
+                    ).fetchall()
+                ],
+            }
+        )
+        event = out["events"][-1]
+        for row in event["outbox"]:
+            row["radio_attempts"] = [
+                {
+                    "attempt_number": progress["attempt_number"],
+                    "parts": json.loads(progress["parts_json"]),
+                }
+                for progress in con.execute(
+                    "SELECT attempt_number,parts_json FROM radio_attempt_progress WHERE outbox_id=? ORDER BY attempt_number",
+                    (row["outbox_id"],),
+                )
+            ]
+    return out
+
+
+def _sent_receipt_event_id(
+    snapshot: dict, destination: str, *, outbox_id: str | None = None
+) -> str | None:
     """Return the canonical event id with one failure-free sent receipt."""
+    if len(snapshot["events"]) != 1:
+        return None
     for event in snapshot["events"]:
         sent = [
             r
@@ -149,9 +184,27 @@ def _sent_receipt_event_id(snapshot: dict, destination: str) -> str | None:
             if r["failure_kind"] is not None
             or r["status"] in ("failed", "dead_lettered", "denied")
         ]
-        if len(sent) == 1 and not bad:
+        if (
+            len(sent) == 1
+            and not bad
+            and (outbox_id is None or sent[0]["outbox_id"] == outbox_id)
+        ):
             return event["event_id"]
     return None
+
+
+def _sent_receipt_identity(snapshot: dict, destination: str) -> tuple[str, str] | None:
+    event_id = _sent_receipt_event_id(snapshot, destination)
+    if event_id is None:
+        return None
+    receipt = next(
+        r
+        for r in snapshot["events"][0]["receipts"]
+        if r["receipt_kind"] == "attempt"
+        and r["status"] == "sent"
+        and r["target_adapter"] == destination
+    )
+    return event_id, receipt["receipt_id"]
 
 
 def _outbox_statuses(capture: dict) -> list[str]:
@@ -186,21 +239,47 @@ def _listener_lifetime(hw: dict, interrupt_wait: float) -> float:
 
 
 async def _arm_listeners(listeners: dict, lifetime: float) -> dict:
-    """Arm every configured peer listener once for the whole phase."""
+    """Arm the selected independent recipient(s), owning partial setup."""
     from .native.live_peer_common import async_peer_context
 
     armed: dict = {}
-    for kind, factory in listeners.items():
-        cm = async_peer_context(factory(lifetime))
-        peer = await cm.__aenter__()
-        armed[kind] = {"cm": cm, "peer": peer}
-    return armed
+    try:
+        for kind, factory in listeners.items():
+            cm = async_peer_context(factory(lifetime))
+            peer = await cm.__aenter__()
+            armed[kind] = {"cm": cm, "peer": peer}
+        return armed
+    except BaseException:
+        await _disarm_listeners(armed)
+        raise
 
 
 async def _disarm_listeners(armed: dict) -> None:
-    for kind in sorted(armed, reverse=True):
-        entry = armed.pop(kind)
-        await entry["cm"].__aexit__(None, None, None)
+    async with AsyncExitStack() as stack:
+        for kind in list(armed):
+            entry = armed.pop(kind)
+            stack.push_async_callback(entry["cm"].__aexit__, None, None, None)
+
+
+async def _select_listener(
+    armed: dict, listeners: dict, destination: str, lifetime: float
+) -> None:
+    """Never contend with a sender for the same serial/BLE/RNS endpoint."""
+    if set(armed) == {destination}:
+        return
+    await _disarm_listeners(armed)
+    armed.update(await _arm_listeners({destination: listeners[destination]}, lifetime))
+
+
+def _observe_window(peer, timeout: float) -> list[dict]:
+    # Native peers return early on a true predicate. Keep the complete
+    # declared window to detect delayed duplicates; a dead observer cannot
+    # prove absence, even if it collected one packet before exiting.
+    packets = peer.packets_until(lambda _: False, timeout)
+    owner = getattr(peer, "_owner", None)
+    if owner is not None and owner.poll() is not None:
+        raise AssertionError("native observer retired before observation completed")
+    return packets
 
 
 async def _run_leg(
@@ -208,18 +287,20 @@ async def _run_leg(
     hw: dict,
     senders: dict,
     armed: dict,
+    listeners: dict,
     source: str,
     destination: str,
     nonce: str,
     timeline: list,
 ) -> dict:
     """One native send from the independent peer plus far-side observation."""
+    await _select_listener(armed, listeners, destination, _listener_lifetime(hw, 0))
     receiver = armed[destination]["peer"]
     before = time.monotonic()
     sent = await asyncio.to_thread(senders[source], nonce)
     observed = await asyncio.to_thread(
-        receiver.packets_until,
-        lambda ps: any(nonce in str(p.get("text", p.get("content", ""))) for p in ps),
+        _observe_window,
+        receiver,
         hw["observation_timeout"],
     )
     seen = [p for p in observed if nonce in str(p.get("text", p.get("content", "")))]
@@ -249,15 +330,23 @@ async def _run_leg(
     return leg
 
 
-def _leg_state(run: Path, leg: dict, destination: str) -> dict:
+async def _leg_state(run: Path, leg: dict, destination: str, timeout: float) -> dict:
     """Attach the durable DB identity of one completed leg."""
-    snapshot = capture_nonce_state(run / "state.sqlite", leg["nonce"])
-    event_id = _sent_receipt_event_id(snapshot, destination)
+    snapshot = {}
+
+    def committed() -> bool:
+        nonlocal snapshot
+        snapshot = capture_nonce_state(run / "state.sqlite", leg["nonce"])
+        return _sent_receipt_event_id(snapshot, destination) is not None
+
+    await _wait_for(committed, timeout, _DB_POLL_INTERVAL)
+    identity = _sent_receipt_identity(snapshot, destination)
+    event_id = identity[0] if identity else None
     if event_id is None:
         raise AssertionError(
             f"{leg['nonce']} lacks one failure-free sent receipt at {destination}"
         )
-    leg.update(event_id=event_id, durable=snapshot)
+    leg.update(event_id=event_id, receipt_id=identity[1], durable=snapshot)
     return leg
 
 
@@ -276,21 +365,44 @@ def _child_pids() -> list[int]:
     return children
 
 
-async def _teardown_owner(app, result: dict) -> None:
+async def _teardown_owner(app, result: dict, armed: dict) -> None:
     """Bounded stop of the MEDRE owner plus SDK-child teardown evidence."""
     if app is None:
         return
-    children_before = _child_pids()
+    peer_pids = {
+        owner.proc.pid
+        for entry in armed.values()
+        if (owner := getattr(entry["peer"], "_owner", None)) is not None
+        and owner.proc is not None
+    }
     started = time.monotonic()
     await asyncio.wait_for(app.stop(), _STOP_BUDGET_SECONDS)
     result["stop_seconds"] = round(time.monotonic() - started, 3)
-    result["surviving_sdk_children"] = sorted(set(_child_pids()) - set(children_before))
+    result["surviving_sdk_children"] = sorted(set(_child_pids()) - peer_pids)
 
 
 async def run_baseline(
     config: dict, selection: str, role: int, run: Path, interrupt_wait: float
 ) -> bool:
     """Baseline owner phase: deliveries, link interruption, pending capture."""
+    from .worker import configure
+
+    if not math.isfinite(interrupt_wait) or interrupt_wait <= 0:
+        raise ValueError("interrupt_wait must be finite and positive")
+    with own_run(run):
+        if (run / "continuity-state.json").exists():
+            raise RuntimeError("baseline requires a fresh run directory")
+        configured = configure(config, pair_selection(selection), role, run)
+        with own(configured[3]):
+            return await _run_baseline_owned(
+                config, selection, role, run, interrupt_wait, configured
+            )
+
+
+async def _run_baseline_owned(
+    config, selection, role, run, interrupt_wait, configured
+) -> bool:
+
     transports = pair_selection(selection)
     hw = config["hardware"]
     timeline: list = [{"stage": "baseline-start", "at": _now(), "pid": os.getpid()}]
@@ -317,144 +429,162 @@ async def run_baseline(
     )
     _write_state(run, state)
     try:
-        from .worker import configure, provenance, wait_startup_drain_retired
+        from .worker import provenance, wait_startup_drain_retired
 
         result["packages"] = provenance(transports)
-        listeners, senders, destinations, endpoints = configure(
-            config, transports, role, run
-        )
+        listeners, senders, destinations, _ = configured
         if "meshcore" in hw:
             os.environ["MEDRE_LAB_OWNED_MESHCORE_ADDRESS"] = hw["meshcore"][
                 "addresses"
             ][role]
-        with own(endpoints), own_run(run):
-            result["process"] = {"pid": os.getpid()}
-            app = build(
-                config,
-                transports,
-                role,
+        result["process"] = {"pid": os.getpid()}
+        app = build(
+            config,
+            transports,
+            role,
+            run,
+            destinations,
+            message_delay_seconds=CONTINUITY_MESSAGE_DELAY_SECONDS,
+        )
+        await asyncio.wait_for(app.start(), hw["startup_timeout"])
+        for adapter in app.adapters.values():
+            health = await asyncio.wait_for(adapter.health_check(), 15)
+            if health.health != "healthy":
+                raise RuntimeError("adapter did not report healthy at startup")
+        result["startup_drain_wait"] = await wait_startup_drain_retired(app)
+        timeline.append({"stage": "owner-started", "at": _now()})
+
+        armed = await _arm_listeners(
+            {transports[1]: listeners[transports[1]]},
+            _listener_lifetime(hw, interrupt_wait),
+        )
+        try:
+            # Completed delivery per direction on the healthy link.
+            leg1 = await _run_leg(
                 run,
-                destinations,
-                message_delay_seconds=CONTINUITY_MESSAGE_DELAY_SECONDS,
+                hw,
+                senders,
+                armed,
+                listeners,
+                transports[0],
+                transports[1],
+                _nonce(),
+                timeline,
             )
-            await asyncio.wait_for(app.start(), hw["startup_timeout"])
-            for adapter in app.adapters.values():
-                health = await asyncio.wait_for(adapter.health_check(), 15)
-                if health.health != "healthy":
-                    raise RuntimeError("adapter did not report healthy at startup")
-            result["startup_drain_wait"] = await wait_startup_drain_retired(app)
-            timeline.append({"stage": "owner-started", "at": _now()})
-
-            armed = await _arm_listeners(
-                listeners, _listener_lifetime(hw, interrupt_wait)
+            leg2 = await _run_leg(
+                run,
+                hw,
+                senders,
+                armed,
+                listeners,
+                transports[1],
+                transports[0],
+                _nonce(),
+                timeline,
             )
-            try:
-                # Completed delivery per direction on the healthy link.
-                leg1 = await _run_leg(
-                    run,
-                    hw,
-                    senders,
-                    armed,
-                    transports[0],
-                    transports[1],
-                    _nonce(),
-                    timeline,
-                )
-                leg2 = await _run_leg(
-                    run,
-                    hw,
-                    senders,
-                    armed,
-                    transports[1],
-                    transports[0],
-                    _nonce(),
-                    timeline,
-                )
-                _leg_state(run, leg1, transports[1])
-                _leg_state(run, leg2, transports[0])
-                result["legs"] += [leg1, leg2]
-                state["completed_legs"] = [leg1, leg2]
-                _write_state(run, state)
+            await _leg_state(run, leg1, transports[1], hw["observation_timeout"])
+            await _leg_state(run, leg2, transports[0], hw["observation_timeout"])
+            result["legs"] += [leg1, leg2]
+            state["completed_legs"] = [leg1, leg2]
+            _write_state(run, state)
 
-                # Declared-link interruption (separate watcher/operator action).
-                result["interrupt"] = await _interrupt_stage(
-                    app, run, hw, interrupt_wait, timeline
-                )
+            # Declared-link interruption (separate watcher/operator action).
+            await _disarm_listeners(armed)
+            result["interrupt"] = await _interrupt_stage(
+                app, run, hw, interrupt_wait, timeline
+            )
 
-                # Fresh markers on the rejoined link.
-                leg3 = await _run_leg(
-                    run,
-                    hw,
-                    senders,
-                    armed,
-                    transports[0],
-                    transports[1],
-                    _nonce(),
-                    timeline,
-                )
-                leg4 = await _run_leg(
-                    run,
-                    hw,
-                    senders,
-                    armed,
-                    transports[1],
-                    transports[0],
-                    _nonce(),
-                    timeline,
-                )
-                _leg_state(run, leg3, transports[1])
-                _leg_state(run, leg4, transports[0])
-                result["legs"] += [leg3, leg4]
-                result["stale_backlog"] = _stale_backlog_observation(
-                    run, result["legs"]
-                )
-                state["completed_legs"] = result["legs"]
-                _write_state(run, state)
+            # Fresh markers on the rejoined link.
+            leg3 = await _run_leg(
+                run,
+                hw,
+                senders,
+                armed,
+                listeners,
+                transports[0],
+                transports[1],
+                _nonce(),
+                timeline,
+            )
+            leg4 = await _run_leg(
+                run,
+                hw,
+                senders,
+                armed,
+                listeners,
+                transports[1],
+                transports[0],
+                _nonce(),
+                timeline,
+            )
+            await _leg_state(run, leg3, transports[1], hw["observation_timeout"])
+            await _leg_state(run, leg4, transports[0], hw["observation_timeout"])
+            result["legs"] += [leg3, leg4]
+            result["stale_backlog"] = _stale_backlog_observation(run, [leg1, leg2])
+            state["completed_legs"] = result["legs"]
+            _write_state(run, state)
 
-                # Reconcilable pending capture before shutdown.
-                result["pending_capture"] = await _pending_capture(
-                    run, hw, senders, transports, timeline
-                )
-                state["pending_capture"] = result["pending_capture"]
-                _write_state(run, state)
+            # Reconcilable pending capture before shutdown.
+            await _select_listener(
+                armed, listeners, "meshcore", _listener_lifetime(hw, interrupt_wait)
+            )
+            result["pending_capture"] = await _pending_capture(
+                run, hw, senders, transports, timeline
+            )
+            state["pending_capture"] = result["pending_capture"]
+            _write_state(run, state)
 
-                # Owner stop precedes peer-listener teardown on purpose: the
-                # pending capture's truthfulness depends on stopping the
-                # owner inside the destination adapter's pre-send pacing
-                # window, and the independent peer listeners are not MEDRE
-                # observers. Teardown remains bounded either way.
-                await _teardown_owner(app, result)
-                app = None
-                timeline.append({"stage": "owner-stopped", "at": _now()})
-            finally:
+            # Owner stop precedes peer-listener teardown on purpose: the
+            # pending capture's truthfulness depends on stopping the
+            # owner inside the destination adapter's pre-send pacing
+            # window, and the independent peer listeners are not MEDRE
+            # observers. Teardown remains bounded either way.
+            await _teardown_owner(app, result, armed)
+            app = None
+            _verify_stopped_capture(run, result["pending_capture"])
+            state["pending_capture"] = result["pending_capture"]
+            _write_state(run, state)
+            timeline.append({"stage": "owner-stopped", "at": _now()})
+        finally:
+            if app is not None:
+                try:
+                    await _teardown_owner(app, result, armed)
+                    app = None
+                    result["stop_on_error"] = True
+                finally:
+                    await _disarm_listeners(armed)
+            else:
                 await _disarm_listeners(armed)
-                armed = {}
-            result["timeline"] = timeline
-            result["pass"] = (
-                all(leg.get("observed_once") for leg in result["legs"])
-                and result["interrupt"].get("rejoined") is True
-                and result["pending_capture"].get("captured") is True
-            )
+        result["timeline"] = timeline
+        result["pass"] = (
+            all(leg.get("observed_once") for leg in result["legs"])
+            and result["interrupt"].get("rejoined") is True
+            and result["pending_capture"].get("captured") is True
+            and not result.get("surviving_sdk_children")
+            and not _child_pids()
+        )
     except BaseException as exc:
         result["error"] = type(exc).__name__ + ": " + str(exc)[-1600:]
         result["timeline"] = timeline
-        if armed:
+        try:
+            if app is not None:
+                await _teardown_owner(app, result, armed)
+                result["stop_on_error"] = True
+        except BaseException as cleanup_error:
+            result["cleanup_error"] = (
+                type(cleanup_error).__name__ + ": " + str(cleanup_error)[-800:]
+            )
+        finally:
             try:
                 await _disarm_listeners(armed)
-            except BaseException:
-                pass
-        if app is not None:
-            try:
-                await asyncio.wait_for(app.stop(), _STOP_BUDGET_SECONDS)
-            except BaseException:
-                pass
-            result["stop_on_error"] = True
+            except BaseException as cleanup_error:
+                result["peer_cleanup_error"] = (
+                    type(cleanup_error).__name__ + ": " + str(cleanup_error)[-800:]
+                )
     finally:
         state["baseline_finished_at"] = _now()
         _write_state(run, state)
-        (run / "baseline-verdict.json").write_text(
-            json.dumps(result, indent=2, default=str) + "\n"
-        )
+        _write_json(run / "baseline-verdict.json", result)
     return bool(result.get("pass"))
 
 
@@ -473,30 +603,32 @@ async def _interrupt_stage(
         raise RuntimeError("continuity interrupt stage requires the meshcore adapter")
     sentinel = run / "interrupt-armed.json"
     owned_address = os.environ.get("MEDRE_LAB_OWNED_MESHCORE_ADDRESS", "")
-    sentinel.write_text(
-        json.dumps(
-            {
-                "instruction": "disconnect the MEDRE-owned MeshCore host link",
-                "owned_address": owned_address,
-                "suggested_command": (
-                    f"bluetoothctl disconnect {owned_address}"
-                    if owned_address
-                    else None
-                ),
-            },
-            indent=2,
-        )
-        + "\n"
+    diag_before = meshcore.diagnostics()
+    session_before = diag_before.get("session", {})
+    if session_before.get("connected") is not True:
+        raise RuntimeError("meshcore session not connected before interrupt stage")
+    _write_json(
+        sentinel,
+        {
+            "instruction": "disconnect the MEDRE-owned MeshCore host link",
+            "owned_address": owned_address,
+            "controller": hw.get("ble_adapter"),
+            "instruction_detail": "Use the selected controller and disconnect only the owned link.",
+        },
     )
     evidence: dict = {"owned_address": owned_address}
     try:
-        if _session_diag(meshcore).get("connected") is not True:
-            raise RuntimeError("meshcore session not connected before interrupt stage")
+        last_inbound_before = session_before.get("last_message_time")
+        evidence["pre_interrupt_diagnostics"] = session_before
+        disconnected = {}
 
-        diag_before = meshcore.diagnostics()
-        last_inbound_before = _session_diag(meshcore).get("last_message_time")
+        def disconnected_now():
+            nonlocal disconnected
+            disconnected = _session_diag(meshcore)
+            return disconnected.get("connected") is False
+
         ok, waited = await _wait_for(
-            lambda: _session_diag(meshcore).get("connected") is False,
+            disconnected_now,
             interrupt_wait,
         )
         if not ok:
@@ -504,7 +636,7 @@ async def _interrupt_stage(
                 f"declared link was not disconnected within {interrupt_wait:g}s"
             )
         evidence["disconnect_observed_after_s"] = round(waited, 3)
-        evidence["disconnect_diagnostics"] = _session_diag(meshcore)
+        evidence["disconnect_diagnostics"] = disconnected
         evidence["last_inbound_before"] = str(last_inbound_before)
         timeline.append({"stage": "link-disconnected", "at": _now()})
 
@@ -543,25 +675,19 @@ async def _interrupt_stage(
 
 
 def _stale_backlog_observation(run: Path, legs: list) -> dict:
-    """Observe whether pre-disconnect markers were replayed after rejoin.
-
-    Suppression is asserted only for markers actually re-observed at the
-    boundary; a lossy or quiet link may legitimately replay nothing.
-    """
+    """Detect duplicate durable effects; no claim of ingress re-observation."""
     db = run / "state.sqlite"
     detail = []
     for leg in legs:
         snapshot = capture_nonce_state(db, leg["nonce"])
-        event_count = len(snapshot["events"])
-        if event_count != 1:
-            detail.append({"nonce": leg["nonce"], "canonical_events": event_count})
+        if snapshot != leg["durable"]:
+            detail.append({"nonce": leg["nonce"], "durable_state_changed": True})
+    if detail:
+        raise AssertionError(f"pre-interrupt durable marker state changed: {detail}")
     return {
-        "replayed_markers_observed": bool(detail),
-        "detail": detail,
-        "assertion": (
-            "duplicate canonical events per nonce would indicate unsuppressed "
-            "backlog replay; none is asserted without an observed replay"
-        ),
+        "ingress_reobservation": "not_instrumented",
+        "duplicate_durable_effects": False,
+        "checked_markers": len(legs),
     }
 
 
@@ -579,6 +705,68 @@ def _has_pending_outbox(capture: dict) -> bool:
         for event in capture["events"]
         for row in event["outbox"]
     )
+
+
+def _single_destination_row(snapshot: dict, destination: str) -> dict | None:
+    if len(snapshot["events"]) != 1:
+        return None
+    rows = [
+        row
+        for row in snapshot["events"][0]["outbox"]
+        if row["target_adapter"] == destination
+    ]
+    return rows[0] if len(rows) == 1 else None
+
+
+def _pre_handoff(row: dict) -> bool:
+    attempts = row["radio_attempts"]
+    return (
+        len(attempts) == 1
+        and attempts[0]["attempt_number"] == 1
+        and bool(attempts[0]["parts"])
+        and all(
+            part["state"] == "unsent" and part["handoff_id"] is None
+            for part in attempts[0]["parts"]
+        )
+    )
+
+
+def _never_claimed(row: dict) -> bool:
+    return (
+        row["status"] == "pending"
+        and row["attempt_number"] == 0
+        and row["active_attempt"] is None
+        and row["locked_at"] is None
+        and row["worker_id"] is None
+        and row["lease_until"] is None
+        and not row["radio_attempts"]
+    )
+
+
+def _verify_stopped_capture(run: Path, capture: dict) -> None:
+    head, tail = capture_nonce_states(
+        run / "state.sqlite", capture["uncertain"]["nonce"], capture["pending"]["nonce"]
+    )
+    original_head = _single_destination_row(capture["uncertain"]["state"], "meshcore")
+    original_tail = _single_destination_row(capture["pending"]["state"], "meshcore")
+    current_head = _single_destination_row(head, "meshcore")
+    current_tail = _single_destination_row(tail, "meshcore")
+    if (
+        current_head is None
+        or current_tail is None
+        or original_head is None
+        or original_tail is None
+        or current_head["outbox_id"] != original_head["outbox_id"]
+        or current_tail["outbox_id"] != original_tail["outbox_id"]
+        or not _never_claimed(current_tail)
+        or current_head["status"] in ("sent", "queued")
+        or not _pre_handoff(current_head)
+        or _sent_receipt_event_id(head, "meshcore") is not None
+    ):
+        raise AssertionError(
+            "stopped burst no longer retains the captured head/tail identities and unfinished tail"
+        )
+    capture["stopped"] = {"uncertain": head, "pending": tail}
 
 
 async def _pending_capture(
@@ -605,24 +793,35 @@ async def _pending_capture(
 
     sent_first = await asyncio.to_thread(senders[source], burst_uncertain)
     ok, _ = await _wait_for(
-        lambda: len(capture_nonce_state(db, burst_uncertain)["events"]) > 0, 15.0
+        lambda: bool(capture_nonce_state(db, burst_uncertain)["events"]), 15.0
     )
-    head_state = capture_nonce_state(db, burst_uncertain)
-    if len(head_state["events"]) == 0:
+    if not ok:
         raise AssertionError("burst head was never ingested by the owner")
-
     sent_second = await asyncio.to_thread(senders[source], burst_pending)
-    ok, _ = await _wait_for(
-        lambda: _has_pending_outbox(capture_nonce_state(db, burst_pending)),
-        hw["observation_timeout"],
-        _DB_POLL_INTERVAL,
-    )
-    pending_state = capture_nonce_state(db, burst_pending)
-    if not _has_pending_outbox(pending_state):
-        raise AssertionError(
-            "pending burst was not observed pending before shutdown; "
-            f"state: {json.dumps(pending_state)[:400]}"
+    head_state, pending_state = {}, {}
+
+    def captured():
+        nonlocal head_state, pending_state
+        head_state, pending_state = capture_nonce_states(
+            db, burst_uncertain, burst_pending
         )
+        head = _single_destination_row(head_state, destination)
+        tail = _single_destination_row(pending_state, destination)
+        return (
+            head is not None
+            and head["status"] == "in_progress"
+            and head["active_attempt"] == 1
+            and head["attempt_number"] == 0
+            and _pre_handoff(head)
+            and tail is not None
+            and _never_claimed(tail)
+            and not head_state["events"][0]["receipts"]
+            and not pending_state["events"][0]["receipts"]
+        )
+
+    ok, _ = await _wait_for(captured, hw["observation_timeout"], _DB_POLL_INTERVAL)
+    if not ok:
+        raise AssertionError("burst was not observed pending behind an active head")
     timeline.append(
         {
             "stage": "pending-captured",
@@ -649,6 +848,16 @@ async def _pending_capture(
 
 async def run_reopen(config: dict, selection: str, role: int, run: Path) -> bool:
     """Fresh-process reopen phase on the same private campaign state."""
+    from .worker import configure
+
+    with own_run(run):
+        configured = configure(config, pair_selection(selection), role, run)
+        with own(configured[3]):
+            return await _run_reopen_owned(config, selection, role, run, configured)
+
+
+async def _run_reopen_owned(config, selection, role, run, configured) -> bool:
+
     transports = pair_selection(selection)
     hw = config["hardware"]
     timeline: list = [{"stage": "reopen-start", "at": _now(), "pid": os.getpid()}]
@@ -668,7 +877,7 @@ async def run_reopen(config: dict, selection: str, role: int, run: Path) -> bool
     state = _read_state(run)
     db = run / "state.sqlite"
     try:
-        from .worker import configure, provenance, wait_startup_drain_retired
+        from .worker import provenance, wait_startup_drain_retired
 
         if "pending_capture" not in state or "completed_legs" not in state:
             raise RuntimeError(
@@ -680,116 +889,150 @@ async def run_reopen(config: dict, selection: str, role: int, run: Path) -> bool
         uncertain_nonce = state["pending_capture"]["uncertain"]["nonce"]
         completed = state["completed_legs"]
 
-        listeners, senders, destinations, endpoints = configure(
-            config, transports, role, run
+        listeners, senders, destinations, _ = configured
+        result["process"] = {"pid": os.getpid()}
+        # Persisted-state verification happens while no owner lives and
+        # before any new send.
+        before = {
+            leg["nonce"]: capture_nonce_state(db, leg["nonce"]) for leg in completed
+        }
+        before[pending_nonce] = capture_nonce_state(db, pending_nonce)
+        before[uncertain_nonce] = capture_nonce_state(db, uncertain_nonce)
+        persisted_ok = True
+        for leg in completed:
+            snapshot = before[leg["nonce"]]
+            if _sent_receipt_identity(snapshot, leg["destination"]) != (
+                leg["event_id"],
+                leg["receipt_id"],
+            ):
+                persisted_ok = False
+        result["persisted"] = {
+            "completed_identities_retained": persisted_ok,
+            "pending_before": before[pending_nonce],
+            "uncertain_before": before[uncertain_nonce],
+        }
+        timeline.append(
+            {"stage": "persisted-verified", "at": _now(), "ok": persisted_ok}
         )
-        with own(endpoints), own_run(run):
-            result["process"] = {"pid": os.getpid()}
-            # Persisted-state verification happens while no owner lives and
-            # before any new send.
-            before = {
-                leg["nonce"]: capture_nonce_state(db, leg["nonce"]) for leg in completed
-            }
-            before[pending_nonce] = capture_nonce_state(db, pending_nonce)
-            before[uncertain_nonce] = capture_nonce_state(db, uncertain_nonce)
-            persisted_ok = True
-            for leg in completed:
-                snapshot = before[leg["nonce"]]
-                if (
-                    _sent_receipt_event_id(snapshot, leg["destination"])
-                    != leg["event_id"]
-                ):
-                    persisted_ok = False
-            result["persisted"] = {
-                "completed_identities_retained": persisted_ok,
-                "pending_before": before[pending_nonce],
-                "uncertain_before": before[uncertain_nonce],
-            }
-            timeline.append(
-                {"stage": "persisted-verified", "at": _now(), "ok": persisted_ok}
+        if not persisted_ok:
+            raise AssertionError("completed sibling identities did not persist")
+        stopped_capture = state["pending_capture"].get("stopped")
+        if (
+            stopped_capture is None
+            or before[pending_nonce] != stopped_capture["pending"]
+            or before[uncertain_nonce] != stopped_capture["uncertain"]
+        ):
+            raise AssertionError(
+                "stopped burst evidence missing or changed before reopen"
             )
-            if not persisted_ok:
-                raise AssertionError("completed sibling identities did not persist")
 
-            # The pending case re-dispatches shortly after start; the peer
-            # listeners must already be armed when that fresh native send
-            # happens. MeshCore exposes no startup drain, and the drain wait
-            # below still precedes the first leg send.
-            armed = await _arm_listeners(listeners, _listener_lifetime(hw, 0.0))
-            try:
-                app = build(
-                    config,
-                    transports,
-                    role,
-                    run,
-                    destinations,
-                    message_delay_seconds=CONTINUITY_MESSAGE_DELAY_SECONDS,
-                )
-                await asyncio.wait_for(app.start(), hw["startup_timeout"])
-                for adapter in app.adapters.values():
-                    health = await asyncio.wait_for(adapter.health_check(), 15)
-                    if health.health != "healthy":
-                        raise RuntimeError(
-                            "adapter did not report healthy after reopen"
-                        )
-                result["startup_drain_wait"] = await wait_startup_drain_retired(app)
-                timeline.append({"stage": "owner-restarted", "at": _now()})
+        # The pending case re-dispatches shortly after start; the peer
+        # listeners must already be armed when that fresh native send
+        # happens. MeshCore exposes no startup drain, and the drain wait
+        # below still precedes the first leg send.
+        armed = await _arm_listeners(
+            {"meshcore": listeners["meshcore"]}, _listener_lifetime(hw, 0.0)
+        )
+        try:
+            app = build(
+                config,
+                transports,
+                role,
+                run,
+                destinations,
+                message_delay_seconds=CONTINUITY_MESSAGE_DELAY_SECONDS,
+            )
+            await asyncio.wait_for(app.start(), hw["startup_timeout"])
+            for adapter in app.adapters.values():
+                health = await asyncio.wait_for(adapter.health_check(), 15)
+                if health.health != "healthy":
+                    raise RuntimeError("adapter did not report healthy after reopen")
+            result["startup_drain_wait"] = await wait_startup_drain_retired(app)
+            timeline.append({"stage": "owner-restarted", "at": _now()})
 
-                result["disposition"] = await _disposition(
-                    run,
-                    hw,
-                    armed,
-                    transports,
-                    pending_nonce,
-                    uncertain_nonce,
-                    timeline,
-                )
-                # Functioning peer observation after reopen.
-                leg7 = await _run_leg(
-                    run,
-                    hw,
-                    senders,
-                    armed,
-                    transports[0],
-                    transports[1],
-                    _nonce(),
-                    timeline,
-                )
-                _leg_state(run, leg7, transports[1])
-                result["legs"].append(leg7)
+            pending_row = _single_destination_row(before[pending_nonce], "meshcore")
+            assert pending_row is not None, "stopped pending generation is missing"
+            result["disposition"] = await _disposition(
+                run,
+                hw,
+                armed,
+                pending_row["outbox_id"],
+                pending_nonce,
+                uncertain_nonce,
+                timeline,
+            )
+            # Functioning peer observation after reopen.
+            leg7 = await _run_leg(
+                run,
+                hw,
+                senders,
+                armed,
+                listeners,
+                transports[0],
+                transports[1],
+                _nonce(),
+                timeline,
+            )
+            await _leg_state(run, leg7, transports[1], hw["observation_timeout"])
+            result["legs"].append(leg7)
+            leg8 = await _run_leg(
+                run,
+                hw,
+                senders,
+                armed,
+                listeners,
+                transports[1],
+                transports[0],
+                _nonce(),
+                timeline,
+            )
+            await _leg_state(run, leg8, transports[0], hw["observation_timeout"])
+            result["legs"].append(leg8)
 
-                await _teardown_owner(app, result)
-                app = None
-                timeline.append({"stage": "owner-restopped", "at": _now()})
-            finally:
+            await _teardown_owner(app, result, armed)
+            app = None
+            timeline.append({"stage": "owner-restopped", "at": _now()})
+        finally:
+            if app is not None:
+                try:
+                    await _teardown_owner(app, result, armed)
+                    app = None
+                    result["stop_on_error"] = True
+                finally:
+                    await _disarm_listeners(armed)
+            else:
                 await _disarm_listeners(armed)
-                armed = {}
-            result["pending_after"] = capture_nonce_state(db, pending_nonce)
-            result["uncertain_after"] = capture_nonce_state(db, uncertain_nonce)
-            result["timeline"] = timeline
-            result["pass"] = result["disposition"].get(
-                "pending_reconciled"
-            ) is True and all(leg.get("observed_once") for leg in result["legs"])
+        result["pending_after"] = capture_nonce_state(db, pending_nonce)
+        result["uncertain_after"] = capture_nonce_state(db, uncertain_nonce)
+        result["timeline"] = timeline
+        result["pass"] = (
+            result["disposition"].get("pending_reconciled") is True
+            and all(leg.get("observed_once") for leg in result["legs"])
+            and not result.get("surviving_sdk_children")
+            and not _child_pids()
+        )
     except BaseException as exc:
         result["error"] = type(exc).__name__ + ": " + str(exc)[-1600:]
         result["timeline"] = timeline
-        if armed:
+        try:
+            if app is not None:
+                await _teardown_owner(app, result, armed)
+                result["stop_on_error"] = True
+        except BaseException as cleanup_error:
+            result["cleanup_error"] = (
+                type(cleanup_error).__name__ + ": " + str(cleanup_error)[-800:]
+            )
+        finally:
             try:
                 await _disarm_listeners(armed)
-            except BaseException:
-                pass
-        if app is not None:
-            try:
-                await asyncio.wait_for(app.stop(), _STOP_BUDGET_SECONDS)
-            except BaseException:
-                pass
-            result["stop_on_error"] = True
+            except BaseException as cleanup_error:
+                result["peer_cleanup_error"] = (
+                    type(cleanup_error).__name__ + ": " + str(cleanup_error)[-800:]
+                )
     finally:
         state["reopen_finished_at"] = _now()
         _write_state(run, state)
-        (run / "reopen-verdict.json").write_text(
-            json.dumps(result, indent=2, default=str) + "\n"
-        )
+        _write_json(run / "reopen-verdict.json", result)
     return bool(result.get("pass"))
 
 
@@ -797,7 +1040,7 @@ async def _disposition(
     run: Path,
     hw: dict,
     armed: dict,
-    transports: tuple[str, str],
+    pending_outbox_id: str,
     pending_nonce: str,
     uncertain_nonce: str,
     timeline: list,
@@ -817,7 +1060,9 @@ async def _disposition(
 
     ok, waited = await _wait_for(
         lambda: _sent_receipt_event_id(
-            capture_nonce_state(db, pending_nonce), destination
+            capture_nonce_state(db, pending_nonce),
+            destination,
+            outbox_id=pending_outbox_id,
         )
         is not None,
         RECONCILE_WAIT_SECONDS,
@@ -827,10 +1072,8 @@ async def _disposition(
     pending_after = capture_nonce_state(db, pending_nonce)
     if pending_reconciled:
         observed = await asyncio.to_thread(
-            receiver.packets_until,
-            lambda ps: any(
-                pending_nonce in str(p.get("text", p.get("content", ""))) for p in ps
-            ),
+            _observe_window,
+            receiver,
             hw["observation_timeout"],
         )
         seen = [

@@ -10,7 +10,7 @@ client-connection interruption and a MEDRE process reopen. The ordinary
 
 - MeshCore boards are healthy: both configured boards advertise, connect
   over BLE, and deliver channel traffic between themselves in both
-  directions (`C4:4F:33:6A:AE:A7`, `C4:4F:33:6A:A5:2B`, channel 1).
+  directions (`<owned-board>`, `<peer-board>`, channel 1).
 - The RAK4631 Meshtastic board is connectable; the T1000-E is in BOOT
   loader mode and must be recovered by the operator before any Meshtastic
   pair can run. Do not reflash from the lab.
@@ -36,8 +36,8 @@ client-connection interruption and a MEDRE process reopen. The ordinary
    the CLI writes run state only there when `--run-root` is passed.
 4. No other lab run owns the selected endpoints; the endpoint locks fail
    fast instead.
-5. `medre-lab doctor` is clean for the selected controller (the campaign
-   used `hci0`; the committed `lab.toml` still names `hci1`).
+5. `medre-lab --config <campaign>/lab.toml doctor` is clean for the selected
+   controller. Check `ble_adapter` in that same campaign configuration.
 
 ## Invocation
 
@@ -101,10 +101,12 @@ Reopen phase (`reopen-verdict.json`), a fresh process:
 - Ctrl-C the CLI once: the owned worker process group gets SIGINT, then a
   bounded SIGKILL ladder; phase verdicts are already written when a phase
   completes, so partial runs keep honest per-phase evidence.
-- Kill the CLI hard (SIGKILL): orphaned peer children hold no exclusive
-  resources beyond their own BLE connections; remove the run directory to
-  release the run lock, and `bluetoothctl disconnect` the boards if a peer
-  child survived.
+- If the CLI is killed hard, preserve the run directory and inspect the
+  process group using `ps -eo pid,ppid,pgid,args` (match the private run
+  path and worker command). Signal only that verified worker process group
+  with `kill -INT -- -<pgid>`, escalate to TERM/KILL if needed, and verify
+  the worker and children have exited before starting another campaign.
+  Deleting the lock file or disconnecting hardware does not retire an owner.
 - No firmware, channel, key, bond, or clock state is written at any point.
 
 ## Reading the verdicts
@@ -114,3 +116,11 @@ boundary (pid, exit code, timeout, log path). A phase that dies before
 writing its verdict gets an explicit `worker-exited-before-verdict` record
 instead of a pass. Private evidence (native ids, wire text) stays in the
 run directory; publish only sanitized summaries.
+
+Each direction arms only its destination listener; the source SDK must own
+its exclusive peer endpoint for sending. Observe the full declared recipient
+window; this is not continuous two-peer observation across the interruption.
+Durable pre-interrupt marker equality detects duplicate durable effects, not
+whether an ingress packet was re-observed and suppressed. A failed/cancelled
+baseline does not start reopen. The historical reduced result does not qualify
+these revised checks; rerun on the exact selected full hardware pair.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import signal
@@ -15,6 +16,7 @@ import uuid
 from pathlib import Path
 
 from .config import load, pair
+from .continuity import _write_json
 
 
 def root_path(value):
@@ -73,18 +75,23 @@ def _spawn_worker(argv: list[str], log_path: Path, timeout: float, watch=None) -
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        watcher = None
         if watch is not None:
-            threading.Thread(target=watch, args=(child,), daemon=True).start()
+            watcher = threading.Thread(target=watch, args=(child,))
+            watcher.start()
         try:
             return child.wait(timeout=timeout)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
             os.killpg(child.pid, signal.SIGINT)
             try:
                 child.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
-            return 1
+            return 130 if isinstance(exc, KeyboardInterrupt) else 1
+        finally:
+            if watcher is not None:
+                watcher.join()
 
 
 def _hardware_run_dir(root: Path, transports, role: str, run_root: Path | None) -> Path:
@@ -163,7 +170,9 @@ def hardware(root, config, selected, role, run_root: str | None = None):
     return code
 
 
-def _auto_disconnect_watch(run: Path, owned_address: str):
+def _auto_disconnect_watch(
+    run: Path, owned_address: str, controller: str | None = None
+):
     """Perform the declared-link disconnect when the baseline arms the stage.
 
     The watcher is the harness-owned interruption action: it waits for the
@@ -181,16 +190,39 @@ def _auto_disconnect_watch(run: Path, owned_address: str):
             if not performed and (run / "interrupt-armed.json").exists():
                 performed = True
                 try:
-                    proc = subprocess.run(
-                        ["bluetoothctl", "disconnect", owned_address],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
+                    argv = (
+                        [
+                            "busctl",
+                            "call",
+                            "org.bluez",
+                            f"/org/bluez/{controller}/dev_{owned_address.upper().replace(':', '_')}",
+                            "org.bluez.Device1",
+                            "Disconnect",
+                        ]
+                        if controller
+                        else ["bluetoothctl", "disconnect", owned_address]
                     )
-                    log_path.write_text(
-                        f"$ bluetoothctl disconnect {owned_address}\n"
-                        f"exit={proc.returncode}\n{proc.stdout}{proc.stderr}"
-                    )
+                    with log_path.open("w") as log:
+                        proc = subprocess.Popen(
+                            argv, stdout=log, stderr=subprocess.STDOUT
+                        )
+                        deadline = time.monotonic() + 30
+                        try:
+                            while (
+                                child.poll() is None
+                                and proc.poll() is None
+                                and time.monotonic() < deadline
+                            ):
+                                time.sleep(0.1)
+                        finally:
+                            if proc.poll() is None:
+                                proc.terminate()
+                                try:
+                                    proc.wait(timeout=2)
+                                except subprocess.TimeoutExpired:
+                                    proc.kill()
+                                    proc.wait(timeout=2)
+                        log.write(f"\nexit={proc.returncode}\n")
                 except (OSError, subprocess.SubprocessError) as exc:
                     log_path.write_text(f"disconnect action failed: {exc}")
             time.sleep(1.0)
@@ -208,6 +240,8 @@ def continuity(
     run_root: str | None,
 ):
     """Two-phase continuity case: baseline owner, then fresh-process reopen."""
+    if not math.isfinite(interrupt_wait) or interrupt_wait <= 0:
+        raise ValueError("interrupt wait must be finite and positive")
     cfg = load(config)
     transports = pair(selected)
     if any(t not in cfg["hardware"] for t in transports):
@@ -250,7 +284,7 @@ def continuity(
             argv.append(str(interrupt_wait))
         started = time.time()
         watch = (
-            _auto_disconnect_watch(run, owned_address)
+            _auto_disconnect_watch(run, owned_address, hw.get("ble_adapter"))
             if phase == "baseline" and auto_disconnect
             else None
         )
@@ -264,9 +298,18 @@ def continuity(
             "log": str(run / f"{phase}-worker.log"),
         }
         _write_worker_absent_verdict(run, f"{phase}-verdict.json", phase, code)
-        verdict = json.loads((run / f"{phase}-verdict.json").read_text())
-        boundary[phase]["pass"] = bool(verdict.get("pass"))
+        try:
+            verdict = json.loads((run / f"{phase}-verdict.json").read_text())
+            if not isinstance(verdict, dict) or verdict.get("phase") != phase:
+                raise ValueError("invalid phase verdict")
+            boundary[phase]["worker_verdict_pass"] = verdict.get("pass") is True
+        except (ValueError, OSError) as exc:
+            boundary[phase]["worker_verdict_pass"] = False
+            boundary[phase]["verdict_error"] = type(exc).__name__
+        boundary[phase]["pass"] = code == 0 and boundary[phase]["worker_verdict_pass"]
         phases_ok = phases_ok and boundary[phase]["pass"]
+        if not boundary[phase]["pass"]:
+            break  # Never open a replacement after cancellation or failed retirement.
     merged = {
         "case": "reconnect-reopen-continuity",
         "pass": phases_ok,
@@ -276,11 +319,9 @@ def continuity(
         "scope": "Two-phase continuity case; physical interruption and MEDRE "
         "shutdown are separate evidenced actions.",
     }
-    (run / "continuity-verdict.json").write_text(
-        json.dumps(merged, indent=2, default=str) + "\n"
-    )
+    _write_json(run / "continuity-verdict.json", merged)
     print(json.dumps({"pass": phases_ok, "evidence": str(run)}))
-    return 0 if phases_ok else 1
+    return 130 if code == 130 else (0 if phases_ok else 1)
 
 
 def main(argv=None):

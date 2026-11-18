@@ -28,7 +28,7 @@ def build(
         entry = hw[kind]
         common = dict(
             adapter_id=kind,
-            message_delay_seconds=message_delay_seconds,
+            message_delay_seconds=message_delay_seconds if kind == "meshcore" else 2.5,
             relay_prefix="{sender}: ",
         )
         if kind == "meshtastic":
