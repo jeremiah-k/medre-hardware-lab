@@ -827,7 +827,19 @@ def test_reopen_refuses_inconsistent_baseline_before_native_start(
 def test_unrelated_sent_receipt_cannot_qualify_leg(tmp_path, column, value):
     con = make_db(tmp_path)
     insert_event(con, "marker", "meshcore", receipt_status="sent", outbox_status="sent")
-    con.execute(f"UPDATE delivery_receipts SET {column}=?", (value,))
+    fields = {
+        "target_channel": None,
+        "delivery_plan_id": "",
+        "attempt_number": 1,
+        "outbox_id": "ob-marker",
+    }
+    fields[column] = value
+    con.execute(
+        "UPDATE delivery_receipts SET target_channel=:target_channel,"
+        " delivery_plan_id=:delivery_plan_id, attempt_number=:attempt_number,"
+        " outbox_id=:outbox_id",
+        fields,
+    )
     con.commit()
     assert (
         continuity._sent_receipt_event_id(
@@ -851,7 +863,7 @@ def test_cancelled_blocking_sender_drains_before_endpoint_release():
 
     async def runner():
         try:
-            await continuity._owned_blocking(send)
+            await continuity.owned_blocking(send)
         finally:
             ownership_released.append(retired.is_set())
 

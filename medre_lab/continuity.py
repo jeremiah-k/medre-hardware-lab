@@ -46,6 +46,7 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 
 from .config import pair as pair_selection
+from .native.live_peer_common import async_peer_context, owned_blocking
 from .ownership import own, own_run
 from .runtime import build
 
@@ -253,8 +254,6 @@ def _listener_lifetime(hw: dict, interrupt_wait: float) -> float:
 
 async def _arm_listeners(listeners: dict, lifetime: float) -> dict:
     """Arm the selected independent recipient(s), owning partial setup."""
-    from .native.live_peer_common import async_peer_context
-
     armed: dict = {}
     try:
         for kind, factory in listeners.items():
@@ -293,30 +292,6 @@ def _observe_window(peer, timeout: float) -> list[dict]:
     if owner is not None and owner.poll() is not None:
         raise AssertionError("native observer retired before observation completed")
     return packets
-
-
-async def _owned_blocking(function, *args):
-    """Drain a timeout-bounded native call before unwinding endpoint ownership.
-
-    Native senders use subprocess.run(timeout=send_timeout), which kills and
-    reaps their child before returning. Observation calls have a finite window.
-    Cancellation must not detach either thread while its endpoint is owned.
-    The outer process-group deadline remains the hard-stop escalation.
-    """
-    task = asyncio.create_task(asyncio.to_thread(function, *args))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                continue
-            except Exception:
-                break
-        if not task.cancelled():
-            task.exception()  # Retrieve any native failure; cancellation wins.
-        raise
 
 
 def _disconnect_owned(run: Path, address: str, controller: str | None) -> None:
@@ -359,8 +334,8 @@ async def _run_leg(
     await _select_listener(armed, listeners, destination, _listener_lifetime(hw, 0))
     receiver = armed[destination]["peer"]
     before = time.monotonic()
-    sent = await _owned_blocking(senders[source], nonce)
-    observed = await _owned_blocking(
+    sent = await owned_blocking(senders[source], nonce)
+    observed = await owned_blocking(
         _observe_window,
         receiver,
         hw["observation_timeout"],
@@ -705,7 +680,7 @@ async def _interrupt_stage(
     try:
         if auto_disconnect:
             action = asyncio.create_task(
-                _owned_blocking(
+                owned_blocking(
                     _disconnect_owned, run, owned_address, hw.get("ble_adapter")
                 )
             )
@@ -897,13 +872,13 @@ async def _pending_capture(
     burst_uncertain = _nonce()
     burst_pending = _nonce()
 
-    sent_first = await _owned_blocking(senders[source], burst_uncertain)
+    sent_first = await owned_blocking(senders[source], burst_uncertain)
     ok, _ = await _wait_for(
         lambda: bool(capture_nonce_state(db, burst_uncertain)["events"]), 15.0
     )
     if not ok:
         raise AssertionError("burst head was never ingested by the owner")
-    sent_second = await _owned_blocking(senders[source], burst_pending)
+    sent_second = await owned_blocking(senders[source], burst_pending)
     head_state, pending_state = {}, {}
 
     def captured():
@@ -1207,7 +1182,7 @@ async def _disposition(
     )
     pending_reconciled = ok
     if pending_reconciled:
-        observed = await _owned_blocking(
+        observed = await owned_blocking(
             _observe_window,
             receiver,
             hw["observation_timeout"],

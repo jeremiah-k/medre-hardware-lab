@@ -21,13 +21,36 @@ import sys
 import tempfile
 import time
 from collections.abc import AsyncIterator, Callable
-from contextlib import AbstractContextManager, asynccontextmanager
+from contextlib import AbstractContextManager, asynccontextmanager, suppress
 from pathlib import Path
 from threading import Event
-from typing import TextIO, TypeVar
+from typing import Any, TextIO, TypeVar
 
 _POLL_WAIT = Event()
 _PeerT = TypeVar("_PeerT")
+_ResultT = TypeVar("_ResultT")
+
+
+async def _drain_native(task: asyncio.Task[_ResultT]) -> _ResultT:
+    """Join a bounded native operation across repeated caller cancellation."""
+    while not task.done():
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
+
+
+async def owned_blocking(function: Callable[..., _ResultT], *args: Any) -> _ResultT:
+    """Keep ownership until a bounded native thread operation has retired."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Retrieve the native failure and preserve caller cancellation.
+        with suppress(Exception):
+            await _drain_native(task)
+        raise
 
 
 @asynccontextmanager
@@ -44,20 +67,20 @@ async def async_peer_context(
         peer = await asyncio.shield(startup)
     except asyncio.CancelledError:
         try:
-            await startup
+            await _drain_native(startup)
         except Exception:
             # A failed __enter__ owns its cleanup; preserve cancellation.
             pass
         else:
-            await asyncio.to_thread(listener.__exit__, None, None, None)
+            await owned_blocking(listener.__exit__, None, None, None)
         raise
     try:
         yield peer
     except BaseException:
-        if not await asyncio.to_thread(listener.__exit__, *sys.exc_info()):
+        if not await owned_blocking(listener.__exit__, *sys.exc_info()):
             raise
     else:
-        await asyncio.to_thread(listener.__exit__, None, None, None)
+        await owned_blocking(listener.__exit__, None, None, None)
 
 
 def read_jsonl(path: Path) -> list[dict]:

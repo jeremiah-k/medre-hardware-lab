@@ -211,30 +211,45 @@ async def test_async_peer_lifecycle_keeps_runtime_responsive() -> None:
     assert phases == ["enter", "body", "exit"]
 
 
-async def test_cancelled_peer_start_is_released_before_return() -> None:
+@pytest.mark.parametrize("blocked_phase", ["startup", "teardown"])
+async def test_cancelled_peer_lifecycle_is_released_before_return(
+    blocked_phase,
+) -> None:
     loop = asyncio.get_running_loop()
     started = asyncio.Event()
     release = threading.Event()
     closed = threading.Event()
 
     class Listener:
-        def __enter__(self):
+        def _block(self):
             loop.call_soon_threadsafe(started.set)
             assert release.wait(2)
+
+        def __enter__(self):
+            if blocked_phase == "startup":
+                self._block()
             return self
 
         def __exit__(self, *_):
+            if blocked_phase == "teardown":
+                self._block()
             closed.set()
 
     async def run():
         async with async_peer_context(Listener()):
-            pytest.fail("cancelled startup entered body")
+            assert blocked_phase == "teardown", "cancelled startup entered body"
 
     task = asyncio.create_task(run())
     await asyncio.wait_for(started.wait(), 1)
-    task.cancel()
-    await asyncio.sleep(0)
-    release.set()
+    try:
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert not closed.is_set()
+    finally:
+        release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert closed.is_set()
