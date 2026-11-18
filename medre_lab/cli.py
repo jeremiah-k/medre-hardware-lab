@@ -10,7 +10,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -62,12 +61,8 @@ def doctor(config):
     return 1 if result.get("problems") else 0
 
 
-def _spawn_worker(argv: list[str], log_path: Path, timeout: float, watch=None) -> int:
-    """Run one owned worker subprocess with a bounded interrupt/kill ladder.
-
-    ``watch`` receives the live child handle once and runs detached; it must
-    return when the child exits so the thread never outlives the worker.
-    """
+def _spawn_worker(argv: list[str], log_path: Path, timeout: float) -> int:
+    """Run one owned worker subprocess with a bounded interrupt/kill ladder."""
     with log_path.open("w") as log:
         child = subprocess.Popen(
             argv,
@@ -75,10 +70,6 @@ def _spawn_worker(argv: list[str], log_path: Path, timeout: float, watch=None) -
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        watcher = None
-        if watch is not None:
-            watcher = threading.Thread(target=watch, args=(child,))
-            watcher.start()
         try:
             return child.wait(timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
@@ -89,9 +80,6 @@ def _spawn_worker(argv: list[str], log_path: Path, timeout: float, watch=None) -
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
             return 130 if isinstance(exc, KeyboardInterrupt) else 1
-        finally:
-            if watcher is not None:
-                watcher.join()
 
 
 def _hardware_run_dir(root: Path, transports, role: str, run_root: Path | None) -> Path:
@@ -110,18 +98,15 @@ def _hardware_run_dir(root: Path, transports, role: str, run_root: Path | None) 
 def _write_worker_absent_verdict(run: Path, name: str, phase: str, code: int) -> None:
     path = run / name
     if not path.exists():
-        path.write_text(
-            json.dumps(
-                {
-                    "phase": phase,
-                    "pass": False,
-                    "stage": "worker-exited-before-verdict",
-                    "exit_code": code,
-                    "details": "See private worker log; no qualification claim.",
-                },
-                indent=2,
-            )
-            + "\n"
+        _write_json(
+            path,
+            {
+                "phase": phase,
+                "pass": False,
+                "stage": "worker-exited-before-verdict",
+                "exit_code": code,
+                "details": "See private worker log; no qualification claim.",
+            },
         )
 
 
@@ -153,81 +138,11 @@ def hardware(root, config, selected, role, run_root: str | None = None):
         timeout,
     )
     if not (run / "verdict.json").exists():
-        (run / "verdict.json").write_text(
-            json.dumps(
-                {
-                    "pass": False,
-                    "stage": "worker-exited-before-verdict",
-                    "exit_code": code,
-                    "details": "See private worker.log; no qualification claim.",
-                },
-                indent=2,
-            )
-            + "\n"
-        )
-        code = 1
+        _write_worker_absent_verdict(run, "verdict.json", "hardware", code)
+        if code != 130:
+            code = 1
     print(json.dumps({"pass": code == 0, "evidence": str(run)}))
     return code
-
-
-def _auto_disconnect_watch(
-    run: Path, owned_address: str, controller: str | None = None
-):
-    """Perform the declared-link disconnect when the baseline arms the stage.
-
-    The watcher is the harness-owned interruption action: it waits for the
-    worker's interrupt sentinel, disconnects the MEDRE-owned MeshCore host
-    link once, and records the action. The worker observes the actual
-    disconnect and rejoin through adapter diagnostics. No setting, bond,
-    key, or firmware state is touched; disconnecting an owned BLE host link
-    is the declared fault mechanism.
-    """
-
-    def watch(child) -> None:
-        log_path = run / "disconnect-action.log"
-        performed = False
-        while child.poll() is None:
-            if not performed and (run / "interrupt-armed.json").exists():
-                performed = True
-                try:
-                    argv = (
-                        [
-                            "busctl",
-                            "call",
-                            "org.bluez",
-                            f"/org/bluez/{controller}/dev_{owned_address.upper().replace(':', '_')}",
-                            "org.bluez.Device1",
-                            "Disconnect",
-                        ]
-                        if controller
-                        else ["bluetoothctl", "disconnect", owned_address]
-                    )
-                    with log_path.open("w") as log:
-                        proc = subprocess.Popen(
-                            argv, stdout=log, stderr=subprocess.STDOUT
-                        )
-                        deadline = time.monotonic() + 30
-                        try:
-                            while (
-                                child.poll() is None
-                                and proc.poll() is None
-                                and time.monotonic() < deadline
-                            ):
-                                time.sleep(0.1)
-                        finally:
-                            if proc.poll() is None:
-                                proc.terminate()
-                                try:
-                                    proc.wait(timeout=2)
-                                except subprocess.TimeoutExpired:
-                                    proc.kill()
-                                    proc.wait(timeout=2)
-                        log.write(f"\nexit={proc.returncode}\n")
-                except (OSError, subprocess.SubprocessError) as exc:
-                    log_path.write_text(f"disconnect action failed: {exc}")
-            time.sleep(1.0)
-
-    return watch
 
 
 def continuity(
@@ -250,11 +165,16 @@ def continuity(
         raise ValueError(
             "continuity link interruption currently supports the meshcore BLE host link"
         )
-    owned_address = cfg["hardware"]["meshcore"]["addresses"][0 if role == "a" else 1]
     run = _hardware_run_dir(
         root, transports, role, Path(run_root) if run_root else None
     )
     run.mkdir(parents=True, mode=0o700)
+    # Both workers use a private, resolved copy of the validated settings.
+    # The original operator TOML may change while the baseline is running.
+    from .config import write_effective_config
+
+    snapshot = run / "effective-config.toml"
+    write_effective_config(snapshot, cfg)
     hw = cfg["hardware"]
     baseline_timeout = (
         hw["startup_timeout"]
@@ -274,7 +194,7 @@ def continuity(
             sys.executable,
             "-m",
             "medre_lab.worker",
-            str(config.resolve()),
+            str(snapshot),
             ":".join(transports),
             str(0 if role == "a" else 1),
             str(run),
@@ -282,13 +202,10 @@ def continuity(
         ]
         if phase == "baseline":
             argv.append(str(interrupt_wait))
+            if auto_disconnect:
+                argv.append("--auto-disconnect")
         started = time.time()
-        watch = (
-            _auto_disconnect_watch(run, owned_address, hw.get("ble_adapter"))
-            if phase == "baseline" and auto_disconnect
-            else None
-        )
-        code = _spawn_worker(argv, run / f"{phase}-worker.log", timeout, watch=watch)
+        code = _spawn_worker(argv, run / f"{phase}-worker.log", timeout)
         boundary[phase] = {
             "exit_code": code,
             "started_at": started,

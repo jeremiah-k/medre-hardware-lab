@@ -8,7 +8,7 @@ short-check semantics. The case runs in two owned worker processes:
     One MEDRE runtime process completes one delivery per direction, then
     waits for the declared host link to be disconnected (MeshCore BLE only:
     ``bluetoothctl disconnect`` of the MEDRE-owned board, performed by the
-    CLI watcher or the operator), records actual disconnect/rejoin evidence,
+    lock-owning worker or the operator), records actual disconnect/rejoin evidence,
     sends fresh markers on the rejoined link, and finally captures a
     reconcilable pending outbox case before a bounded graceful stop.
 
@@ -39,6 +39,7 @@ import json
 import math
 import os
 import sqlite3
+import subprocess
 import time
 import uuid
 from contextlib import AsyncExitStack
@@ -294,6 +295,55 @@ def _observe_window(peer, timeout: float) -> list[dict]:
     return packets
 
 
+async def _owned_blocking(function, *args):
+    """Drain a timeout-bounded native call before unwinding endpoint ownership.
+
+    Native senders use subprocess.run(timeout=send_timeout), which kills and
+    reaps their child before returning. Observation calls have a finite window.
+    Cancellation must not detach either thread while its endpoint is owned.
+    The outer process-group deadline remains the hard-stop escalation.
+    """
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not task.cancelled():
+            task.exception()  # Retrieve any native failure; cancellation wins.
+        raise
+
+
+def _disconnect_owned(run: Path, address: str, controller: str | None) -> None:
+    """Perform the fault action inside the worker that owns the endpoints."""
+    if not address:
+        raise ValueError("owned MeshCore address is missing")
+    argv = (
+        [
+            "busctl",
+            "call",
+            "org.bluez",
+            f"/org/bluez/{controller}/dev_{address.upper().replace(':', '_')}",
+            "org.bluez.Device1",
+            "Disconnect",
+        ]
+        if controller
+        else ["bluetoothctl", "disconnect", address]
+    )
+    with (run / "disconnect-action.log").open("w") as log:
+        result = subprocess.run(
+            argv, stdout=log, stderr=subprocess.STDOUT, timeout=30, check=False
+        )
+        log.write(f"\nexit={result.returncode}\n")
+    if result.returncode != 0:
+        raise RuntimeError(f"owned BLE disconnect failed ({result.returncode})")
+
+
 async def _run_leg(
     run: Path,
     hw: dict,
@@ -309,8 +359,8 @@ async def _run_leg(
     await _select_listener(armed, listeners, destination, _listener_lifetime(hw, 0))
     receiver = armed[destination]["peer"]
     before = time.monotonic()
-    sent = await asyncio.to_thread(senders[source], nonce)
-    observed = await asyncio.to_thread(
+    sent = await _owned_blocking(senders[source], nonce)
+    observed = await _owned_blocking(
         _observe_window,
         receiver,
         hw["observation_timeout"],
@@ -394,7 +444,13 @@ async def _teardown_owner(app, result: dict, armed: dict) -> None:
 
 
 async def run_baseline(
-    config: dict, selection: str, role: int, run: Path, interrupt_wait: float
+    config: dict,
+    selection: str,
+    role: int,
+    run: Path,
+    interrupt_wait: float,
+    *,
+    auto_disconnect: bool = False,
 ) -> bool:
     """Baseline owner phase: deliveries, link interruption, pending capture."""
     from .worker import configure
@@ -407,12 +463,18 @@ async def run_baseline(
         configured = configure(config, pair_selection(selection), role, run)
         with own(configured[3]):
             return await _run_baseline_owned(
-                config, selection, role, run, interrupt_wait, configured
+                config,
+                selection,
+                role,
+                run,
+                interrupt_wait,
+                configured,
+                auto_disconnect=auto_disconnect,
             )
 
 
 async def _run_baseline_owned(
-    config, selection, role, run, interrupt_wait, configured
+    config, selection, role, run, interrupt_wait, configured, *, auto_disconnect=False
 ) -> bool:
 
     transports = pair_selection(selection)
@@ -501,10 +563,10 @@ async def _run_baseline_owned(
             state["completed_legs"] = [leg1, leg2]
             _write_state(run, state)
 
-            # Declared-link interruption (separate watcher/operator action).
+            # Declared-link interruption (owned action or manual operator).
             await _disarm_listeners(armed)
             result["interrupt"] = await _interrupt_stage(
-                app, run, hw, interrupt_wait, timeline
+                app, run, hw, interrupt_wait, timeline, auto_disconnect=auto_disconnect
             )
 
             # Fresh markers on the rejoined link.
@@ -579,6 +641,7 @@ async def _run_baseline_owned(
         )
     except BaseException as exc:
         result["error"] = type(exc).__name__ + ": " + str(exc)[-1600:]
+        result["cancelled"] = isinstance(exc, asyncio.CancelledError)
         result["timeline"] = timeline
         try:
             if app is not None:
@@ -595,6 +658,8 @@ async def _run_baseline_owned(
                 result["peer_cleanup_error"] = (
                     type(cleanup_error).__name__ + ": " + str(cleanup_error)[-800:]
                 )
+        if isinstance(exc, asyncio.CancelledError):
+            raise
     finally:
         state["baseline_finished_at"] = _now()
         _write_state(run, state)
@@ -603,14 +668,19 @@ async def _run_baseline_owned(
 
 
 async def _interrupt_stage(
-    app, run: Path, hw: dict, interrupt_wait: float, timeline: list
+    app,
+    run: Path,
+    hw: dict,
+    interrupt_wait: float,
+    timeline: list,
+    *,
+    auto_disconnect: bool = False,
 ) -> dict:
     """Wait for the declared-link disconnect, then for the rejoin.
 
-    The disconnect itself is a separate action: the CLI watcher or the
-    operator performs it while this stage polls real adapter diagnostics.
-    The stage arms a sentinel file the watcher can look for, and times out
-    honestly if nobody acts.
+    The owned worker performs the automatic action concurrently with polling,
+    or the operator acts on the sentinel in manual mode. The action is drained
+    before leaving the endpoint-ownership scope.
     """
     meshcore = app.adapters.get("meshcore")
     if meshcore is None:
@@ -631,13 +701,22 @@ async def _interrupt_stage(
         },
     )
     evidence: dict = {"owned_address": owned_address}
+    action = None
     try:
+        if auto_disconnect:
+            action = asyncio.create_task(
+                _owned_blocking(
+                    _disconnect_owned, run, owned_address, hw.get("ble_adapter")
+                )
+            )
         last_inbound_before = session_before.get("last_message_time")
         evidence["pre_interrupt_diagnostics"] = session_before
         disconnected = {}
 
         def disconnected_now():
             nonlocal disconnected
+            if action is not None and action.done():
+                action.result()
             disconnected = _session_diag(meshcore)
             return disconnected.get("connected") is False
 
@@ -677,12 +756,24 @@ async def _interrupt_stage(
         )
         if not ok:
             raise RuntimeError("meshcore session did not rejoin after the disconnect")
+        if action is not None:
+            await asyncio.shield(action)
         evidence["rejoin_observed_after_s"] = round(waited, 3)
         evidence["rejoin_diagnostics"] = _session_diag(meshcore)
         evidence["rejoin_peak_reconnect_attempts"] = peak_attempts
         evidence["rejoined"] = True
         evidence["relayed_before"] = diag_before.get("classifier_packets_relayed")
         timeline.append({"stage": "link-rejoined", "at": _now()})
+    except BaseException:
+        if action is not None:
+            # Preserve the original failure/cancellation, but do not detach
+            # the fault action from its endpoint owner.
+            action.cancel()
+            try:
+                await action
+            except (asyncio.CancelledError, Exception):
+                pass
+        raise
     finally:
         sentinel.unlink(missing_ok=True)
     return evidence
@@ -806,13 +897,13 @@ async def _pending_capture(
     burst_uncertain = _nonce()
     burst_pending = _nonce()
 
-    sent_first = await asyncio.to_thread(senders[source], burst_uncertain)
+    sent_first = await _owned_blocking(senders[source], burst_uncertain)
     ok, _ = await _wait_for(
         lambda: bool(capture_nonce_state(db, burst_uncertain)["events"]), 15.0
     )
     if not ok:
         raise AssertionError("burst head was never ingested by the owner")
-    sent_second = await asyncio.to_thread(senders[source], burst_pending)
+    sent_second = await _owned_blocking(senders[source], burst_pending)
     head_state, pending_state = {}, {}
 
     def captured():
@@ -1056,6 +1147,7 @@ async def _run_reopen_owned(config, selection, role, run, configured) -> bool:
         )
     except BaseException as exc:
         result["error"] = type(exc).__name__ + ": " + str(exc)[-1600:]
+        result["cancelled"] = isinstance(exc, asyncio.CancelledError)
         result["timeline"] = timeline
         try:
             if app is not None:
@@ -1072,6 +1164,8 @@ async def _run_reopen_owned(config, selection, role, run, configured) -> bool:
                 result["peer_cleanup_error"] = (
                     type(cleanup_error).__name__ + ": " + str(cleanup_error)[-800:]
                 )
+        if isinstance(exc, asyncio.CancelledError):
+            raise
     finally:
         state["reopen_finished_at"] = _now()
         _write_state(run, state)
@@ -1113,7 +1207,7 @@ async def _disposition(
     )
     pending_reconciled = ok
     if pending_reconciled:
-        observed = await asyncio.to_thread(
+        observed = await _owned_blocking(
             _observe_window,
             receiver,
             hw["observation_timeout"],

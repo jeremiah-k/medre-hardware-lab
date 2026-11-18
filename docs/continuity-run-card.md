@@ -55,10 +55,16 @@ medre-lab --config <campaign>/lab.toml hardware continuity --pair meshcore:lxmf 
 ```
 
 `--no-auto-disconnect` leaves the interruption to the operator: the baseline
-writes `interrupt-armed.json` with the owned address and the suggested
-`bluetoothctl disconnect <address>`; the operator performs it while the
-baseline polls real adapter diagnostics. Without the flag the CLI watcher
-performs the owned BLE host-link disconnect once and logs the action.
+writes `interrupt-armed.json` with `owned_address` and `controller`. For a
+selected controller (e.g. `hci1`), run
+`busctl call org.bluez /org/bluez/hci1/dev_<ADDRESS_WITH_UNDERSCORES> org.bluez.Device1 Disconnect`
+using the exact values in that file (uppercase BLE address, colons replaced
+with underscores). Without a selected controller, use
+`bluetoothctl disconnect <owned_address>`. The baseline polls actual adapter
+diagnostics; removal of the sentinel indicates the interruption stage ended,
+not acknowledgement of the initial disconnect. Without the flag the
+lock-owning worker performs the action once and logs it. Both workers consume
+the same private, resolved `effective-config.toml`.
 
 Role `a` makes MEDRE own the first configured endpoint of each transport;
 role `b` swaps ownership to exercise the other boards.
@@ -72,7 +78,7 @@ Baseline phase (`baseline-verdict.json`):
 2. Two legs, one per direction, each with exactly one correlated far-side
    delivery and a failure-free `sent` receipt at the destination adapter.
 3. `link-disconnected` — observed from the adapter's own connection
-   diagnostics (sentinel file removed once observed).
+   diagnostics (sentinel remains until the interruption/rejoin stage ends).
 4. `link-rejoined` — connected again with the recovery loop finished; the
    peak reconnect-attempt counter is recorded as evidence only (the session
    resets it to zero on success).
@@ -116,8 +122,9 @@ Reopen phase (`reopen-verdict.json`), a fresh process:
 
 ## Reading the verdicts
 
-`continuity-verdict.json` merges the phase verdicts with the process
-boundary (pid, exit code, timeout, log path). A phase that dies before
+`continuity-verdict.json` records phase pass flags, exit codes, timing,
+timeouts and log paths. Inspect the individual phase verdict for detailed
+evidence and worker PID when initialization reached that point. A phase that dies before
 writing its verdict gets an explicit `worker-exited-before-verdict` record
 instead of a pass. Private evidence (native ids, wire text) stays in the
 run directory; publish only sanitized summaries.

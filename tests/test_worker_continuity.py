@@ -12,6 +12,7 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -632,21 +633,25 @@ def test_cli_continuity_records_process_boundary(tmp_path, monkeypatch):
     config = _lab_config(tmp_path)
     run_root = tmp_path / "runs"
     spawned = []
+    from medre_lab.config import load
 
-    def fake_spawn(argv, log_path, timeout, watch=None):
+    original_config = load(config)
+
+    def fake_spawn(argv, log_path, timeout):
         run = log_path.parent
         phase = argv[7]
-        spawned.append((phase, argv[8] if len(argv) > 8 else None, watch is not None))
+        spawned.append(
+            (phase, argv[8] if len(argv) > 8 else None, "--auto-disconnect" in argv)
+        )
+        from medre_lab.config import load
+
+        assert load(Path(argv[3])) == original_config
+        assert Path(argv[3]) == run / "effective-config.toml"
         (run / f"{phase}-verdict.json").write_text(
             json.dumps({"phase": phase, "pass": True}) + "\n"
         )
-        if watch is not None:
-            # The watcher thread must stop once the child "exits".
-            class FakeChild:
-                def poll(self):
-                    return 0
-
-            threading.Thread(target=watch, args=(FakeChild(),), daemon=True).start()
+        if phase == "baseline":
+            config.write_text("[hardware]\nsend_timeout=999\n")
         return 0
 
     monkeypatch.setattr(cli, "_spawn_worker", fake_spawn)
@@ -658,7 +663,7 @@ def test_cli_continuity_records_process_boundary(tmp_path, monkeypatch):
     # Baseline carries the interrupt wait; reopen does not.
     assert spawned[0][1] == "30.0"
     assert spawned[1][1] is None
-    # Auto-disconnect watcher armed for the baseline phase only.
+    # Automatic interruption is executed by the baseline owner only.
     assert spawned[0][2] is True
     assert spawned[1][2] is False
     runs = list(run_root.iterdir())
@@ -673,7 +678,7 @@ def test_cli_continuity_records_worker_absent_honestly(tmp_path, monkeypatch):
     config = _lab_config(tmp_path)
     run_root = tmp_path / "runs"
 
-    def fake_spawn(argv, log_path, timeout, watch=None):
+    def fake_spawn(argv, log_path, timeout):
         return 1  # dies before any verdict
 
     monkeypatch.setattr(cli, "_spawn_worker", fake_spawn)
@@ -727,7 +732,7 @@ def test_cli_never_reopens_failed_or_cancelled_worker(
     config = _lab_config(tmp_path)
     calls = []
 
-    def spawn(argv, log_path, timeout, watch=None):
+    def spawn(argv, log_path, timeout):
         calls.append(argv[7])
         (log_path.parent / "baseline-verdict.json").write_text(raw)
         return exit_code
@@ -830,4 +835,200 @@ def test_unrelated_sent_receipt_cannot_qualify_leg(tmp_path, column, value):
             "meshcore",
         )
         is None
+    )
+
+
+def test_cancelled_blocking_sender_drains_before_endpoint_release():
+    started = threading.Event()
+    release = threading.Event()
+    retired = threading.Event()
+    ownership_released = []
+
+    def send():
+        started.set()
+        assert release.wait(5)
+        retired.set()
+
+    async def runner():
+        try:
+            await continuity._owned_blocking(send)
+        finally:
+            ownership_released.append(retired.is_set())
+
+    async def exercise():
+        task = asyncio.create_task(runner())
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert ownership_released == []
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert ownership_released == [True]
+
+    asyncio.run(exercise())
+
+
+def test_auto_disconnect_uses_owned_controller_and_finite_timeout(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs["timeout"]))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(continuity.subprocess, "run", run)
+    continuity._disconnect_owned(tmp_path, "AA:BB:CC:DD:EE:FF", "hci1")
+    assert calls == [
+        (
+            [
+                "busctl",
+                "call",
+                "org.bluez",
+                "/org/bluez/hci1/dev_AA_BB_CC_DD_EE_FF",
+                "org.bluez.Device1",
+                "Disconnect",
+            ],
+            30,
+        )
+    ]
+    assert "exit=0" in (tmp_path / "disconnect-action.log").read_text()
+
+
+def test_ordinary_cancel_without_verdict_preserves_exit_code(tmp_path, monkeypatch):
+    config = _lab_config(tmp_path)
+    monkeypatch.setattr(cli, "_spawn_worker", lambda *args: 130)
+    assert (
+        cli.hardware(tmp_path, config, "meshcore:lxmf", "a", str(tmp_path / "runs"))
+        == 130
+    )
+    run = next((tmp_path / "runs").iterdir())
+    assert json.loads((run / "verdict.json").read_text())["exit_code"] == 130
+
+
+def test_baseline_produced_capture_reopens_without_synthetic_head(
+    tmp_path, monkeypatch, fast_polls
+):
+    state = {"connected": True, "reconnecting": False}
+    first = StubApp(diagnostics=scripted_session(tmp_path, state))
+    baseline = Harness(monkeypatch, first, tmp_path)
+    assert run_async(
+        lambda: continuity.run_baseline(stub_config(), "meshcore:lxmf", 0, tmp_path, 5)
+    )
+    captured = continuity._read_state(tmp_path)["pending_capture"]
+    pending = captured["pending"]["nonce"]
+    uncertain = captured["uncertain"]["nonce"]
+    assert captured["stopped"]["uncertain"]["events"][0]["outbox"][0]["radio_attempts"]
+
+    def on_start():
+        con = baseline.con
+        con.execute(
+            "UPDATE delivery_outbox SET status='sent', attempt_number=1 WHERE event_id=?",
+            (f"ev-{pending}",),
+        )
+        con.execute(
+            "INSERT INTO delivery_receipts (receipt_id, outbox_id, event_id, target_adapter, status) VALUES (?, ?, ?, 'meshcore', 'sent')",
+            (f"rc-{pending}", f"ob-{pending}", f"ev-{pending}"),
+        )
+        con.commit()
+        Harness.deliver("meshcore", pending)
+
+    second = StubApp(on_start=on_start)
+    Harness(monkeypatch, second, tmp_path)
+    assert run_async(
+        lambda: continuity.run_reopen(stub_config(), "meshcore:lxmf", 0, tmp_path)
+    )
+    verdict = json.loads((tmp_path / "reopen-verdict.json").read_text())
+    assert verdict["persisted"]["completed_identities_retained"]
+    assert verdict["disposition"]["pending_reconciled"]
+    assert verdict["uncertain_after"]["events"][0]["event_id"] == f"ev-{uncertain}"
+
+
+def test_automatic_fault_is_inside_endpoint_owner(tmp_path, monkeypatch, fast_polls):
+    state = {"connected": True, "reconnecting": False}
+    app = StubApp(diagnostics=scripted_session(tmp_path, state))
+    Harness(monkeypatch, app, tmp_path)
+    held = []
+    actions = []
+
+    @contextmanager
+    def own(endpoints):
+        held.append(True)
+        try:
+            yield
+        finally:
+            held.clear()
+
+    def disconnect(run, address, controller):
+        assert held == [True]
+        assert (run / "interrupt-armed.json").exists()
+        actions.append((address, controller))
+
+    monkeypatch.setattr(continuity, "own", own)
+    monkeypatch.setattr(continuity, "_disconnect_owned", disconnect)
+    monkeypatch.setenv("MEDRE_LAB_OWNED_MESHCORE_ADDRESS", "AA:BB:CC:DD:EE:FF")
+    assert run_async(
+        lambda: continuity.run_baseline(
+            stub_config(ble_adapter="hci1"),
+            "meshcore:lxmf",
+            0,
+            tmp_path,
+            5,
+            auto_disconnect=True,
+        )
+    )
+    assert actions == [("AA:BB:CC:DD:EE:FF", "hci1")]
+    assert held == []
+
+
+def test_cancelled_baseline_publishes_failure_and_propagates(tmp_path, monkeypatch):
+    app = StubApp()
+    Harness(monkeypatch, app, tmp_path)
+
+    async def exercise():
+        entered = asyncio.Event()
+
+        async def drain(app):
+            entered.set()
+            await asyncio.Future()
+
+        monkeypatch.setattr(worker, "wait_startup_drain_retired", drain)
+        task = asyncio.create_task(
+            continuity.run_baseline(stub_config(), "meshcore:lxmf", 0, tmp_path, 5)
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    verdict = json.loads((tmp_path / "baseline-verdict.json").read_text())
+    assert verdict["cancelled"] is True
+    assert verdict["pass"] is False
+    assert app.stopped
+
+
+def test_worker_maps_cancelled_phase_to_interrupt_exit(tmp_path, monkeypatch):
+    async def cancelled(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(continuity, "run_baseline", cancelled)
+    assert (
+        worker.main(
+            [
+                str(_lab_config(tmp_path)),
+                "meshcore:lxmf",
+                "0",
+                str(tmp_path),
+                "baseline",
+                "5",
+            ]
+        )
+        == 130
     )

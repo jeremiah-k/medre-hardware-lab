@@ -356,7 +356,7 @@ def main(argv=None):
             run_pair(load(Path(path)), pair(selection), int(role), Path(output))
         )
         return 0 if ok else 1
-    if len(args) in (5, 6):
+    if len(args) in (5, 6, 7):
         path, selection, role, output, phase = args[:5]
         from .continuity import DEFAULT_INTERRUPT_WAIT_SECONDS, run_baseline, run_reopen
 
@@ -364,18 +364,30 @@ def main(argv=None):
         run = Path(output)
         if phase == "baseline":
             interrupt_wait = (
-                float(args[5]) if len(args) == 6 else DEFAULT_INTERRUPT_WAIT_SECONDS
+                float(args[5]) if len(args) >= 6 else DEFAULT_INTERRUPT_WAIT_SECONDS
             )
-            ok = asyncio.run(
-                run_baseline(config, selection, int(role), run, interrupt_wait)
-            )
-        elif phase == "reopen":
-            ok = asyncio.run(run_reopen(config, selection, int(role), run))
+            auto_disconnect = len(args) == 7 and args[6] == "--auto-disconnect"
+            if len(args) == 7 and not auto_disconnect:
+                raise SystemExit("invalid baseline interruption argument")
+            options = {"auto_disconnect": True} if auto_disconnect else {}
+            try:
+                ok = asyncio.run(
+                    run_baseline(
+                        config, selection, int(role), run, interrupt_wait, **options
+                    )
+                )
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                return 130
+        elif phase == "reopen" and len(args) == 5:
+            try:
+                ok = asyncio.run(run_reopen(config, selection, int(role), run))
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                return 130
         else:
             raise SystemExit(f"unknown continuity phase: {phase}")
         return 0 if ok else 1
     raise SystemExit(
-        "worker requires [config pair role run] or [config pair role run phase [interrupt_wait]]"
+        "worker requires [config pair role run] or [config pair role run phase [interrupt_wait [--auto-disconnect]]]"
     )
 
 
