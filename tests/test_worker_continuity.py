@@ -172,9 +172,10 @@ def stub_config(**overrides):
 @pytest.fixture()
 def fast_polls(monkeypatch):
     monkeypatch.setattr(continuity, "_DB_POLL_INTERVAL", 0.02)
-    monkeypatch.setattr(continuity, "_HEAD_BOUNDARY_WAIT_SECONDS", 5.0)
+    monkeypatch.setattr(continuity, "_HEAD_BOUNDARY_WAIT_SECONDS", 1.0)
     monkeypatch.setattr(continuity, "RECONCILE_WAIT_SECONDS", 5.0)
     monkeypatch.setattr(continuity, "UNCERTAIN_SETTLE_WAIT_SECONDS", 2.0)
+    monkeypatch.setattr(continuity, "_SDK_CHILD_RETIRE_WAIT_SECONDS", 1.0)
 
 
 class Harness:
@@ -296,19 +297,24 @@ class Harness:
     def _concurrent_tail(self, nonce):
         """Tail lands while its sender is still retiring.
 
-        The tail's durable row appears 0.3s into the send and the sender only
-        retires 1.7s after it started. The head's scripted pacing window
-        expires 0.8s after release unless the owner was stopped before then —
-        a capture that only polls after the sender retires always loses this
-        race, a concurrent durable-state poll observes the boundary in time.
+        The tail's durable row appears almost immediately into the send, and
+        the sender only retires after a scripted teardown window. The head's
+        scripted pacing window expires just before the sender retires unless
+        the owner was stopped before then: a capture that only polls after
+        the sender retires always observes an expired window, while a
+        concurrent durable-state poll observes the boundary in time. The
+        close is causally ordered with the sender's retirement instead of
+        racing the capture on wall-clock time, so the pass/fail outcome does
+        not depend on machine load.
         """
         import time
 
         self.tail_started.set()
-        time.sleep(0.3)
+        time.sleep(0.05)
         insert_event(self.con, nonce, "meshcore", outbox_status="pending")
-        threading.Timer(0.5, self._guarded_window_close).start()
-        time.sleep(1.4)
+        time.sleep(0.9)
+        self._guarded_window_close()
+        time.sleep(0.25)
         self.tail_finished.set()
         return {"nonce": nonce}
 
@@ -323,9 +329,9 @@ class Harness:
 
         self.tail_started.set()
         self._close_head_window()
-        time.sleep(0.2)
+        time.sleep(0.05)
         insert_event(self.con, nonce, "meshcore", outbox_status="pending")
-        time.sleep(0.3)
+        time.sleep(0.1)
         self.tail_finished.set()
         return {"nonce": nonce}
 
@@ -356,7 +362,9 @@ def scripted_session(tmp_path, state):
     the rejoin completes on the next read. On success the session also
     resets its reconnect-attempt counter to zero (the real adapter's
     behavior), so the rejoin must be detected without requiring the
-    counter to stay elevated.
+    counter to stay elevated. The disconnected window is comfortably longer
+    than any plausible arming-to-first-read delay, but shorter than one
+    interrupt poll interval, so the scripted cycle costs one poll.
     """
     import time
 
@@ -367,7 +375,7 @@ def scripted_session(tmp_path, state):
         if (tmp_path / "interrupt-armed.json").exists():
             if armed_at is None:
                 armed_at = time.monotonic()
-            if time.monotonic() - armed_at < 0.7:
+            if time.monotonic() - armed_at < 0.3:
                 state.update(connected=False, reconnecting=True)
             else:
                 state.update(connected=True, reconnecting=False, reconnect_attempts=0)
@@ -479,13 +487,13 @@ def test_capture_observes_boundary_while_tail_sender_retires(
 ):
     """The pending boundary is observed during the tail send, not after it.
 
-    The scripted tail's durable row appears 0.3s into its send while the
-    sender only retires 1.7s after release, and the head's scripted pacing
-    window expires 0.8s after release unless the owner was stopped in time.
-    A capture that waited for the sender to retire before polling (the old
-    gate) always lost this race on a real link; the durable-state poll
-    observes the boundary while the send is in flight and the stop freezes
-    the head inside its pacing window.
+    The scripted tail's durable row appears immediately into its send while
+    the sender only retires after a scripted teardown window, and the head's
+    scripted pacing window expires just before the sender retires unless the
+    owner was stopped in time. A capture that waited for the sender to
+    retire before polling (the old gate) always lost this race on a real
+    link; the durable-state poll observes the boundary while the send is in
+    flight and the stop freezes the head inside its pacing window.
     """
     state = {"connected": True, "reconnect_attempts": 0, "reconnecting": False}
     app = StubApp(diagnostics=scripted_session(tmp_path, state))
@@ -493,7 +501,7 @@ def test_capture_observes_boundary_while_tail_sender_retires(
 
     ok = run_async(
         lambda: continuity.run_baseline(
-            stub_config(observation_timeout=2.0),
+            stub_config(observation_timeout=0.3),
             "meshcore:lxmf",
             0,
             tmp_path,
@@ -536,7 +544,7 @@ def test_capture_fails_honestly_when_window_expires_before_tail(
 
     ok = run_async(
         lambda: continuity.run_baseline(
-            stub_config(observation_timeout=2.0),
+            stub_config(observation_timeout=0.3),
             "meshcore:lxmf",
             0,
             tmp_path,
@@ -594,7 +602,7 @@ def test_cancelled_capture_drains_in_flight_tail_sender(
     async def scenario():
         task = asyncio.create_task(
             continuity.run_baseline(
-                stub_config(observation_timeout=5.0),
+                stub_config(observation_timeout=0.2),
                 "meshcore:lxmf",
                 0,
                 tmp_path,
