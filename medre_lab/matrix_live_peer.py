@@ -19,8 +19,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import quote, urlencode, urlsplit
 import uuid
+from urllib.parse import quote, urlencode, urlsplit
 
 __all__ = ["MatrixPeerListener", "run_matrix_send", "matrix_request"]
 

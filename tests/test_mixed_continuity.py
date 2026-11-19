@@ -876,6 +876,7 @@ def test_matrix_request_headers_redirect_and_total_deadline():
     import http.server
     import threading
     import time
+
     from medre_lab.matrix_live_peer import matrix_request
 
     calls = []

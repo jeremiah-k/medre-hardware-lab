@@ -57,6 +57,7 @@ meshcore:lxmf case are unchanged.
    matching the configured `ble_adapter` (hci0 on this bench). The worker
    checks again before disconnect. Multi-controller hosts are unsupported for
    this campaign until the owner can select and attest its controller.
+
 5. No other lab run owns the selected endpoints (endpoint locks fail fast);
    boards sit `Connected: no` at rest. A stale BLE link holds a connected
    board silent — clear it via a clean disconnect before starting.
@@ -189,6 +190,7 @@ recorded, never fabricated.
   ```
 
   Separately check that both board links are `Connected: no`.
+
 - No firmware, channel, key, bond, or clock state is written to any board
   at any point. The operator's Docker rig is left in its brought-up state.
 

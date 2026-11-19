@@ -57,6 +57,7 @@ from .continuity import (
     CONTINUITY_MESSAGE_DELAY_SECONDS,
     DEFAULT_INTERRUPT_WAIT_SECONDS,
     RECONCILE_WAIT_SECONDS,
+    _capture_nonce_state,
     _child_pids,
     _cmdline,
     _disarm_listeners,
@@ -70,7 +71,6 @@ from .continuity import (
     _uncertain_settled,
     _wait_for,
     _write_json,
-    _capture_nonce_state,
 )
 from .native.live_peer_common import async_peer_context, owned_blocking
 from .ownership import own, own_run
