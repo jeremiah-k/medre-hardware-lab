@@ -35,7 +35,7 @@ meshcore:lxmf case are unchanged.
    accounts (`campaign-m0`, `campaign-m1`, `campaign-sender`,
    `campaign-witness`) and rooms `#mixed-a` / `#mixed-b` exist, recorded in
    `<campaign>/campaign-matrix.json` (0600). The owner adapters' nio
-   crypto store lives under `<campaign>/matrix-stores/` and MUST persist
+   crypto store lives under `<campaign>/matrix-stores/` (owner-only mode 0700) and MUST persist
    across runs: a fresh store regenerates one-time keys under indices the
    homeserver already holds, and synapse 400s the re-upload
    ("One time key ... already exists"), failing adapter health with
@@ -112,15 +112,19 @@ Baseline (`mixed-baseline-verdict.json`):
    matrix0->matrix1; each with exactly one correlated far-side observation
    and a failure-free sent receipt at the destination.
 3. `link-disconnected` — worker-owned `busctl` disconnect of the owned
-   board, observed from the adapter's own diagnostics.
+   board, with successful command status and the adapter's own disconnected diagnostics.
+   The test establishes the owned action and transition, not exclusive physical causality.
 4. Fault-window burst: `burst-count` room-A messages, each fanning out to
    the healthy route (matrix1, room B) and the faulted route (meshcore
    outbox rows). The independent room-B recipient starts incremental observation before the fault and observes every
    burst nonce exactly once inside the conservatively proven disconnected
-   interval. Both observers are armed before interruption. Matrix timeline gaps
-   or missing coverage invalidate the verdict.
+   interval. Both observers are armed before interruption. Matrix timeline gaps, loss of witness membership,
+   or missing coverage invalidate the verdict. A gap-free incremental sync
+   must start and finish after the upper rejoin bound.
 5. `link-rejoined` — diagnostic polls bound the actual transition between the
-   last disconnected and first connected readings. Sightings in that uncertainty
+   last disconnected and first connected readings. The pinned MeshCore session
+   connection-change callback is observed (without replacing the original health
+   notification) to reject intervening down/up/down transitions. Sightings in that uncertainty
    interval do not qualify as in-fault or recovered evidence. The peak
    reconnect-attempt counter is evidence only (the session resets it on success).
 6. Affected-route recovery: the burst MeshCore rows reach sent receipts
@@ -169,10 +173,11 @@ retirement checks. Historical partial-recovery results cannot qualify it.
 
 The owner shells the RELEASED core's read-only CLI on a 2 s cadence into
 `work-status-series.jsonl`, phase-tagged (`baseline`, `interruption`,
-`recovery`, `pending-capture`, `reopen`): `medre inspect work-status
+`recovery`, `reopen`; sampling stops before pending capture): `medre inspect work-status
 --json` each cycle and `medre inspect pressure` every other cycle (the
 requested `medre storage status` does not exist in the 0.1.2 CLI; the
-substitution is recorded in the series header). Sampler failures are
+substitution is recorded in the series header). Work-status is written before
+pressure; pressure records carry the same cycle with `kind: pressure`. Sampler failures are
 recorded, never fabricated. The cadence is instrumentation density only:
 coverage still requires each sample to begin and finish strictly inside the
 proven interval, three per phase, and the cadence was calibrated so the
@@ -193,7 +198,18 @@ samples.
   ps -eo pid,ppid,pgid,args | awk -v pgid=<recorded-pgid> '$3 == pgid'
   ```
 
-  Separately check that both board links are `Connected: no`.
+  If verified campaign-group members remain, send `kill -INT -- -$PGID`
+  to that group, wait for retirement, then `kill -KILL -- -$PGID` only
+  if the same verified members remain. Recheck group membership before each
+  signal (PIDs/PGIDs may be reused). Do not start another owner until the group
+  is empty and the ownership locks are available.
+
+  Separately check that both configured board links are `Connected: no` with
+  `busctl get-property org.bluez /org/bluez/<hci>/dev_<AA_BB_CC_DD_EE_FF> org.bluez.Device1 Connected`.
+  If a link remains up after the group is gone, first confirm no other owner
+  has acquired it, then use the documented `busctl call … org.bluez.Device1 Disconnect`
+  on only that owned board. Verify `b false` afterward; refuse restart if the link
+  cannot be verified. Do not delete bonds or account stores.
 
 - No firmware, channel, key, bond, or clock state is written to any board
   at any point. The operator's Docker rig is left in its brought-up state.
@@ -205,6 +221,9 @@ and log paths. A-3 verdict comparisons use phase-relative monotonic offsets;
 raw phase starts retain monotonic readings, and timeline `at` fields are
 wall-clock diagnostic timestamps, not ordering authority. The phase files
 contain the individual worker identity and detailed evidence. Completed
-identities are checked by destination, allowing ordinary sibling settlement. Private evidence (native ids,
+identities are checked by destination, allowing ordinary sibling settlement.
+`final_reconciliation.outstanding` is scoped to the completed-leg inventory;
+it is not a database-wide active-outbox count. The uncertain head’s observed
+and final stopped statuses are reported separately. Private evidence (native ids,
 tokens, room ids, wire text) stays in the run directory and campaign
 files; publish only sanitized summaries.

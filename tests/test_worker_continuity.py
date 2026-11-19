@@ -134,6 +134,9 @@ class StubApp:
     def __init__(self, meshcore_diag=None, on_start=None, diagnostics=None):
         self.started = False
         self.stopped = False
+        import threading
+
+        self.stopped_signal = threading.Event()
         self.stop_drain_deadline = None
         self.events: list = []
         self.on_start = on_start
@@ -159,6 +162,7 @@ class StubApp:
 
     async def stop(self, drain_deadline=None):
         self.stopped = True
+        self.stopped_signal.set()
         self.stop_drain_deadline = drain_deadline
         self.events.append("stop")
 
@@ -312,7 +316,7 @@ class Harness:
         self.tail_started.set()
         time.sleep(0.05)
         insert_event(self.con, nonce, "meshcore", outbox_status="pending")
-        time.sleep(0.9)
+        self.app.stopped_signal.wait(5)
         self._guarded_window_close()
         time.sleep(0.25)
         self.tail_finished.set()

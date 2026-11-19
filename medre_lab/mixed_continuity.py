@@ -49,13 +49,13 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from .a3_eval import evaluate_a3
 from .config import path_from
 from .continuity import (
     CONTINUITY_MESSAGE_DELAY_SECONDS,
-    DEFAULT_INTERRUPT_WAIT_SECONDS,
     RECONCILE_WAIT_SECONDS,
     _capture_nonce_state,
     _child_pids,
@@ -326,6 +326,14 @@ def verify_controller(hw: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _private_matrix_store(path: Path) -> None:
+    """Protect persistent credentials without replacing existing account state."""
+    path.mkdir(mode=0o700, exist_ok=True)
+    if path.is_symlink() or not path.is_dir() or path.stat().st_uid != os.getuid():
+        raise MixedConfigError("Matrix store must be an operator-owned directory")
+    path.chmod(0o700)
+
+
 def build_mixed(config: dict, role: int, run: Path):
     """Assemble the mixed runtime: matrix0, matrix1, meshcore, meshtastic."""
     from medre.config.adapters.matrix import MatrixConfig
@@ -350,10 +358,14 @@ def build_mixed(config: dict, role: int, run: Path):
     matrix = config["matrix"]
     rooms = matrix["rooms"]
     accounts = matrix["accounts"]
+    store_root = Path(matrix["store_dir"])
+    _private_matrix_store(store_root)
 
     def matrix_runtime(
         adapter_id: str, room_id: str, account: dict
     ) -> MatrixRuntimeConfig:
+        store = store_root / adapter_id
+        _private_matrix_store(store)
         settings = MatrixConfig(
             adapter_id=adapter_id,
             homeserver=matrix["homeserver"],
@@ -363,7 +375,7 @@ def build_mixed(config: dict, role: int, run: Path):
             room_allowlist={room_id},
             auto_join_rooms=(room_id,),
             relay_prefix="{sender}: ",
-            store_path=str(Path(matrix["store_dir"]) / adapter_id),
+            store_path=str(store),
         ).validate()
         return MatrixRuntimeConfig(
             adapter_id=adapter_id, enabled=True, adapter_kind="real", config=settings
@@ -659,7 +671,9 @@ def _tail_pending_mixed(snapshot: dict) -> bool:
     )
 
 
-def _final_sent_mixed(snapshot: dict, adapter: str) -> bool:
+def _final_sent_mixed(
+    snapshot: dict, adapter: str, *, destination_only: bool = False
+) -> bool:
     """One sent receipt at *adapter*, one sent destination row, no permanent
     failure anywhere in the event (transient fault-window failures excluded).
 
@@ -667,7 +681,8 @@ def _final_sent_mixed(snapshot: dict, adapter: str) -> bool:
     scheduled-retry adapter failures as ``failure_kind="adapter_transient"``
     (its own retryable rule), not the bare ``"transient"`` this check
     previously assumed — that literal matches nothing and misread honest
-    fault-window retries as permanent failures.
+    fault-window retries as permanent failures. The narrow healthy binding
+    is destination-scoped; full campaign acceptance retains the event-wide gate.
     """
     rows = _rows_for(snapshot, adapter)
     sent = [
@@ -682,12 +697,15 @@ def _final_sent_mixed(snapshot: dict, adapter: str) -> bool:
         receipt
         for event in snapshot["events"]
         for receipt in event["receipts"]
-        if receipt["failure_kind"] not in (None, "adapter_transient")
-        or receipt["status"]
-        in ("dead_lettered", "denied", "cancelled", "abandoned", "suppressed")
-        or (
-            receipt["status"] == "failed"
-            and receipt["failure_kind"] != "adapter_transient"
+        if (not destination_only or receipt["target_adapter"] == adapter)
+        and (
+            receipt["failure_kind"] not in (None, "adapter_transient")
+            or receipt["status"]
+            in ("dead_lettered", "denied", "cancelled", "abandoned", "suppressed")
+            or (
+                receipt["status"] == "failed"
+                and receipt["failure_kind"] != "adapter_transient"
+            )
         )
     ]
     return (
@@ -711,9 +729,13 @@ def _final_sent_mixed(snapshot: dict, adapter: str) -> bool:
 
 
 def _mixed_receipt_identity(
-    snapshot: dict, adapter: str, *, outbox_id: str | None = None
+    snapshot: dict,
+    adapter: str,
+    *,
+    outbox_id: str | None = None,
+    destination_only: bool = False,
 ) -> tuple[str, str] | None:
-    if not _final_sent_mixed(snapshot, adapter):
+    if not _final_sent_mixed(snapshot, adapter, destination_only=destination_only):
         return None
     row = _single_row(snapshot, adapter)
     if outbox_id is not None and row["outbox_id"] != outbox_id:
@@ -727,6 +749,26 @@ def _mixed_receipt_identity(
         and r["status"] == "sent"
     )
     return event["event_id"], receipt["receipt_id"]
+
+
+def _affected_recovery_outcome(burst, generation, snapshots, delivered_after) -> str:
+    """Classify using the final durable snapshot and independent sightings.
+
+    A receipt that settled during the observation window counts; the earlier
+    wait is only a pacing aid, not the verdict authority.
+    """
+    if burst and sorted(delivered_after) == sorted(burst):
+        for nonce, snapshot in zip(burst, snapshots, strict=True):
+            binding = generation[nonce]
+            outbox_id = binding["dest_outbox_ids"].get(MESH_ADAPTER)
+            identity = _mixed_receipt_identity(
+                snapshot, MESH_ADAPTER, outbox_id=outbox_id
+            )
+            if not outbox_id or identity is None or identity[0] != binding["event_id"]:
+                break
+        else:
+            return "all_delivered"
+    return "partial" if delivered_after else "not_delivered"
 
 
 def _completed_evidence(snapshot: dict, adapter: str) -> dict:
@@ -805,16 +847,20 @@ async def _sample_command(argv: list[str]):
 async def _retire_task(task, result: dict, name: str) -> None:
     if task is None:
         return
+    worker = asyncio.current_task()
     task.cancel()
     while not task.done():
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
-            if not task.done():
+            if worker is not None and worker.cancelling():
                 result["cancelled"] = True
                 result["pass"] = False
         except Exception:
             break
+    if worker is not None and worker.cancelling():
+        result["cancelled"] = True
+        result["pass"] = False
     if not task.cancelled():
         try:
             task.result()
@@ -826,8 +872,8 @@ async def _retire_task(task, result: dict, name: str) -> None:
 async def run_sampler(run: Path, db: Path, phases: dict, interval: float) -> None:
     """Shell the released core's read-only inspection CLI on a cadence.
 
-    One JSONL line per sample: phase, phase-relative offset, the work-status
-    document, and (every other cycle) the pressure aggregates that stand in
+    One JSONL line per work-status sample, followed by a separate optional
+    pressure record with the same cycle. Pressure aggregates stand in
     for the requested ``medre storage status`` (no such command exists in the
     released 0.1.2 CLI; the substitution is recorded here and in the
     verdict). Sampler failures are recorded and skipped — one failed shell
@@ -878,16 +924,23 @@ async def run_sampler(run: Path, db: Path, phases: dict, interval: float) -> Non
             sample["completed_monotonic"] = time.monotonic()
         except Exception as exc:  # noqa: BLE001 - record, never fabricate
             sample["error"] = type(exc).__name__ + ": " + str(exc)[-200:]
+        with path.open("a") as stream:
+            stream.write(json.dumps(sample, default=str) + "\n")
         if cycle % 2 == 0:
+            pressure_record = {
+                "cycle": cycle,
+                "phase": sample["phase"],
+                "kind": "pressure",
+            }
             try:
                 pressure = await _sample_command(
                     [str(medre), "inspect", "pressure", "--storage-path", str(db)],
                 )
-                sample["pressure"] = json.loads(pressure.stdout)
+                pressure_record["pressure"] = json.loads(pressure.stdout)
             except Exception as exc:  # noqa: BLE001
-                sample["pressure_error"] = type(exc).__name__
-        with path.open("a") as stream:
-            stream.write(json.dumps(sample, default=str) + "\n")
+                pressure_record["pressure_error"] = type(exc).__name__
+            with path.open("a") as stream:
+                stream.write(json.dumps(pressure_record, default=str) + "\n")
         cycle += 1
         await asyncio.sleep(max(0.0, interval - (time.monotonic() - started)))
 
@@ -895,6 +948,11 @@ async def run_sampler(run: Path, db: Path, phases: dict, interval: float) -> Non
 # ---------------------------------------------------------------------------
 # Shared phase helpers
 # ---------------------------------------------------------------------------
+
+
+def _phase_error(exc: BaseException, limit: int = 1600) -> str:
+    details = [str(exc), *getattr(exc, "__notes__", ())]
+    return type(exc).__name__ + ": " + "; ".join(detail[-limit:] for detail in details)
 
 
 async def _arm(listeners: dict, selected: dict, lifetime: float) -> dict:
@@ -905,8 +963,11 @@ async def _arm(listeners: dict, selected: dict, lifetime: float) -> dict:
             peer = await cm.__aenter__()
             armed[kind] = {"cm": cm, "peer": peer}
         return armed
-    except BaseException:
-        await _disarm_listeners(armed)
+    except BaseException as primary:
+        try:
+            await _disarm_listeners(armed)
+        except Exception as cleanup:
+            primary.add_note(f"partially armed peer cleanup: {cleanup}")
         raise
 
 
@@ -1150,7 +1211,37 @@ async def _fault_action(app, run: Path, hw: dict, timeline: list) -> dict:
     return evidence
 
 
-async def _observe_rejoin(adapter, timeout: float, timeline: list, phases: dict):
+@contextmanager
+def _observe_mesh_transitions(adapter):
+    """Latch actual transitions through the pinned session's callback seam.
+
+    ba12d4d publishes every connected-state change synchronously via
+    _on_connection_change. Preserve the original health publisher; polling
+    alone cannot distinguish a down/up/down cycle between samples.
+    """
+    session = getattr(adapter, "_session", None)
+    original = getattr(session, "_on_connection_change", None)
+    if session is None or not callable(original) or not session.connected:
+        raise RuntimeError("pinned MeshCore connection transition seam unavailable")
+    transitions = []
+
+    def capture(connected):
+        transitions.append((connected, time.monotonic()))
+        original(connected)
+
+    session._on_connection_change = capture
+    try:
+        yield transitions
+    finally:
+        if session._on_connection_change is capture:
+            session._on_connection_change = original
+        if adapter._session is not session:
+            raise RuntimeError("MeshCore owner changed during fault observation")
+
+
+async def _observe_rejoin(
+    adapter, timeout: float, timeline: list, phases: dict, transitions: list
+):
     """Poll the session diagnostics until the first connected observation.
 
     The MeshCore session resets its reconnect-attempt counter to zero on
@@ -1162,17 +1253,25 @@ async def _observe_rejoin(adapter, timeout: float, timeline: list, phases: dict)
     peak = 0
     last_disconnected = None
     while True:
+        before_read = _phase_offset(timeline)
         diag = _session_diag(adapter)
+        states = [connected for connected, _ in transitions]
+        if states not in ([False], [False, True]):
+            raise RuntimeError(
+                "MeshCore fault transition sequence was not one continuous outage"
+            )
         try:
             peak = max(peak, int(diag.get("reconnect_attempts") or 0))
         except (TypeError, ValueError):
             pass
         if diag.get("connected") is True and diag.get("reconnecting") is False:
+            if states != [False, True]:
+                raise RuntimeError("MeshCore rejoin missing transition evidence")
             upper = _phase_offset(timeline)
             phases.update(current="recovery", phase_started_monotonic=time.monotonic())
             return upper, peak, last_disconnected
-        if diag.get("connected") is False:
-            last_disconnected = _phase_offset(timeline)
+        if diag.get("connected") is False and states == [False]:
+            last_disconnected = before_read
         if time.monotonic() - started > timeout:
             raise RuntimeError("meshcore session did not rejoin after the burst")
         await asyncio.sleep(0.5)
@@ -1183,19 +1282,25 @@ async def run_mixed_baseline(
     role: int,
     run: Path,
     burst_count: int = 3,
-    interrupt_wait: float = DEFAULT_INTERRUPT_WAIT_SECONDS,
 ) -> bool:
     """Baseline owner phase: healthy legs, MeshCore fault, in-window proof."""
 
     if role not in (0, 1):
         raise ValueError("invalid mixed owner role")
-    if not math.isfinite(interrupt_wait) or interrupt_wait <= 0:
-        raise ValueError("interrupt_wait must be finite and positive")
     if not 1 <= int(burst_count) <= 6:
         raise ValueError("burst_count must be between 1 and 6")
     burst_count = int(burst_count)
     with own_run(run):
-        if (run / "continuity-state.json").exists():
+        if any(
+            (run / name).exists() or (run / name).is_symlink()
+            for name in (
+                "continuity-state.json",
+                "state.sqlite",
+                "state.sqlite-wal",
+                "state.sqlite-shm",
+                "state.sqlite-journal",
+            )
+        ):
             raise RuntimeError("baseline requires a fresh run directory")
         listeners, senders, destinations, endpoints = configure_mixed(config, role, run)
         with own(endpoints):
@@ -1348,26 +1453,36 @@ async def _run_mixed_baseline_owned(
 
         witness_task = asyncio.create_task(collect_witness())
         phases.update(current="interruption", phase_started_monotonic=time.monotonic())
-        result["interrupt"] = await _fault_action(app, run, hw, timeline)
-        rejoin_watch = asyncio.create_task(
-            _observe_rejoin(
-                app.adapters[MESH_ADAPTER],
-                hw["startup_timeout"] + 300.0,
-                timeline,
-                phases,
+        with _observe_mesh_transitions(app.adapters[MESH_ADAPTER]) as transitions:
+            result["interrupt"] = await _fault_action(app, run, hw, timeline)
+            rejoin_watch = asyncio.create_task(
+                _observe_rejoin(
+                    app.adapters[MESH_ADAPTER],
+                    hw["startup_timeout"] + 300.0,
+                    timeline,
+                    phases,
+                    transitions,
+                )
             )
-        )
-        burst = [_nonce() for _ in range(burst_count)]
-        posted = {}
-        for nonce in burst:
-            sent = await owned_blocking(senders[HEALTHY_SOURCE], nonce)
-            posted[nonce] = {
-                "posted_offset": _phase_offset(timeline),
-                "send_event_id": sent.get("event_id"),
-            }
-        timeline.append({"stage": "fault-window-burst", "at": _now()})
-        rejoin_offset, rejoin_peak, last_disconnected = await rejoin_watch
-        rejoin_watch = None
+            burst = [_nonce() for _ in range(burst_count)]
+            posted = {}
+            for nonce in burst:
+                sent = await owned_blocking(senders[HEALTHY_SOURCE], nonce)
+                posted[nonce] = {
+                    "posted_offset": _phase_offset(timeline),
+                    "send_event_id": sent.get("event_id"),
+                }
+            timeline.append({"stage": "fault-window-burst", "at": _now()})
+            rejoin_offset, rejoin_peak, last_disconnected = await rejoin_watch
+            rejoin_watch = None
+            if [connected for connected, _ in transitions] != [False, True]:
+                raise RuntimeError(
+                    "MeshCore rejoined and lost its link again during the burst"
+                )
+            result["interrupt"]["connection_transitions"] = [
+                {"connected": connected, "offset": stamp - timeline[0]["monotonic"]}
+                for connected, stamp in transitions
+            ]
         if (
             last_disconnected is None
             or last_disconnected <= result["interrupt"]["disconnect_offset"]
@@ -1377,7 +1492,7 @@ async def _run_mixed_baseline_owned(
         # Wait for a successful cursor advance after the upper transition bound.
         ok, _ = await _wait_for(
             lambda: witness_task.done()
-            or (witness.last_sync_monotonic or 0) > anchor + rejoin_offset,
+            or (witness.last_sync_started_monotonic or 0) > anchor + rejoin_offset,
             FAULT_WINDOW_WITNESS_WAIT_SECONDS,
             0.1,
         )
@@ -1458,7 +1573,7 @@ async def _run_mixed_baseline_owned(
                 "observations": unaffected_obs,
                 "coverage_complete": witness.ready_monotonic
                 < anchor + result["interrupt"]["disconnect_offset"]
-                and witness.last_sync_monotonic > anchor + rejoin_offset,
+                and witness.last_sync_started_monotonic > anchor + rejoin_offset,
             },
             "affected": {
                 "manifest": [
@@ -1487,7 +1602,7 @@ async def _run_mixed_baseline_owned(
                 _final_sent_mixed(snapshot, MESH_ADAPTER) for snapshot in snapshots
             )
 
-        ok, waited = await _wait_for(affected_settled, FAULT_RECOVERY_WAIT_SECONDS, 0.2)
+        _, waited = await _wait_for(affected_settled, FAULT_RECOVERY_WAIT_SECONDS, 0.2)
         recovery_packets = await owned_blocking(
             _observe_window, mesh_peer, FAULT_RECOVERY_OBSERVE_SECONDS
         )
@@ -1525,14 +1640,14 @@ async def _run_mixed_baseline_owned(
             for p in mesh_sightings
             if p["observed_offset"] is not None and p["observed_offset"] > rejoin_offset
         )
+        final_snapshots = capture_nonce_states(db, *burst)
+        recovery_outcome = _affected_recovery_outcome(
+            burst, generation, final_snapshots, delivered_after
+        )
         result["a3"]["affected"].update(
             {
                 "post_rejoin_delivered_nonces": delivered_after,
-                "post_rejoin_outcome": (
-                    "all_delivered"
-                    if ok and delivered_after == sorted(burst)
-                    else "partial" if delivered_after else "not_delivered"
-                ),
+                "post_rejoin_outcome": recovery_outcome,
                 "observations_during_fault": during_fault,
                 "coverage_complete": mesh_ready
                 < anchor + result["interrupt"]["disconnect_offset"]
@@ -1544,7 +1659,6 @@ async def _run_mixed_baseline_owned(
 
         # Correlate independently observed room-B event IDs and actual ingress
         # event IDs to the original durable generations, not nonce text alone.
-        final_snapshots = capture_nonce_states(db, *burst)
         for nonce, snapshot in zip(burst, final_snapshots, strict=True):
             binding = generation[nonce]
             binding["matrix_ingress_event_id"] = posted[nonce]["send_event_id"]
@@ -1564,6 +1678,7 @@ async def _run_mixed_baseline_owned(
                 snapshot,
                 HEALTHY_DEST,
                 outbox_id=binding["dest_outbox_ids"].get(HEALTHY_DEST),
+                destination_only=True,
             )
             if identity is not None and binding["dest_outbox_ids"].get(HEALTHY_DEST):
                 receipt = next(
@@ -1583,6 +1698,7 @@ async def _run_mixed_baseline_owned(
                 "disconnect_offset": result["interrupt"].get("disconnect_offset"),
                 "rejoin_offset": result["interrupt"].get("rejoin_offset"),
                 "last_disconnected_offset": last_disconnected,
+                "connection_transitions": result["interrupt"]["connection_transitions"],
             },
             "unaffected": result["a3"]["unaffected"],
             "affected": result["a3"]["affected"],
@@ -1658,7 +1774,7 @@ async def _run_mixed_baseline_owned(
             and not _child_pids()
         )
     except BaseException as exc:
-        result["error"] = type(exc).__name__ + ": " + str(exc)[-1600:]
+        result["error"] = _phase_error(exc)
         result["cancelled"] = bool(result.get("cancelled")) or isinstance(
             exc, asyncio.CancelledError
         )
@@ -1676,16 +1792,12 @@ async def _run_mixed_baseline_owned(
                 app = None
                 result["stop_on_error"] = True
         except BaseException as cleanup_error:
-            result["cleanup_error"] = (
-                type(cleanup_error).__name__ + ": " + str(cleanup_error)[-800:]
-            )
+            result["cleanup_error"] = _phase_error(cleanup_error, 800)
         finally:
             try:
                 await _disarm_listeners(armed)
             except BaseException as cleanup_error:
-                result["peer_cleanup_error"] = (
-                    type(cleanup_error).__name__ + ": " + str(cleanup_error)[-800:]
-                )
+                result["peer_cleanup_error"] = _phase_error(cleanup_error, 800)
         if isinstance(exc, asyncio.CancelledError):
             raise
     finally:
@@ -2002,6 +2114,13 @@ async def _run_mixed_reopen_owned(config, role, run, listeners, senders) -> bool
                 "pending replay durable state changed after observation"
             )
         result["uncertain_after"] = capture_nonce_state(db, uncertain_nonce)
+        result["uncertain_final_statuses"] = sorted(
+            {
+                row["status"]
+                for event in result["uncertain_after"]["events"]
+                for row in event["outbox"]
+            }
+        )
 
         # The final stopped snapshot matches all completed deliveries.
         outstanding = []
@@ -2010,6 +2129,7 @@ async def _run_mixed_reopen_owned(config, role, run, listeners, senders) -> bool
             if _mixed_receipt_identity(snapshot, leg["destination"]) is None:
                 outstanding.append(leg["nonce"])
         result["final_reconciliation"] = {
+            "scope": "completed_legs",
             "completed_count": len(all_completed),
             "outstanding": outstanding,
             "final_snapshot_matches_completed": not outstanding,
@@ -2025,7 +2145,7 @@ async def _run_mixed_reopen_owned(config, role, run, listeners, senders) -> bool
             and not _child_pids()
         )
     except BaseException as exc:
-        result["error"] = type(exc).__name__ + ": " + str(exc)[-1600:]
+        result["error"] = _phase_error(exc)
         result["cancelled"] = bool(result.get("cancelled")) or isinstance(
             exc, asyncio.CancelledError
         )
@@ -2037,16 +2157,12 @@ async def _run_mixed_reopen_owned(config, role, run, listeners, senders) -> bool
                 await teardown_owner_mixed(app, result, armed)
                 result["stop_on_error"] = True
         except BaseException as cleanup_error:
-            result["cleanup_error"] = (
-                type(cleanup_error).__name__ + ": " + str(cleanup_error)[-800:]
-            )
+            result["cleanup_error"] = _phase_error(cleanup_error, 800)
         finally:
             try:
                 await _disarm_listeners(armed)
             except BaseException as cleanup_error:
-                result["peer_cleanup_error"] = (
-                    type(cleanup_error).__name__ + ": " + str(cleanup_error)[-800:]
-                )
+                result["peer_cleanup_error"] = _phase_error(cleanup_error, 800)
         if isinstance(exc, asyncio.CancelledError):
             raise
     finally:
@@ -2133,7 +2249,7 @@ async def _disposition_mixed(
         "uncertain_after": uncertain_after,
         "uncertain_progressed": _mixed_receipt_identity(uncertain_after, MESH_ADAPTER)
         is not None,
-        "uncertain_final_statuses": sorted(
+        "uncertain_observed_statuses": sorted(
             {
                 row["status"]
                 for event in uncertain_after["events"]

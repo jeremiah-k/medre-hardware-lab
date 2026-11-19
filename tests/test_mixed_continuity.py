@@ -300,6 +300,10 @@ def passing_transcript() -> dict:
             "disconnect_offset": 100.0,
             "rejoin_offset": 140.0,
             "last_disconnected_offset": 139.5,
+            "connection_transitions": [
+                {"connected": False, "offset": 99.9},
+                {"connected": True, "offset": 139.8},
+            ],
         },
         "unaffected": {
             "manifest": [
@@ -396,10 +400,10 @@ def test_regression_healthy_traffic_only_after_rejoin_fails():
     transcript = passing_transcript()
     # Healthy deliveries land only after the MeshCore rejoin: the exact gap
     # this campaign exists to close must FAIL, not pass.
-    transcript["unaffected"]["observations"] = [
-        {"nonce": "N1", "observed_offset": 141.5},
-        {"nonce": "N2", "observed_offset": 142.1},
-    ]
+    for observation, offset in zip(
+        transcript["unaffected"]["observations"], (141.5, 142.1), strict=True
+    ):
+        observation["observed_offset"] = offset
     verdict = evaluate_a3(transcript)
     assert verdict["pass"] is False
     assert "healthy_route_delivered_inside_declared_window" in verdict["failed"]
@@ -488,7 +492,7 @@ def stub_sync(monkeypatch, pages):
         if path.endswith("/whoami"):
             return {"user_id": "@w:x"}
         if "_matrix/client/v3/sync?timeout=0" in path:
-            return {"next_batch": "s0"}
+            return {"next_batch": "s0", "rooms": {"join": {"!b:x": {}}}}
         index = len([c for c in calls if "since=" in c]) - 1
         return pages[min(index, len(pages) - 1)]
 
@@ -907,6 +911,7 @@ def test_matrix_request_headers_redirect_and_total_deadline():
     from medre_lab.matrix_live_peer import matrix_request
 
     calls = []
+    slow_started = threading.Event()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -938,6 +943,7 @@ def test_matrix_request_headers_redirect_and_total_deadline():
                     for _ in range(20):
                         self.wfile.write(b" ")
                         self.wfile.flush()
+                        slow_started.set()
                         time.sleep(0.1)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
@@ -958,9 +964,262 @@ def test_matrix_request_headers_redirect_and_total_deadline():
         assert [call[0] for call in calls] == ["/_matrix/send", "/_matrix/redirect"]
         start = time.monotonic()
         with pytest.raises(TimeoutError):
-            matrix_request(origin, "GET", "/_matrix/slow", token="secret", timeout=0.5)
-        assert time.monotonic() - start < 1.5
+            matrix_request(origin, "GET", "/_matrix/slow", token="secret", timeout=1.0)
+        assert slow_started.is_set()
+        assert time.monotonic() - start < 2.0
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+@pytest.mark.parametrize("value", [None, {}, ""])
+def test_missing_affected_silence_evidence_is_not_a_pass(value):
+    transcript = passing_transcript()
+    transcript["affected"]["observations_during_fault"] = value
+    assert "affected_route_silent_during_fault" in evaluate_a3(transcript)["failed"]
+
+
+@pytest.mark.parametrize(
+    "outcome, sightings, expected",
+    [
+        ("not_delivered", ["N1"], False),
+        ("not_delivered", [], True),
+        ("partial", [], False),
+        ("partial", ["N1", "N2"], True),
+    ],
+)
+def test_affected_outcomes_match_sightings(outcome, sightings, expected):
+    transcript = passing_transcript()
+    transcript["affected"].update(
+        post_rejoin_outcome=outcome, post_rejoin_delivered_nonces=sightings
+    )
+    assert evaluate_a3(transcript)["pass"] is expected
+
+
+def test_transient_rejoin_cannot_extend_first_fault():
+    transcript = passing_transcript()
+    transcript["fault"]["connection_transitions"].insert(
+        1, {"connected": True, "offset": 101.0}
+    )
+    transcript["fault"]["connection_transitions"].insert(
+        2, {"connected": False, "offset": 102.0}
+    )
+    assert "fault_actually_occurred" in evaluate_a3(transcript)["failed"]
+
+
+async def test_connection_hook_preserves_health_callback_and_rejects_intervening_rejoin():
+    import time
+    from types import SimpleNamespace
+
+    notifications = []
+    session = SimpleNamespace(
+        connected=True, _on_connection_change=notifications.append
+    )
+    original = session._on_connection_change
+    adapter = SimpleNamespace(
+        _session=session, diagnostics=lambda: {"session": {"connected": False}}
+    )
+    with mixed_continuity._observe_mesh_transitions(adapter) as transitions:
+        for connected in (False, True, False):
+            session._on_connection_change(connected)
+        assert notifications == [False, True, False]
+        with pytest.raises(RuntimeError, match="continuous outage"):
+            await mixed_continuity._observe_rejoin(
+                adapter, 0.1, [{"monotonic": time.monotonic()}], {}, transitions
+            )
+    assert session._on_connection_change is original
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"rooms": {"leave": {"!b:x": {}}}},
+        {
+            "rooms": {
+                "join": {
+                    "!b:x": {
+                        "timeline": {
+                            "events": [
+                                {
+                                    "type": "m.room.member",
+                                    "state_key": "@w:x",
+                                    "content": {"membership": "leave"},
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+    ],
+)
+def test_witness_departure_invalidates_coverage(monkeypatch, response):
+    stub_sync(monkeypatch, [{"next_batch": "s1", **response}])
+    with MatrixPeerListener("http://x", "tok", ("!b:x",), "@w:x") as listener:
+        with pytest.raises(AssertionError, match="lost campaign room membership"):
+            listener.packets_until(lambda _: False, 0.1)
+        assert listener.last_sync_started_monotonic is None
+
+
+def test_witness_requires_joined_rooms_on_arm(monkeypatch):
+    stub_sync(monkeypatch, [])
+    with pytest.raises(AssertionError, match="not joined"):
+        MatrixPeerListener("http://x", "tok", ("!a:x", "!b:x"), "@w:x").__enter__()
+
+
+def test_witness_omitted_room_is_not_departure(monkeypatch):
+    stub_sync(monkeypatch, [{"next_batch": "s1"}])
+    with MatrixPeerListener("http://x", "tok", ("!b:x",), "@w:x") as listener:
+        assert listener.packets_until(lambda _: True, 0.1) == []
+        assert (
+            listener.ready_monotonic
+            <= listener.last_sync_started_monotonic
+            <= listener.last_sync_monotonic
+        )
+
+
+def test_existing_matrix_store_is_made_private_without_reset(tmp_path):
+    import stat
+
+    store = tmp_path / "matrix-stores"
+    store.mkdir(mode=0o755)
+    data = store / "native.db"
+    data.write_bytes(b"existing state")
+    mixed_continuity._private_matrix_store(store)
+    assert stat.S_IMODE(store.stat().st_mode) == 0o700
+    assert data.read_bytes() == b"existing state"
+    link = tmp_path / "alias"
+    link.symlink_to(store, target_is_directory=True)
+    with pytest.raises(mixed_continuity.MixedConfigError):
+        mixed_continuity._private_matrix_store(link)
+
+
+async def test_baseline_refuses_existing_state_without_baseline_verdict(tmp_path):
+    (tmp_path / "state.sqlite").write_bytes(b"retained")
+    with pytest.raises(RuntimeError, match="fresh run"):
+        await mixed_continuity.run_mixed_baseline({}, 0, tmp_path)
+    assert (tmp_path / "state.sqlite").read_bytes() == b"retained"
+
+
+async def test_sampler_publishes_work_before_pressure_retires(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    pressure_started = asyncio.Event()
+    dispose = asyncio.Event()
+
+    async def command(argv):
+        if "pressure" in argv:
+            pressure_started.set()
+            await dispose.wait()
+        return SimpleNamespace(stdout="{}")
+
+    monkeypatch.setattr(mixed_continuity, "_medre_binary", lambda: Path("medre"))
+    monkeypatch.setattr(mixed_continuity, "_sample_command", command)
+    task = asyncio.create_task(
+        mixed_continuity.run_sampler(
+            tmp_path, tmp_path / "state.sqlite", {"current": "recovery"}, 2
+        )
+    )
+    try:
+        await asyncio.wait_for(pressure_started.wait(), 3)
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "work-status-series.jsonl").read_text().splitlines()
+        ]
+        assert records[-1]["ok"] is True
+        assert records[-1]["cycle"] == 0
+    finally:
+        await mixed_continuity._retire_task(task, {}, "sampler")
+
+
+async def test_worker_cancellation_during_sampler_retirement_is_recorded():
+    import asyncio
+
+    retiring = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def sampler():
+        try:
+            await asyncio.Future()
+        finally:
+            retiring.set()
+            await finish.wait()
+
+    task = asyncio.create_task(sampler())
+    await asyncio.sleep(0)
+    result = {"pass": True}
+    worker = asyncio.create_task(mixed_continuity._retire_task(task, result, "sampler"))
+    await asyncio.wait_for(retiring.wait(), 2)
+    finish.set()
+    worker.cancel()
+    await worker
+    assert result["cancelled"] is True and result["pass"] is False
+    assert task.done()
+
+
+def test_healthy_receipt_binding_excludes_affected_permanent_failure(db):
+    con, _ = db
+    insert_event(
+        con,
+        "n-healthy",
+        {
+            "matrix1": {"outbox_id": "ob-b", "status": "sent", "attempt_number": 1},
+            "meshcore": {"outbox_id": "ob-m", "status": "dead_lettered"},
+        },
+        receipts=[
+            ("matrix1", "ob-b", "sent", None),
+            ("meshcore", "ob-m", "failed", "exhausted"),
+        ],
+    )
+    snapshot = mixed_continuity.capture_nonce_state(_db_path(con), "n-healthy")
+    assert (
+        mixed_continuity._mixed_receipt_identity(
+            snapshot, "matrix1", outbox_id="ob-b", destination_only=True
+        )
+        is not None
+    )
+    assert (
+        mixed_continuity._mixed_receipt_identity(snapshot, "matrix1", outbox_id="ob-b")
+        is None
+    )
+
+
+def test_affected_recovery_uses_final_exact_receipts_not_earlier_wait(db):
+    con, _ = db
+    insert_event(con, "late", {"meshcore": {"outbox_id": "ob-m", "status": "pending"}})
+    binding = {"late": {"event_id": "ev-late", "dest_outbox_ids": {"meshcore": "ob-m"}}}
+    before = mixed_continuity.capture_nonce_state(_db_path(con), "late")
+    assert (
+        mixed_continuity._affected_recovery_outcome(
+            ["late"], binding, [before], ["late"]
+        )
+        == "partial"
+    )
+    con.execute(
+        "UPDATE delivery_outbox SET status='sent',attempt_number=1,receipt_id='late-sent' WHERE outbox_id='ob-m'"
+    )
+    # Match the real durable identity columns, not just the destination name.
+    con.execute(
+        "INSERT INTO delivery_receipts (receipt_id,event_id,target_adapter,status,failure_kind,outbox_id,delivery_plan_id,target_channel,attempt_number,receipt_kind) SELECT 'late-sent',event_id,target_adapter,'sent',NULL,outbox_id,delivery_plan_id,target_channel,attempt_number,'attempt' FROM delivery_outbox WHERE outbox_id='ob-m'"
+    )
+    con.commit()
+    after = mixed_continuity.capture_nonce_state(_db_path(con), "late")
+    assert (
+        mixed_continuity._affected_recovery_outcome(
+            ["late"], binding, [after], ["late"]
+        )
+        == "all_delivered"
+    )
+    assert (
+        mixed_continuity._affected_recovery_outcome(["late"], binding, [after], [])
+        == "not_delivered"
+    )
+    binding["late"]["dest_outbox_ids"]["meshcore"] = "other"
+    assert (
+        mixed_continuity._affected_recovery_outcome(
+            ["late"], binding, [after], ["late"]
+        )
+        == "partial"
+    )

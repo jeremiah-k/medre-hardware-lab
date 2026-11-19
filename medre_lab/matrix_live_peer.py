@@ -163,6 +163,7 @@ class MatrixPeerListener:
         self._closed = False
         self.ready_monotonic: float | None = None
         self.last_sync_monotonic: float | None = None
+        self.last_sync_started_monotonic: float | None = None
         # Observability parity with the native peers: no owned child process.
         self._owner = None
 
@@ -184,6 +185,9 @@ class MatrixPeerListener:
             "/_matrix/client/v3/sync?timeout=0&filter=%7B%22room%22%3A%7B%22timeline%22%3A%7B%22limit%22%3A1%7D%7D%7D",
             token=self._token,
         )
+        joined = (body.get("rooms") or {}).get("join") or {}
+        if not self._room_ids.issubset(joined):
+            raise AssertionError("Matrix witness is not joined to every campaign room")
         self._since = body.get("next_batch")
         if not isinstance(self._since, str) or not self._since:
             raise ValueError("Matrix initial sync lacks a cursor")
@@ -196,14 +200,25 @@ class MatrixPeerListener:
 
     def _collect(self, body: dict) -> None:
         observed = time.monotonic()
-        join = (body.get("rooms") or {}).get("join") or {}
+        rooms = body.get("rooms") or {}
+        if self._room_ids.intersection(rooms.get("leave") or {}):
+            raise AssertionError("Matrix witness lost campaign room membership")
+        join = rooms.get("join") or {}
         for room_id, room in join.items():
             if room_id not in self._room_ids:
                 continue
             timeline = room.get("timeline") or {}
             if timeline.get("limited") is True:
                 raise AssertionError("Matrix witness timeline gap in campaign room")
-            for event in timeline.get("events") or []:
+            events = timeline.get("events") or []
+            for event in ((room.get("state") or {}).get("events") or []) + events:
+                if (
+                    event.get("type") == "m.room.member"
+                    and event.get("state_key") == self._user_id
+                    and (event.get("content") or {}).get("membership") != "join"
+                ):
+                    raise AssertionError("Matrix witness lost campaign room membership")
+            for event in events:
                 event_id = event.get("event_id")
                 if (
                     event.get("type") != "m.room.message"
@@ -238,6 +253,7 @@ class MatrixPeerListener:
             # Reserve time for response parsing rather than giving each
             # long poll a fresh timeout past the observation deadline.
             slice_ms = max(0, min(_SYNC_SLICE_MS, int(remaining * 500)))
+            sync_started = time.monotonic()
             try:
                 body = matrix_request(
                     self._homeserver,
@@ -257,6 +273,7 @@ class MatrixPeerListener:
             self._collect(body)
             self._since = cursor
             self.last_sync_monotonic = time.monotonic()
+            self.last_sync_started_monotonic = sync_started
             if predicate(self._packets):
                 break
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))

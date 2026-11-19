@@ -41,11 +41,28 @@ def _fault_checks(fault: dict) -> list[dict]:
     disconnect = fault.get("disconnect_offset")
     rejoin = fault.get("rejoin_offset")
     last_down = fault.get("last_disconnected_offset")
+    transitions = fault.get("connection_transitions")
+    continuous = (
+        isinstance(transitions, list)
+        and len(transitions) == 2
+        and all(
+            isinstance(entry, dict) and _offset(entry.get("offset"))
+            for entry in transitions
+        )
+        and transitions[0].get("connected") is False
+        and transitions[1].get("connected") is True
+    )
     windowed = (
         _offset(disconnect)
         and _offset(rejoin)
         and _offset(last_down)
         and disconnect < last_down <= rejoin
+        and continuous
+        and transitions[0]["offset"]
+        <= disconnect
+        < last_down
+        < transitions[1]["offset"]
+        <= rejoin
     )
     owned = (
         isinstance(action, str)
@@ -59,6 +76,7 @@ def _fault_checks(fault: dict) -> list[dict]:
             {
                 "occurred": occurred,
                 "windowed": windowed,
+                "continuous_transition_evidence": continuous,
                 "action": action,
                 "reason": (
                     "no disconnect/rejoin pair was observed"
@@ -135,7 +153,7 @@ def _window_checks(unaffected: dict, disconnect: float, rejoin: float) -> list[d
                 "first_healthy_offset": min(
                     (min(o) for o in inside.values()), default=None
                 ),
-                "rejoin_offset": rejoin,
+                "last_disconnected_offset": rejoin,
             },
         ),
     ]
@@ -152,14 +170,18 @@ def _affected_checks(affected: dict, disconnect: float, rejoin: float) -> list[d
     manifest = affected.get("manifest") or []
     # The producer supplies all matching pre-rejoin or ambiguously timed
     # packets. Missing timestamps are not evidence of silence.
-    during = affected.get("observations_during_fault") or []
+    during = affected.get("observations_during_fault")
     nonces = {row["nonce"] for row in manifest}
-    delivered_after = affected.get("post_rejoin_delivered_nonces") or []
+    delivered_after = affected.get("post_rejoin_delivered_nonces")
+    during_present = isinstance(during, list)
+    after_present = isinstance(delivered_after, list)
+    during = during if during_present else []
+    delivered_after = delivered_after if after_present else []
     outcome = affected.get("post_rejoin_outcome") or "not_recorded"
     return [
         _check(
             "affected_route_silent_during_fault",
-            not during and affected.get("coverage_complete") is True,
+            during_present and not during and affected.get("coverage_complete") is True,
             {
                 "during_fault_observations": len(during),
                 "reason": (
@@ -169,11 +191,14 @@ def _affected_checks(affected: dict, disconnect: float, rejoin: float) -> list[d
         ),
         _check(
             "affected_route_outcome_recorded",
-            bool(manifest)
+            after_present
+            and bool(manifest)
             and outcome in ("all_delivered", "partial", "not_delivered")
             and set(delivered_after) <= nonces
             and len(set(delivered_after)) == len(delivered_after)
-            and (outcome != "all_delivered" or set(delivered_after) == nonces),
+            and (outcome != "all_delivered" or set(delivered_after) == nonces)
+            and (outcome != "not_delivered" or not delivered_after)
+            and (outcome != "partial" or bool(delivered_after)),
             {
                 "manifest_nonces": len(nonces),
                 "post_rejoin_delivered": len(delivered_after),
