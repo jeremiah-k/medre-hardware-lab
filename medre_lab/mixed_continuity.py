@@ -94,8 +94,13 @@ FAULT_RECOVERY_OBSERVE_SECONDS = 120.0
 #: Bounded wait for the burst head's claimed, reserved, pre-handoff mesh row.
 _HEAD_BOUNDARY_WAIT_SECONDS = 15.0
 
-#: Sampler cadence for the released-core work-status/pressure shells.
-SAMPLER_INTERVAL_SECONDS = 5.0
+#: Sampler cadence for the released-core work-status/pressure shells. Sized
+#: for the measured bench fault windows: the proven disconnected interval can
+#: be ~12 s (fast board rejoin), and coverage requires a sample to begin AND
+#: finish strictly inside it, so a 5 s cadence yields only two valid
+#: interruption samples. A 2 s cadence keeps every rule unchanged while
+#: giving even a ~12 s window at least three valid samples.
+SAMPLER_INTERVAL_SECONDS = 2.0
 
 MESH_ADAPTER = "meshcore"
 HEALTHY_SOURCE = "matrix0"

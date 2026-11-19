@@ -167,13 +167,17 @@ retirement checks. Historical partial-recovery results cannot qualify it.
 
 ## Sustained-load sampler
 
-The owner shells the RELEASED core's read-only CLI on a 5 s cadence into
+The owner shells the RELEASED core's read-only CLI on a 2 s cadence into
 `work-status-series.jsonl`, phase-tagged (`baseline`, `interruption`,
 `recovery`, `pending-capture`, `reopen`): `medre inspect work-status
 --json` each cycle and `medre inspect pressure` every other cycle (the
 requested `medre storage status` does not exist in the 0.1.2 CLI; the
 substitution is recorded in the series header). Sampler failures are
-recorded, never fabricated.
+recorded, never fabricated. The cadence is instrumentation density only:
+coverage still requires each sample to begin and finish strictly inside the
+proven interval, three per phase, and the cadence was calibrated so the
+measured ~12 s fast-rejoin fault window can yield its three interruption
+samples.
 
 ## Safe stop
 
