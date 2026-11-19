@@ -360,3 +360,95 @@ def test_unverifiable_teardown_is_honest_failure_not_padded_pass(
         (tmp_path / "meshcore-peer-link-hygiene.jsonl").read_text().splitlines()[-1]
     )
     assert record["verified"] is False and record["heals"] == 2
+
+
+@pytest.mark.parametrize("error", ["timeout", "oserror", "nonzero"])
+@pytest.mark.parametrize("stage", ["ensure_available", "verify_dropped"])
+def test_heal_command_failure_rechecks_and_records_drop(tmp_path, error, stage):
+    fake = FakeBlueZ(connected=True)
+
+    def runner(argv, **kwargs):
+        if argv[:2] == ["busctl", "call"]:
+            fake.connected = False
+            if error == "timeout":
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            if error == "oserror":
+                raise OSError("command failed")
+            return subprocess.CompletedProcess(argv, 1, "", "already disconnected")
+        return fake(argv, **kwargs)
+
+    link = _link(runner, tmp_path)
+    result = getattr(link, stage)(stage)
+    assert result.get("known_clear", result.get("verified")) is True
+    assert len(result["errors"]) == 1
+    assert result["heals"] == 0
+    assert (
+        json.loads((tmp_path / "meshcore-peer-link-hygiene.jsonl").read_text())
+        == result
+    )
+
+
+def test_property_timeout_budget_and_malformed_response(tmp_path):
+    timeouts = []
+
+    def runner(argv, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(argv, 0, "unexpected response", "")
+
+    link = BlueZLink(
+        "AA:BB:CC:DD:EE:01", "hci0", tmp_path, runner=runner, poll_interval=0.01
+    )
+    assert link.wait_dropped(0.05) is None
+    assert timeouts and all(0 < timeout <= 0.05 for timeout in timeouts)
+    assert timeouts[-1] <= timeouts[0]
+
+
+def test_hygiene_record_failure_cannot_pass_or_replace_primary(tmp_path):
+    absent = tmp_path / "absent"
+    with pytest.raises(OSError):
+        _link(FakeBlueZ(connected=False), absent).verify_dropped("disarm")
+    with pytest.raises(LinkHygieneError, match="did not drop") as exc:
+        _link(FakeBlueZ(connected=True, drop_works=False), absent).verify_dropped(
+            "disarm"
+        )
+    assert any("evidence write failed" in note for note in exc.value.__notes__)
+
+
+def test_listener_readiness_timeout_reaps_before_heal(monkeypatch):
+    def probe(stage):
+        if stage == "arm-failed":
+            assert listener._owner.proc is not None
+            assert listener._owner.proc.poll() is not None
+
+    listener = _listener(
+        monkeypatch, "import time; time.sleep(30)", FakeLink(probe=probe)
+    )
+    listener._owner._ready_timeout = 0.1
+    with pytest.raises(AssertionError, match="never signalled ready"):
+        listener.__enter__()
+    assert listener._owner.stdio_closed
+
+
+def test_full_window_rejects_observation_gap(monkeypatch):
+    script = (
+        "import json, sys, time\n"
+        "open(sys.argv[4], 'w').write(json.dumps({'observation_gap': True}) + '\\n')\n"
+        "open(sys.argv[5], 'w').write('1')\n"
+        "time.sleep(0.4)\n"
+        "print(json.dumps({'received': []}))\n"
+    )
+    listener = _listener(monkeypatch, script, FakeLink())
+    with listener:
+        with pytest.raises(AssertionError, match="disconnected during collection"):
+            listener.packets(timeout=3)
+
+
+def test_failed_arm_retains_primary_when_heal_fails(monkeypatch):
+    class BrokenCleanup(FakeLink):
+        def verify_dropped(self, stage):
+            raise LinkHygieneError("cleanup failure")
+
+    listener = _listener(monkeypatch, _FAILING_PEER_SCRIPT, BrokenCleanup())
+    with pytest.raises(AssertionError, match="died before readiness") as exc:
+        listener.__enter__()
+    assert "cleanup failure" in " ".join(exc.value.__notes__)

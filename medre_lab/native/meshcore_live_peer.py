@@ -299,10 +299,19 @@ class MeshCorePeerListener:
                     str(self._READY_PATH),
                 ]
             )
-        except BaseException:
+        except BaseException as primary:
             # A failed arm still owns the link: the child may have reached
             # the board before dying (attempt-level ConnectionError).
-            self._link.verify_dropped("arm-failed")
+            try:
+                if self._owner.proc is not None and self._owner.poll() is None:
+                    self._owner.terminate()
+                if self._owner.proc is not None and self._owner.poll() is None:
+                    raise AssertionError(
+                        "peer child did not retire; link healing unsafe"
+                    )
+                self._link.verify_dropped("arm-failed")
+            except Exception as cleanup:
+                primary.add_note(f"failed arm link cleanup: {cleanup}")
             raise
         return self
 
@@ -326,13 +335,23 @@ class MeshCorePeerListener:
         assert self._owner.proc is not None
         if self._owner.proc.returncode != 0:
             raise AssertionError(f"native peer listener failed: {err[-800:]}")
+        self._read_packets()  # full-window results must reject the same gap markers
         lines = [ln for ln in out.strip().splitlines() if ln.strip()]
         return json.loads(lines[-1])["received"] if lines else []
 
     def __exit__(self, *exc: object) -> None:
-        self._owner.terminate()
         # Owned teardown verification: SIGINT (or the kill ladder) retires
         # the child, but its async SDK disconnect can leave the BlueZ ACL
         # link up indefinitely. Await the drop, heal a lingering link with
         # the documented disconnect, and fail honestly if it cannot drop.
-        self._link.verify_dropped("disarm")
+        try:
+            self._owner.terminate()
+            if self._owner.proc is not None and self._owner.poll() is None:
+                raise AssertionError("peer child did not retire; link healing unsafe")
+            self._link.verify_dropped("disarm")
+        except Exception as cleanup:
+            primary = exc[1] if len(exc) > 1 else None
+            if isinstance(primary, BaseException):
+                primary.add_note(f"listener link cleanup: {cleanup}")
+            else:
+                raise

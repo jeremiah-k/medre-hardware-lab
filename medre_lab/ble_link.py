@@ -23,7 +23,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NoReturn
 
 #: Boards resume advertising ~1.1 s after a clean disconnect, so this bound
 #: rides out scheduler delay on a natural drop while staying far below the
@@ -77,9 +77,9 @@ class BlueZLink:
     # BlueZ primitives (busctl with a controller, bluetoothctl otherwise)
     # ------------------------------------------------------------------
 
-    def _bluetoothctl(self, *args: str) -> str:
+    def _bluetoothctl(self, *args: str, timeout: float = 30) -> str:
         result = self._runner(
-            ["bluetoothctl", *args], capture_output=True, text=True, timeout=30
+            ["bluetoothctl", *args], capture_output=True, text=True, timeout=timeout
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -88,9 +88,9 @@ class BlueZLink:
             )
         return result.stdout
 
-    def _busctl(self, *args: str) -> str:
+    def _busctl(self, *args: str, timeout: float = 30) -> str:
         result = self._runner(
-            ["busctl", *args], capture_output=True, text=True, timeout=30
+            ["busctl", *args], capture_output=True, text=True, timeout=timeout
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -99,7 +99,7 @@ class BlueZLink:
             )
         return result.stdout
 
-    def is_connected(self) -> bool | None:
+    def is_connected(self, *, timeout: float = 30) -> bool | None:
         """Read the BlueZ Connected property; ``None`` when undecidable."""
         try:
             if self._controller:
@@ -109,12 +109,13 @@ class BlueZLink:
                     device_object_path(self._controller, self._address),
                     "org.bluez.Device1",
                     "Connected",
+                    timeout=timeout,
                 )
-                return out.strip().endswith("true")
-            out = self._bluetoothctl("info", self._address)
+                return {"b true": True, "b false": False}.get(out.strip())
+            out = self._bluetoothctl("info", self._address, timeout=timeout)
             match = re.search(r"\bConnected:\s*(yes|no)\b", out)
             return {"yes": True, "no": False}[match.group(1)] if match else None
-        except Exception:
+        except (RuntimeError, OSError, subprocess.TimeoutExpired):
             return None
 
     def _documented_disconnect(self) -> None:
@@ -134,17 +135,19 @@ class BlueZLink:
         """Poll until the link is proven gone or the bound expires.
 
         Returns ``True`` (proven ``Connected: no``), ``False`` (still
-        ``Connected: yes`` at the bound), or ``None`` (never readable).
+        ``Connected: yes`` at the bound), or ``None`` (no timely definitive read).
         """
         deadline = time.monotonic() + timeout
-        while True:
-            connected = self.is_connected()
-            if connected is False:
-                return True
+        connected = None
+        while (remaining := deadline - time.monotonic()) > 0:
+            connected = self.is_connected(timeout=remaining)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return None if connected is None else False
+                return False if connected is True else None
+            if connected is False:
+                return True
             time.sleep(min(self._poll_interval, remaining))
+        return False if connected is True else None
 
     # ------------------------------------------------------------------
     # Owned stages
@@ -161,17 +164,16 @@ class BlueZLink:
         record: dict = {"stage": stage, "at": time.monotonic(), "heals": 0}
         connected = self.is_connected()
         record["connected"] = connected
+        stale_link = connected is True
         for _ in range(HEAL_ATTEMPTS):
-            if connected is not True:
+            if not stale_link or connected is False:
                 break
             try:
                 self._documented_disconnect()
-            except RuntimeError as exc:
+            except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
                 record.setdefault("errors", []).append(str(exc)[-200:])
-                connected = self.is_connected()
-                record["connected"] = connected
-                continue
-            record["heals"] += 1
+            else:
+                record["heals"] += 1
             dropped = self.wait_dropped(self._heal_wait)
             connected = None if dropped is None else not dropped
             record["connected"] = connected
@@ -179,12 +181,16 @@ class BlueZLink:
         # pre-arm that is not a refusal — the child's bounded connect loop
         # reports the board honestly — it just is not proven clear here.
         record["known_clear"] = connected is False
-        self._append(record)
-        if connected is True:
-            raise LinkHygieneError(
-                f"stale peer host link refused the documented disconnect: "
-                f"{self._address} stays Connected: yes ({stage})"
+        if stale_link and connected is not False:
+            self._record_failure(
+                record,
+                LinkHygieneError(
+                    f"stale peer host link refused the documented disconnect: "
+                    f"{self._address} last read Connected: "
+                    f"{'yes' if connected else 'unreadable'} ({stage})"
+                ),
             )
+        self._append(record)
         return record
 
     def verify_dropped(self, stage: str) -> dict:
@@ -203,19 +209,21 @@ class BlueZLink:
                 break
             try:
                 self._documented_disconnect()
-            except RuntimeError as exc:
+            except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
                 record.setdefault("errors", []).append(str(exc)[-200:])
-                continue
-            record["heals"] += 1
+            else:
+                record["heals"] += 1
             dropped = self.wait_dropped(self._heal_wait)
         if dropped is not True:
             record["dropped"] = False
             record["verified"] = False
-            self._append(record)
-            raise LinkHygieneError(
-                "peer host link did not drop after listener teardown: "
-                f"{self._address} last read Connected: "
-                f"{'unreadable' if dropped is None else 'yes'} ({stage})"
+            self._record_failure(
+                record,
+                LinkHygieneError(
+                    "peer host link did not drop after listener teardown: "
+                    f"{self._address} last read Connected: "
+                    f"{'unreadable' if dropped is None else 'yes'} ({stage})"
+                ),
             )
         record["dropped"] = True
         record["verified"] = True
@@ -225,13 +233,17 @@ class BlueZLink:
 
     # ------------------------------------------------------------------
 
+    def _record_failure(self, record: dict, error: LinkHygieneError) -> NoReturn:
+        try:
+            self._append(record)
+        except OSError as exc:
+            error.add_note(f"link evidence write failed: {exc}")
+        raise error
+
     def _append(self, record: dict) -> None:
-        """Append one hygiene evidence record; never mask the outcome."""
+        """Append required hygiene evidence; failure invalidates success."""
         if self._log_path is None:
             return
-        try:
-            record["address_role"] = "peer"
-            with self._log_path.open("a") as stream:
-                stream.write(json.dumps(record, default=str) + "\n")
-        except OSError:
-            pass
+        record["address_role"] = "peer"
+        with self._log_path.open("a") as stream:
+            stream.write(json.dumps(record, default=str) + "\n")
