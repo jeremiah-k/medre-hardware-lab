@@ -241,6 +241,94 @@ def continuity(
     return 130 if code == 130 else (0 if phases_ok else 1)
 
 
+def mixed_continuity(
+    root,
+    matrix_json: str,
+    role: str,
+    run_root: str | None,
+    burst_count: int,
+    hardware_toml: Path,
+) -> int:
+    """Mixed-transport A-3 continuity case: two owned worker phases."""
+    from .mixed_continuity import load_mixed
+
+    matrix_path = Path(matrix_json).expanduser()
+    if not matrix_path.is_file():
+        raise ValueError(f"campaign matrix file not found: {matrix_path}")
+    config = load_mixed(hardware_toml, matrix_path)
+    hw = config["hardware"]
+    transports = ("matrix", "meshcore", "meshtastic")
+    run = _hardware_run_dir(
+        root, transports, role, Path(run_root) if run_root else None
+    )
+    run.mkdir(parents=True, mode=0o700)
+    baseline_timeout = (
+        hw["startup_timeout"]
+        + 3 * (hw["send_timeout"] + hw["observation_timeout"])
+        + 240
+        + 900
+    )
+    reopen_timeout = (
+        hw["startup_timeout"]
+        + 2 * (hw["send_timeout"] + hw["observation_timeout"])
+        + 900
+    )
+    boundary: dict = {}
+    phases_ok = True
+    code = 0
+    for phase, timeout in (
+        ("mixed-baseline", baseline_timeout),
+        ("mixed-reopen", reopen_timeout),
+    ):
+        argv = [
+            sys.executable,
+            "-m",
+            "medre_lab.mixed_worker",
+            str(hardware_toml),
+            str(matrix_path),
+            str(0 if role == "a" else 1),
+            str(run),
+            phase,
+        ]
+        if phase == "mixed-baseline":
+            argv.append(str(burst_count))
+        started = time.time()
+        code = _spawn_worker(argv, run / f"{phase}-worker.log", timeout)
+        boundary[phase] = {
+            "exit_code": code,
+            "duration_seconds": round(time.time() - started, 3),
+            "timeout_seconds": timeout,
+            "pass": False,
+            "log": str(run / f"{phase}-worker.log"),
+        }
+        _write_worker_absent_verdict(run, f"{phase}-verdict.json", phase, code)
+        try:
+            verdict = json.loads((run / f"{phase}-verdict.json").read_text())
+            if not isinstance(verdict, dict) or verdict.get("phase") != phase:
+                raise ValueError("invalid phase verdict")
+            boundary[phase]["worker_verdict_pass"] = verdict.get("pass") is True
+        except (ValueError, OSError) as exc:
+            boundary[phase]["worker_verdict_pass"] = False
+            boundary[phase]["verdict_error"] = type(exc).__name__
+        boundary[phase]["pass"] = code == 0 and boundary[phase]["worker_verdict_pass"]
+        phases_ok = phases_ok and boundary[phase]["pass"]
+        if not boundary[phase]["pass"]:
+            break  # Never open a replacement after cancellation or failed retirement.
+    merged = {
+        "case": "mixed-transport-continuity",
+        "pass": phases_ok,
+        "transports": list(transports),
+        "role": role,
+        "burst_count": burst_count,
+        "process_boundary": boundary,
+        "scope": "Mixed-transport A-3 case; physical interruption and MEDRE "
+        "shutdown are separate evidenced actions.",
+    }
+    _write_json(run / "continuity-verdict.json", merged)
+    print(json.dumps({"pass": phases_ok, "evidence": str(run)}))
+    return 130 if code == 130 else (0 if phases_ok else 1)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".", help="lab repository checkout")
@@ -295,6 +383,33 @@ def main(argv=None):
         default=None,
         help="private directory for the run (default: <root>/evidence)",
     )
+    mixed = hw.add_parser(
+        "mixed-continuity",
+        help="mixed-transport A-3 case (matrix+meshcore+meshtastic, two owned phases)",
+    )
+    mixed.add_argument(
+        "--matrix-json",
+        required=True,
+        help="private campaign matrix provisioning file (accounts/rooms/tokens)",
+    )
+    mixed.add_argument(
+        "--hardware-toml",
+        required=True,
+        type=Path,
+        help="private campaign hardware TOML (hci + board endpoints)",
+    )
+    mixed.add_argument("--role", choices=("a", "b"), default="a")
+    mixed.add_argument(
+        "--burst-count",
+        type=int,
+        default=3,
+        help="fault-window burst size per route class (1-6)",
+    )
+    mixed.add_argument(
+        "--run-root",
+        default=None,
+        help="private directory for the run (default: <root>/evidence)",
+    )
     args = parser.parse_args(argv)
     try:
         root = root_path(args.root)
@@ -311,6 +426,15 @@ def main(argv=None):
         if args.command == "hardware":
             if args.action == "run":
                 return hardware(root, config, args.pair, args.role, args.run_root)
+            if args.action == "mixed-continuity":
+                return mixed_continuity(
+                    root,
+                    args.matrix_json,
+                    args.role,
+                    args.run_root,
+                    args.burst_count,
+                    args.hardware_toml,
+                )
             return continuity(
                 root,
                 config,
