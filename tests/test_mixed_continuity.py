@@ -183,7 +183,7 @@ def test_head_boundary_violated_by_mesh_receipt(db):
         },
         receipts=[
             ("matrix1", "ob-b", "sent", None),
-            ("meshcore", "ob-m", "failed", "transient"),
+            ("meshcore", "ob-m", "failed", "adapter_transient"),
         ],
     )
     snapshot = mixed_continuity.capture_nonce_state(_db_path(con), "n-mesh-rcpt")
@@ -212,13 +212,20 @@ def test_tail_pending_never_claimed(db):
 
 
 def test_final_sent_tolerates_transient_fault_failures(db):
+    """Released-core transient vocabulary: scheduled retries are not permanent.
+
+    medre 0.1.2 records fault-window adapter retries as
+    ``failure_kind="adapter_transient"`` (its retryable rule); the lab must
+    classify against that vocabulary, not a bare ``"transient"`` literal.
+    """
     con, _ = db
     insert_event(
         con,
         "n-affected",
-        {"meshcore": {"outbox_id": "ob-m", "status": "sent", "attempt_number": 2}},
+        {"meshcore": {"outbox_id": "ob-m", "status": "sent", "attempt_number": 5}},
         receipts=[
-            ("meshcore", "ob-m", "failed", "transient"),
+            ("meshcore", "ob-m", "failed", "adapter_transient"),
+            ("meshcore", "ob-m", "failed", "adapter_transient"),
             ("meshcore", "ob-m", "sent", None),
             ("matrix1", "ob-b", "sent", None),
         ],
@@ -232,11 +239,31 @@ def test_final_sent_tolerates_transient_fault_failures(db):
         "UPDATE delivery_outbox SET receipt_id=(SELECT receipt_id FROM delivery_receipts WHERE delivery_receipts.outbox_id=delivery_outbox.outbox_id AND status='sent') WHERE status='sent'"
     )
     con.execute(
-        "UPDATE delivery_receipts SET attempt_number=2 WHERE outbox_id='ob-m' AND status='sent'"
+        "UPDATE delivery_receipts SET attempt_number=5 WHERE outbox_id='ob-m' AND status='sent'"
     )
     con.commit()
     snapshot = mixed_continuity.capture_nonce_state(_db_path(con), "n-affected")
     assert mixed_continuity._final_sent_mixed(snapshot, "meshcore") is True
+    # The healthy route's identity stays readable while the affected route's
+    # transient retries are in the same event.
+    identity = mixed_continuity._mixed_receipt_identity(snapshot, "matrix1")
+    assert identity is not None
+
+
+def test_final_sent_rejects_the_bare_transient_misreading(db):
+    """``failure_kind="transient"`` matches no released-core kind: permanent."""
+    con, _ = db
+    insert_event(
+        con,
+        "n-unknown-kind",
+        {"meshcore": {"outbox_id": "ob-m", "status": "sent", "attempt_number": 1}},
+        receipts=[
+            ("meshcore", "ob-m", "failed", "transient"),
+            ("meshcore", "ob-m", "sent", None),
+        ],
+    )
+    snapshot = mixed_continuity.capture_nonce_state(_db_path(con), "n-unknown-kind")
+    assert mixed_continuity._final_sent_mixed(snapshot, "meshcore") is False
 
 
 def test_final_sent_rejects_permanent_failure(db):

@@ -656,7 +656,14 @@ def _tail_pending_mixed(snapshot: dict) -> bool:
 
 def _final_sent_mixed(snapshot: dict, adapter: str) -> bool:
     """One sent receipt at *adapter*, one sent destination row, no permanent
-    failure anywhere in the event (transient fault-window failures excluded)."""
+    failure anywhere in the event (transient fault-window failures excluded).
+
+    Transience uses the RELEASED core's durable vocabulary: 0.1.2 records
+    scheduled-retry adapter failures as ``failure_kind="adapter_transient"``
+    (its own retryable rule), not the bare ``"transient"`` this check
+    previously assumed — that literal matches nothing and misread honest
+    fault-window retries as permanent failures.
+    """
     rows = _rows_for(snapshot, adapter)
     sent = [
         receipt
@@ -670,10 +677,13 @@ def _final_sent_mixed(snapshot: dict, adapter: str) -> bool:
         receipt
         for event in snapshot["events"]
         for receipt in event["receipts"]
-        if receipt["failure_kind"] not in (None, "transient")
+        if receipt["failure_kind"] not in (None, "adapter_transient")
         or receipt["status"]
         in ("dead_lettered", "denied", "cancelled", "abandoned", "suppressed")
-        or (receipt["status"] == "failed" and receipt["failure_kind"] != "transient")
+        or (
+            receipt["status"] == "failed"
+            and receipt["failure_kind"] != "adapter_transient"
+        )
     ]
     return (
         len(snapshot["events"]) == 1
