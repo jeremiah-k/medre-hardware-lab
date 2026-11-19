@@ -9,6 +9,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from medre_lab.ble_link import BlueZLink
 from medre_lab.native.live_peer_common import (
     PeerProcess,
     poll_packets_until,
@@ -251,33 +252,58 @@ class MeshCorePeerListener:
     after the firmware buffer drain + subscribe, not after a fixed sleep.
     Process/readiness/teardown ownership lives in
     :class:`~tests.helpers.live_peer_common.PeerProcess`.
+
+    Host-link hygiene lives at this owning boundary too: the child's async
+    SDK teardown can leave the BlueZ ACL link lingering after the child
+    retires, and a still-connected board does not advertise, so a re-arm
+    child would die honestly while discovering nothing. Arming therefore
+    first recovers a stale link (documented disconnect), and disarming
+    verifies the drop with a bounded wait, healing a lingering link the
+    same way (:mod:`medre_lab.ble_link`).
     """
 
     _JSON_PATH = Path(os.environ["MEDRE_LAB_RUN_DIR"]) / "meshcore_pair_peer.json"
     _READY_PATH = Path(os.environ["MEDRE_LAB_RUN_DIR"]) / "meshcore_pair_peer.ready"
     _READY_TIMEOUT = _PEER_READY_TIMEOUT
 
-    def __init__(self, seconds: float) -> None:
+    def __init__(self, seconds: float, link: BlueZLink | None = None) -> None:
         self._seconds = seconds
         self._owner = PeerProcess(self._READY_PATH, self._READY_TIMEOUT)
+        if link is None:
+            link = BlueZLink(
+                _PEER_BLE,
+                os.environ.get("MESHCORE_PEER_BLE_ADAPTER") or None,
+                Path(os.environ.get("MEDRE_LAB_RUN_DIR", ".")),
+            )
+        self._link = link
 
     def __enter__(self) -> "MeshCorePeerListener":
         self._JSON_PATH.unlink(missing_ok=True)
         self._READY_PATH.unlink(missing_ok=True)
-        # Ready handshake: drain + subscribe + auto-fetch armed before any
-        # MEDRE-side TX (bounded; no fixed startup sleep).
-        self._owner.start(
-            [
-                sys.executable,
-                "-c",
-                _PEER_SCRIPT,
-                "listen",
-                _PEER_BLE,
-                str(self._seconds),
-                str(self._JSON_PATH),
-                str(self._READY_PATH),
-            ]
-        )
+        # Owned hygiene: a stale host link holds the board silent; recover
+        # it with the documented disconnect before the child scans, or
+        # refuse the arm honestly.
+        self._link.ensure_available("arm")
+        try:
+            # Ready handshake: drain + subscribe + auto-fetch armed before
+            # any MEDRE-side TX (bounded; no fixed startup sleep).
+            self._owner.start(
+                [
+                    sys.executable,
+                    "-c",
+                    _PEER_SCRIPT,
+                    "listen",
+                    _PEER_BLE,
+                    str(self._seconds),
+                    str(self._JSON_PATH),
+                    str(self._READY_PATH),
+                ]
+            )
+        except BaseException:
+            # A failed arm still owns the link: the child may have reached
+            # the board before dying (attempt-level ConnectionError).
+            self._link.verify_dropped("arm-failed")
+            raise
         return self
 
     def _read_packets(self) -> list[dict]:
@@ -305,3 +331,8 @@ class MeshCorePeerListener:
 
     def __exit__(self, *exc: object) -> None:
         self._owner.terminate()
+        # Owned teardown verification: SIGINT (or the kill ladder) retires
+        # the child, but its async SDK disconnect can leave the BlueZ ACL
+        # link up indefinitely. Await the drop, heal a lingering link with
+        # the documented disconnect, and fail honestly if it cannot drop.
+        self._link.verify_dropped("disarm")
