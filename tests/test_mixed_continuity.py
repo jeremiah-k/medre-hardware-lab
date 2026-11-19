@@ -25,10 +25,12 @@ from medre_lab.a3_eval import evaluate_a3
 from medre_lab.matrix_live_peer import MatrixPeerListener, run_matrix_send
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS canonical_events (event_id TEXT PRIMARY KEY, source_adapter TEXT, source_native_channel_id TEXT, source_native_message_id TEXT);
 CREATE TABLE IF NOT EXISTS event_body_content (event_id TEXT NOT NULL, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS delivery_receipts (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     receipt_id TEXT UNIQUE,
+    adapter_message_id TEXT,
     outbox_id TEXT,
     event_id TEXT NOT NULL,
     delivery_plan_id TEXT NOT NULL DEFAULT '',
@@ -43,6 +45,7 @@ CREATE TABLE IF NOT EXISTS delivery_receipts (
 );
 CREATE TABLE IF NOT EXISTS delivery_outbox (
     outbox_id TEXT PRIMARY KEY,
+    receipt_id TEXT,
     event_id TEXT NOT NULL,
     delivery_plan_id TEXT NOT NULL DEFAULT '',
     target_adapter TEXT NOT NULL,
@@ -81,6 +84,10 @@ def insert_event(
     ``receipts`` is a list of (adapter, outbox_id, status, failure_kind).
     """
     event_id = f"ev-{nonce}"
+    con.execute(
+        "INSERT INTO canonical_events VALUES (?, 'matrix0', '!a:x', ?)",
+        (event_id, f"$ingress-{nonce}"),
+    )
     con.execute(
         "INSERT INTO event_body_content (event_id, body) VALUES (?, ?)",
         (event_id, nonce),
@@ -123,6 +130,9 @@ def insert_event(
                 failure,
             ),
         )
+    con.execute(
+        "UPDATE delivery_outbox SET receipt_id=(SELECT receipt_id FROM delivery_receipts WHERE delivery_receipts.outbox_id=delivery_outbox.outbox_id AND status='sent') WHERE status='sent'"
+    )
     con.commit()
 
 
@@ -218,6 +228,12 @@ def test_final_sent_tolerates_transient_fault_failures(db):
         " status, attempt_number) VALUES ('ob-b', 'ev-n-affected',"
         " 'matrix1', 'sent', 1)"
     )
+    con.execute(
+        "UPDATE delivery_outbox SET receipt_id=(SELECT receipt_id FROM delivery_receipts WHERE delivery_receipts.outbox_id=delivery_outbox.outbox_id AND status='sent') WHERE status='sent'"
+    )
+    con.execute(
+        "UPDATE delivery_receipts SET attempt_number=2 WHERE outbox_id='ob-m' AND status='sent'"
+    )
     con.commit()
     snapshot = mixed_continuity.capture_nonce_state(_db_path(con), "n-affected")
     assert mixed_continuity._final_sent_mixed(snapshot, "meshcore") is True
@@ -228,20 +244,19 @@ def test_final_sent_rejects_permanent_failure(db):
     insert_event(
         con,
         "n-dead",
-        {
-            "meshcore": {
-                "outbox_id": "ob-m",
-                "status": "dead_lettered",
-                "attempt_number": 6,
-            }
-        },
-        receipts=[
-            ("meshcore", "ob-m", "failed", "transient"),
-            ("meshcore", "ob-m", "failed", "exhausted"),
-        ],
+        {"meshcore": {"outbox_id": "ob-m", "status": "sent", "attempt_number": 1}},
+        receipts=[("meshcore", "ob-m", "sent", None)],
     )
-    snapshot = mixed_continuity.capture_nonce_state(_db_path(con), "n-dead")
-    assert mixed_continuity._final_sent_mixed(snapshot, "meshcore") is False
+    assert mixed_continuity._final_sent_mixed(
+        mixed_continuity.capture_nonce_state(_db_path(con), "n-dead"), "meshcore"
+    )
+    con.execute(
+        "INSERT INTO delivery_receipts (receipt_id,event_id,target_adapter,status,failure_kind) VALUES ('bad','ev-n-dead','matrix1','failed','exhausted')"
+    )
+    con.commit()
+    assert not mixed_continuity._final_sent_mixed(
+        mixed_continuity.capture_nonce_state(_db_path(con), "n-dead"), "meshcore"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -253,9 +268,11 @@ def passing_transcript() -> dict:
     return {
         "fault": {
             "occurred": True,
+            "disconnect_command_succeeded": True,
             "action": "worker-owned busctl disconnect of the MEDRE-owned board",
             "disconnect_offset": 100.0,
             "rejoin_offset": 140.0,
+            "last_disconnected_offset": 139.5,
         },
         "unaffected": {
             "manifest": [
@@ -270,9 +287,20 @@ def passing_transcript() -> dict:
                     "outbox_ids": {"matrix1": "ob-b-N2"},
                 },
             ],
+            "coverage_complete": True,
             "observations": [
-                {"nonce": "N1", "observed_offset": 103.5},
-                {"nonce": "N2", "observed_offset": 104.1},
+                {
+                    "nonce": "N1",
+                    "event_id": "$N1",
+                    "observed_offset": 103.5,
+                    "occurrences": 1,
+                },
+                {
+                    "nonce": "N2",
+                    "event_id": "$N2",
+                    "observed_offset": 104.1,
+                    "occurrences": 1,
+                },
             ],
         },
         "affected": {
@@ -288,6 +316,7 @@ def passing_transcript() -> dict:
                     "outbox_ids": {"meshcore": "ob-m-N2"},
                 },
             ],
+            "coverage_complete": True,
             "observations_during_fault": [],
             "post_rejoin_delivered_nonces": ["N1", "N2"],
             "post_rejoin_outcome": "all_delivered",
@@ -295,19 +324,27 @@ def passing_transcript() -> dict:
         "generation_binding": {
             "N1": {
                 "event_id": "ev-N1",
+                "matrix_ingress_event_id": "$in1",
+                "matrix_source_matches": True,
+                "matrix_delivery_event_id": "$N1",
                 "dest_outbox_ids": {"matrix1": "ob-b-N1", "meshcore": "ob-m-N1"},
                 "single_event": True,
             },
             "N2": {
                 "event_id": "ev-N2",
+                "matrix_ingress_event_id": "$in2",
+                "matrix_source_matches": True,
+                "matrix_delivery_event_id": "$N2",
                 "dest_outbox_ids": {"matrix1": "ob-b-N2", "meshcore": "ob-m-N2"},
                 "single_event": True,
             },
         },
         "sampler": {
-            "baseline": ["a", "b", "c"],
-            "interruption": ["a", "b", "c", "d"],
-            "recovery": ["a", "b", "c"],
+            "baseline": [{"start": t, "end": t + 0.1} for t in (1, 6, 11)],
+            "interruption": [
+                {"start": t, "end": t + 0.1} for t in (101, 106, 111, 116)
+            ],
+            "recovery": [{"start": t, "end": t + 0.1} for t in (141, 146, 151)],
         },
     }
 
@@ -421,6 +458,8 @@ def stub_sync(monkeypatch, pages):
 
     def fake(homeserver, method, path, body=None, token=None, timeout=30.0):
         calls.append(path)
+        if path.endswith("/whoami"):
+            return {"user_id": "@w:x"}
         if "_matrix/client/v3/sync?timeout=0" in path:
             return {"next_batch": "s0"}
         index = len([c for c in calls if "since=" in c]) - 1
@@ -572,7 +611,7 @@ def campaign_files(tmp_path, monkeypatch):
     )
     matrix = tmp_path / "campaign-matrix.json"
     accounts = {
-        key: {"user_id": f"@campaign-{key}:x", "access_token": "tok"}
+        key: {"user_id": f"@campaign-{key}:x", "access_token": f"tok-{key}"}
         for key in ("m0", "m1", "sender", "witness")
     }
     matrix.write_text(
@@ -646,3 +685,254 @@ def test_cli_mixed_continuity_requires_matrix_file(tmp_path):
 
 def test_min_sampler_coverage_is_three():
     assert a3_eval.A3_MIN_SAMPLER_COVERAGE == 3
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_outbox",
+        "reused_event",
+        "reused_witness",
+        "ambiguous_rejoin",
+        "missing_coverage",
+        "late_sample",
+        "command_failed",
+        "wrong_delivery",
+    ],
+)
+def test_adversarial_transcript_boundaries(fault):
+    transcript = passing_transcript()
+    a = transcript["affected"]
+    u = transcript["unaffected"]
+    b = transcript["generation_binding"]
+    if fault == "missing_outbox":
+        a["manifest"][0]["outbox_ids"]["meshcore"] = None
+        b["N1"]["dest_outbox_ids"]["meshcore"] = None
+    elif fault == "reused_event":
+        b["N2"]["event_id"] = b["N1"]["event_id"]
+        for route in (a, u):
+            route["manifest"][1]["event_id"] = b["N1"]["event_id"]
+    elif fault == "reused_witness":
+        u["observations"][1]["event_id"] = "$N1"
+        b["N2"]["matrix_delivery_event_id"] = "$N1"
+    elif fault == "ambiguous_rejoin":
+        u["observations"][1]["observed_offset"] = 139.75
+    elif fault == "missing_coverage":
+        a["coverage_complete"] = False
+    elif fault == "late_sample":
+        transcript["sampler"]["interruption"] = [
+            {"start": 141 + i, "end": 141.5 + i} for i in range(3)
+        ]
+    elif fault == "command_failed":
+        transcript["fault"]["disconnect_command_succeeded"] = False
+    else:
+        b["N1"]["matrix_delivery_event_id"] = "$different"
+    assert not evaluate_a3(transcript)["pass"]
+
+
+def test_duplicate_outbox_cannot_bind_generation(db):
+    con, _ = db
+    head_state(con, "dup")
+    assert set(
+        mixed_continuity.bind_generation(_db_path(con), "dup")["dest_outbox_ids"]
+    ) == {"meshcore", "matrix1"}
+    con.execute(
+        "INSERT INTO delivery_outbox (outbox_id,event_id,target_adapter,status) VALUES ('extra','ev-dup','meshcore','pending')"
+    )
+    con.commit()
+    assert not mixed_continuity.bind_generation(_db_path(con), "dup")["dest_outbox_ids"]
+
+
+def test_completed_destination_ignores_sibling_settlement_but_not_receipt_change(db):
+    con, _ = db
+    snapshot = head_state(con, "stable")
+    leg = {"nonce": "stable", "destination": "matrix1", "durable": snapshot}
+    con.execute(
+        "UPDATE delivery_outbox SET status='pending' WHERE target_adapter='meshcore'"
+    )
+    con.commit()
+    mixed_continuity._verify_completed(_db_path(con), [leg])
+    con.execute(
+        "UPDATE delivery_receipts SET receipt_id='replacement' WHERE target_adapter='matrix1'"
+    )
+    con.execute(
+        "UPDATE delivery_outbox SET receipt_id='replacement' WHERE target_adapter='matrix1'"
+    )
+    con.commit()
+    with pytest.raises(AssertionError, match="changed"):
+        mixed_continuity._verify_completed(_db_path(con), [leg])
+
+
+def test_receipt_must_match_exact_outbox(db):
+    con, _ = db
+    head_state(con, "bound")
+    con.execute("UPDATE delivery_receipts SET outbox_id='unrelated'")
+    con.commit()
+    assert not mixed_continuity._final_sent_mixed(
+        mixed_continuity.capture_nonce_state(_db_path(con), "bound"), "matrix1"
+    )
+
+
+def test_stopped_head_must_remain_claimed(db):
+    con, _ = db
+    head_state(con, "head")
+    con.execute(
+        "UPDATE delivery_outbox SET status='pending' WHERE target_adapter='meshcore'"
+    )
+    con.commit()
+    assert not mixed_continuity._head_boundary_mixed(
+        mixed_continuity.capture_nonce_state(_db_path(con), "head")
+    )
+
+
+def test_matrix_limited_timeline_refuses_coverage(monkeypatch):
+    stub_sync(
+        monkeypatch,
+        [
+            {
+                "next_batch": "s1",
+                "rooms": {
+                    "join": {"!b:x": {"timeline": {"limited": True, "events": []}}}
+                },
+            }
+        ],
+    )
+    with MatrixPeerListener("http://x", "tok", ("!b:x",), "@w:x") as listener:
+        with pytest.raises(AssertionError, match="timeline gap"):
+            listener.packets_until(lambda _: False, 1)
+        assert listener._since == "s0"
+
+
+def test_same_matrix_room_refused(campaign_files):
+    toml, matrix = campaign_files
+    matrix.write_text(matrix.read_text().replace("!b:x", "!a:x"))
+    with pytest.raises(mixed_continuity.MixedConfigError):
+        mixed_continuity.load_mixed(toml, matrix)
+
+
+def test_nonstring_ble_address_refused(campaign_files):
+    toml, matrix = campaign_files
+    toml.write_text(toml.read_text().replace('"c4:4f:33:6a:ae:a7"', "123"))
+    with pytest.raises(mixed_continuity.MixedConfigError):
+        mixed_continuity.load_mixed(toml, matrix)
+
+
+@pytest.mark.asyncio
+async def test_failed_sampler_does_not_escape_retirement():
+    import asyncio
+
+    async def fail():
+        raise RuntimeError("bad sampler")
+
+    task = asyncio.create_task(fail())
+    await asyncio.sleep(0)
+    result = {"pass": True}
+    await mixed_continuity._retire_task(task, result, "sampler")
+    assert result == {"pass": False, "sampler_error": "RuntimeError"}
+
+
+@pytest.mark.asyncio
+async def test_nonzero_sampler_json_not_credited():
+    import subprocess
+    import sys
+
+    with pytest.raises(subprocess.CalledProcessError):
+        await mixed_continuity._sample_command(
+            [sys.executable, "-c", "print('{}'); raise SystemExit(2)"]
+        )
+
+
+def test_cli_pins_one_effective_config_for_both_workers(
+    campaign_files, monkeypatch, tmp_path
+):
+    toml, matrix = campaign_files
+    monkeypatch.setattr(mixed_continuity, "verify_controller", lambda _: "hci0")
+    observed = []
+
+    def spawn(argv, log, timeout):
+        config_path = Path(argv[4])
+        config = json.loads(config_path.read_text())
+        observed.append(config)
+        assert config_path.stat().st_mode & 0o077 == 0
+        assert config["matrix"]["store_dir"] == str(matrix.parent / "matrix-stores")
+        phase = argv[7]
+        Path(argv[6], f"{phase}-verdict.json").write_text(
+            json.dumps({"phase": phase, "pass": True})
+        )
+        matrix.write_text("{}")
+        return 0
+
+    monkeypatch.setattr(cli, "_spawn_worker", spawn)
+    assert (
+        cli.mixed_continuity(
+            tmp_path, str(matrix), "a", str(tmp_path / "runs"), 2, toml
+        )
+        == 0
+    )
+    assert len(observed) == 2 and observed[0] == observed[1]
+
+
+def test_matrix_request_headers_redirect_and_total_deadline():
+    import http.server
+    import threading
+    import time
+    from medre_lab.matrix_live_peer import matrix_request
+
+    calls = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_PUT(self):
+            calls.append(
+                (
+                    self.path,
+                    self.headers.get("Authorization"),
+                    self.headers.get("Content-Type"),
+                )
+            )
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"event_id":"$ok"}')
+
+        def do_GET(self):
+            calls.append((self.path, self.headers.get("Authorization"), None))
+            if self.path.endswith("redirect"):
+                self.send_response(302)
+                self.send_header("Location", "/_matrix/other")
+                self.end_headers()
+            else:
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    for _ in range(20):
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        time.sleep(0.1)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    origin = f"http://127.0.0.1:{server.server_port}"
+    try:
+        assert matrix_request(
+            origin, "PUT", "/_matrix/send", {"body": "hi"}, "secret", 3
+        ) == {"event_id": "$ok"}
+        assert calls[-1] == ("/_matrix/send", "Bearer secret", "application/json")
+        with pytest.raises(RuntimeError, match="no observation credited"):
+            matrix_request(
+                origin, "GET", "/_matrix/redirect", token="secret", timeout=3
+            )
+        assert [call[0] for call in calls] == ["/_matrix/send", "/_matrix/redirect"]
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            matrix_request(origin, "GET", "/_matrix/slow", token="secret", timeout=0.5)
+        assert time.monotonic() - start < 1.5
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)

@@ -33,7 +33,8 @@ RELEASED core's read-only CLI (``medre inspect work-status``; ``medre
 inspect pressure`` substitutes the requested ``medre storage status``, which
 does not exist in the 0.1.2 CLI) throughout every phase.
 
-Time discipline: verdicts record monotonic offsets and durations only.
+Time discipline: comparisons use phase-relative monotonic offsets; wall-clock
+metadata is diagnostic only.
 """
 
 from __future__ import annotations
@@ -43,6 +44,8 @@ import hashlib
 import json
 import math
 import os
+import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -63,15 +66,11 @@ from .continuity import (
     _now,
     _observe_window,
     _pre_handoff,
-    _sent_receipt_event_id,
-    _sent_receipt_identity,
     _session_diag,
-    _stale_backlog_observation,
     _uncertain_settled,
     _wait_for,
     _write_json,
-    capture_nonce_state,
-    capture_nonce_states,
+    _capture_nonce_state,
 )
 from .native.live_peer_common import async_peer_context, owned_blocking
 from .ownership import own, own_run
@@ -126,8 +125,9 @@ def load_mixed(config_path: Path, matrix_path: Path) -> dict:
 
     config_path = config_path.resolve()
     matrix_path = matrix_path.resolve()
-    with config_path.open("rb") as stream:
-        raw = tomllib.load(stream)
+    hardware_bytes = config_path.read_bytes()
+    matrix_bytes = matrix_path.read_bytes()
+    raw = tomllib.loads(hardware_bytes.decode("utf-8"))
     if set(raw) - {"hardware"}:
         raise MixedConfigError("unknown configuration section")
     hw = raw.get("hardware", {})
@@ -162,30 +162,40 @@ def load_mixed(config_path: Path, matrix_path: Path) -> dict:
         ):
             raise MixedConfigError(f"{key} must be finite and positive")
     adapter = hw.get("ble_adapter")
-    if adapter is not None and not str(adapter).startswith("hci"):
+    if adapter is not None and (
+        not isinstance(adapter, str) or not re.fullmatch(r"hci\d+", adapter)
+    ):
         raise MixedConfigError("ble_adapter must be an HCI name such as hci0")
 
     mesh = hw["meshcore"]
-    if set(mesh) != {"addresses", "channel"}:
+    if not isinstance(mesh, dict) or set(mesh) != {"addresses", "channel"}:
         raise MixedConfigError("meshcore requires exactly addresses and channel")
-    addresses = [a.upper() for a in mesh["addresses"]]
+    addresses = mesh["addresses"]
     if (
-        len(addresses) != 2
-        or len(set(addresses)) != 2
-        or any(not isinstance(a, str) or a.count(":") != 5 for a in addresses)
+        not isinstance(addresses, list)
+        or len(addresses) != 2
+        or any(
+            not isinstance(a, str)
+            or not re.fullmatch(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", a)
+            for a in addresses
+        )
     ):
+        raise MixedConfigError("meshcore requires two valid BLE addresses")
+    addresses = [a.upper() for a in addresses]
+    if len(set(addresses)) != 2:
         raise MixedConfigError("meshcore requires two distinct BLE addresses")
     mesh["addresses"] = addresses
-    if not isinstance(mesh["channel"], int) or not 0 <= mesh["channel"] <= 255:
+    if type(mesh["channel"]) is not int or not 0 <= mesh["channel"] <= 255:
         raise MixedConfigError("invalid meshcore channel")
 
     mast = hw["meshtastic"]
-    if set(mast) != {"ports", "channel"}:
+    if not isinstance(mast, dict) or set(mast) != {"ports", "channel"}:
         raise MixedConfigError("meshtastic requires exactly ports and channel")
     ports = mast["ports"]
     if (
         not isinstance(ports, list)
         or not 1 <= len(ports) <= 2
+        or any(not isinstance(port, str) or not port.strip() for port in ports)
         or len(set(ports)) != len(ports)
     ):
         raise MixedConfigError("meshtastic requires one or two distinct ports")
@@ -195,12 +205,13 @@ def load_mixed(config_path: Path, matrix_path: Path) -> dict:
         if not path.exists():
             raise MixedConfigError(f"meshtastic port does not exist: {path}")
         resolved.append(str(path))
+    if len(set(resolved)) != len(resolved):
+        raise MixedConfigError("meshtastic ports resolve to the same endpoint")
     mast["ports"] = resolved
-    if not isinstance(mast["channel"], int) or not 0 <= mast["channel"] <= 7:
+    if type(mast["channel"]) is not int or not 0 <= mast["channel"] <= 7:
         raise MixedConfigError("invalid meshtastic channel")
 
-    with matrix_path.open("rb") as stream:
-        matrix = json.load(stream)
+    matrix = json.loads(matrix_bytes)
     try:
         rooms = matrix["rooms"]
         accounts = matrix["accounts"]
@@ -212,14 +223,55 @@ def load_mixed(config_path: Path, matrix_path: Path) -> dict:
             accounts[key]["access_token"]
     except (KeyError, TypeError) as exc:
         raise MixedConfigError(f"campaign matrix file incomplete: {exc}") from exc
-    fingerprint = hashlib.sha256()
-    fingerprint.update(config_path.read_bytes())
-    fingerprint.update(matrix_path.read_bytes())
-    return {
+    if rooms["a"]["room_id"] == rooms["b"]["room_id"]:
+        raise MixedConfigError("ingress and observation rooms must differ")
+    for key in ("a", "b"):
+        if not isinstance(rooms[key]["room_id"], str) or not rooms[key][
+            "room_id"
+        ].startswith("!"):
+            raise MixedConfigError("campaign rooms must be room IDs")
+    if not isinstance(homeserver, str) or not homeserver.startswith(
+        ("http://", "https://")
+    ):
+        raise MixedConfigError("campaign homeserver must be HTTP(S)")
+    from urllib.parse import urlsplit
+
+    server = urlsplit(homeserver)
+    if (
+        not server.hostname
+        or server.username
+        or server.password
+        or server.query
+        or server.fragment
+        or server.path not in ("", "/")
+    ):
+        raise MixedConfigError(
+            "campaign homeserver must be an origin without credentials"
+        )
+    for key in ("m0", "m1", "sender", "witness"):
+        if any(
+            not isinstance(accounts[key][field], str) or not accounts[key][field]
+            for field in ("user_id", "access_token")
+        ):
+            raise MixedConfigError("campaign account identity is incomplete")
+    if (
+        len({accounts[key]["user_id"] for key in ("m0", "m1", "sender", "witness")})
+        != 4
+        or len(
+            {accounts[key]["access_token"] for key in ("m0", "m1", "sender", "witness")}
+        )
+        != 4
+    ):
+        raise MixedConfigError("campaign accounts and tokens must be independent")
+    # Length-prefix both original inputs; hash the exact bytes parsed above.
+    fingerprint = hashlib.sha256(
+        len(hardware_bytes).to_bytes(8, "big") + hardware_bytes + matrix_bytes
+    )
+    config = {
         "hardware": hw,
         "matrix": {
-            "homeserver": homeserver,
-            "rooms": {k: v["room_id"] for k, v in rooms.items()},
+            "homeserver": homeserver.rstrip("/"),
+            "rooms": {k: rooms[k]["room_id"] for k in ("a", "b")},
             "accounts": accounts,
             # Persistent campaign-owned nio crypto store: a fresh per-run
             # store regenerates one-time keys under the same indices the
@@ -229,9 +281,39 @@ def load_mixed(config_path: Path, matrix_path: Path) -> dict:
             # stable across campaign runs, exactly like the rig's
             # persistent medre-normal volume.
             "store_dir": str(matrix_path.parent / "matrix-stores"),
-            "fingerprint": fingerprint.hexdigest(),
+            "input_sha256": fingerprint.hexdigest(),
         },
     }
+
+    config["matrix"]["fingerprint"] = effective_fingerprint(config)
+    return config
+
+
+def effective_fingerprint(config: dict) -> str:
+    """Bind parsed effective settings (including the persistent store path)."""
+    matrix = {k: v for k, v in config["matrix"].items() if k != "fingerprint"}
+    return hashlib.sha256(
+        json.dumps(
+            {"hardware": config["hardware"], "matrix": matrix},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def verify_controller(hw: dict) -> str:
+    """Released owner has no controller selector: refuse ambiguous hosts."""
+    controllers = sorted(
+        p.name
+        for p in Path("/sys/class/bluetooth").glob("hci*")
+        if re.fullmatch(r"hci\d+", p.name)
+    )
+    selected = hw.get("ble_adapter")
+    if len(controllers) != 1 or (selected is not None and selected != controllers[0]):
+        raise MixedConfigError(
+            "mixed campaign requires one available HCI controller matching ble_adapter; released MeshCore owner does not select a controller"
+        )
+    return controllers[0]
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +467,7 @@ def provenance_mixed() -> dict:
         "medre-adapter-meshcore",
         "medre-adapter-meshtastic",
         "meshcore",
+        "mindroom-nio",
         "mtjk",
         "bleak",
     ):
@@ -423,6 +506,8 @@ def configure_mixed(config: dict, role: int, run: Path):
     os.environ["MESHCORE_PEER_CHANNEL"] = str(hw["meshcore"]["channel"])
     if hw.get("ble_adapter"):
         os.environ["MESHCORE_PEER_BLE_ADAPTER"] = hw["ble_adapter"]
+    else:
+        os.environ.pop("MESHCORE_PEER_BLE_ADAPTER", None)
     os.environ["MEDRE_LAB_OWNED_MESHCORE_ADDRESS"] = hw["meshcore"]["addresses"][role]
     os.environ["MEDRE_LAB_OWNED_MESHTASTIC_PORT"] = hw["meshtastic"]["ports"][0]
 
@@ -466,13 +551,50 @@ def configure_mixed(config: dict, role: int, run: Path):
         HEALTHY_SOURCE: rooms["a"],
         HEALTHY_DEST: rooms["b"],
     }
-    endpoints = hw["meshcore"]["addresses"] + hw["meshtastic"]["ports"]
+    endpoints = (
+        hw["meshcore"]["addresses"] + hw["meshtastic"]["ports"] + [matrix["store_dir"]]
+    )
     return listeners, senders, destinations, endpoints
 
 
 # ---------------------------------------------------------------------------
 # Durable-state helpers (mixed, fan-out aware)
 # ---------------------------------------------------------------------------
+
+
+def capture_nonce_states(db: Path, *nonces: str) -> list[dict]:
+    """Released 0.1.2 durable snapshot plus exact native and receipt identity."""
+    con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("BEGIN")
+        snapshots = [_capture_nonce_state(con, nonce) for nonce in nonces]
+        for snapshot in snapshots:
+            for event in snapshot["events"]:
+                canonical = con.execute(
+                    "SELECT source_adapter,source_native_channel_id,source_native_message_id FROM canonical_events WHERE event_id=?",
+                    (event["event_id"],),
+                ).fetchone()
+                if canonical is None:
+                    raise AssertionError("canonical event is absent")
+                event["source_native"] = dict(canonical)
+                for row in event["outbox"]:
+                    row["receipt_id"] = con.execute(
+                        "SELECT receipt_id FROM delivery_outbox WHERE outbox_id=?",
+                        (row["outbox_id"],),
+                    ).fetchone()[0]
+                for receipt in event["receipts"]:
+                    receipt["adapter_message_id"] = con.execute(
+                        "SELECT adapter_message_id FROM delivery_receipts WHERE receipt_id=?",
+                        (receipt["receipt_id"],),
+                    ).fetchone()[0]
+        return snapshots
+    finally:
+        con.close()
+
+
+def capture_nonce_state(db: Path, nonce: str) -> dict:
+    return capture_nonce_states(db, nonce)[0]
 
 
 def _rows_for(snapshot: dict, adapter: str) -> list[dict]:
@@ -485,6 +607,8 @@ def _rows_for(snapshot: dict, adapter: str) -> list[dict]:
 
 
 def _single_row(snapshot: dict, adapter: str) -> dict | None:
+    if len(snapshot["events"]) != 1:
+        return None
     rows = _rows_for(snapshot, adapter)
     return rows[0] if len(rows) == 1 else None
 
@@ -547,14 +671,76 @@ def _final_sent_mixed(snapshot: dict, adapter: str) -> bool:
         for event in snapshot["events"]
         for receipt in event["receipts"]
         if receipt["failure_kind"] not in (None, "transient")
-        or receipt["status"] in ("dead_lettered", "denied")
+        or receipt["status"]
+        in ("dead_lettered", "denied", "cancelled", "abandoned", "suppressed")
+        or (receipt["status"] == "failed" and receipt["failure_kind"] != "transient")
     ]
     return (
-        len(rows) == 1
+        len(snapshot["events"]) == 1
+        and len(rows) == 1
         and rows[0]["status"] == "sent"
         and len(sent) == 1
+        and sent[0]["failure_kind"] is None
+        and rows[0]["receipt_id"] == sent[0]["receipt_id"]
         and not permanent
+        and all(
+            sent[0][key] == rows[0][key]
+            for key in (
+                "outbox_id",
+                "delivery_plan_id",
+                "target_channel",
+                "attempt_number",
+            )
+        )
     )
+
+
+def _mixed_receipt_identity(
+    snapshot: dict, adapter: str, *, outbox_id: str | None = None
+) -> tuple[str, str] | None:
+    if not _final_sent_mixed(snapshot, adapter):
+        return None
+    row = _single_row(snapshot, adapter)
+    if outbox_id is not None and row["outbox_id"] != outbox_id:
+        return None
+    event = snapshot["events"][0]
+    receipt = next(
+        r
+        for r in event["receipts"]
+        if r["target_adapter"] == adapter
+        and r["receipt_kind"] == "attempt"
+        and r["status"] == "sent"
+    )
+    return event["event_id"], receipt["receipt_id"]
+
+
+def _completed_evidence(snapshot: dict, adapter: str) -> dict:
+    """Stable destination evidence; sibling settlement is not mutation."""
+    identity = _mixed_receipt_identity(snapshot, adapter)
+    if identity is None:
+        raise AssertionError("completed delivery lacks exact sent identity")
+    return {
+        "identity": list(identity),
+        "source_native": snapshot["events"][0]["source_native"],
+        "row": _single_row(snapshot, adapter),
+        "receipts": [
+            r
+            for r in snapshot["events"][0]["receipts"]
+            if r["target_adapter"] == adapter
+        ],
+    }
+
+
+def _verify_completed(db: Path, legs: list) -> None:
+    for leg, snapshot in zip(
+        legs, capture_nonce_states(db, *(leg["nonce"] for leg in legs)), strict=True
+    ):
+        if _completed_evidence(snapshot, leg["destination"]) != _completed_evidence(
+            leg["durable"], leg["destination"]
+        ):
+            raise AssertionError(
+                f"completed delivery changed: {leg['nonce']} {leg['destination']}"
+            )
 
 
 def bind_generation(db: Path, nonce: str) -> dict:
@@ -563,11 +749,16 @@ def bind_generation(db: Path, nonce: str) -> dict:
     return {
         "nonce": nonce,
         "event_ids": [event["event_id"] for event in snapshot["events"]],
-        "dest_outbox_ids": {
-            row["target_adapter"]: row["outbox_id"]
-            for event in snapshot["events"]
-            for row in event["outbox"]
-        },
+        "dest_outbox_ids": (
+            {
+                adapter: rows[0]["outbox_id"]
+                for adapter in (HEALTHY_DEST, MESH_ADAPTER)
+                if len(rows := _rows_for(snapshot, adapter)) == 1
+            }
+            if len(snapshot["events"]) == 1
+            and len(snapshot["events"][0]["outbox"]) == 2
+            else {}
+        ),
         "single_event": len(snapshot["events"]) == 1,
         "state": snapshot,
     }
@@ -585,6 +776,38 @@ def _medre_binary() -> Path:
     return candidate
 
 
+async def _sample_command(argv: list[str]):
+    """Bound and reap every inspection child, including on cancellation."""
+
+    def invoke():
+        return subprocess.run(
+            argv, capture_output=True, text=True, timeout=30, check=True
+        )
+
+    return await owned_blocking(invoke)
+
+
+async def _retire_task(task, result: dict, name: str) -> None:
+    if task is None:
+        return
+    task.cancel()
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done():
+                result["cancelled"] = True
+                result["pass"] = False
+        except Exception:
+            break
+    if not task.cancelled():
+        try:
+            task.result()
+        except Exception as exc:
+            result[name + "_error"] = type(exc).__name__
+            result["pass"] = False
+
+
 async def run_sampler(run: Path, db: Path, phases: dict, interval: float) -> None:
     """Shell the released core's read-only inspection CLI on a cadence.
 
@@ -597,9 +820,7 @@ async def run_sampler(run: Path, db: Path, phases: dict, interval: float) -> Non
     """
     medre = _medre_binary()
     path = run / "work-status-series.jsonl"
-    version = subprocess.run(
-        [str(medre), "version"], capture_output=True, text=True, timeout=30
-    )
+    version = await _sample_command([str(medre), "version"])
     header = {
         "sampler": "released-core-read-only",
         "medre_binary": str(medre),
@@ -619,6 +840,7 @@ async def run_sampler(run: Path, db: Path, phases: dict, interval: float) -> Non
         started = time.monotonic()
         sample: dict = {
             "cycle": cycle,
+            "started_monotonic": started,
             "phase": phases.get("current"),
             "phase_elapsed": round(
                 time.monotonic() - phases.get("phase_started_monotonic", started), 3
@@ -626,7 +848,7 @@ async def run_sampler(run: Path, db: Path, phases: dict, interval: float) -> Non
             "ok": False,
         }
         try:
-            work = subprocess.run(
+            work = await _sample_command(
                 [
                     str(medre),
                     "inspect",
@@ -635,21 +857,16 @@ async def run_sampler(run: Path, db: Path, phases: dict, interval: float) -> Non
                     "--storage-path",
                     str(db),
                 ],
-                capture_output=True,
-                text=True,
-                timeout=30,
             )
             sample["work_status"] = json.loads(work.stdout)
             sample["ok"] = True
+            sample["completed_monotonic"] = time.monotonic()
         except Exception as exc:  # noqa: BLE001 - record, never fabricate
             sample["error"] = type(exc).__name__ + ": " + str(exc)[-200:]
         if cycle % 2 == 0:
             try:
-                pressure = subprocess.run(
+                pressure = await _sample_command(
                     [str(medre), "inspect", "pressure", "--storage-path", str(db)],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
                 )
                 sample["pressure"] = json.loads(pressure.stdout)
             except Exception as exc:  # noqa: BLE001
@@ -715,7 +932,7 @@ def _phase_offset(timeline: list) -> float:
         None,
     )
     base = anchor["monotonic"] if anchor else time.monotonic()
-    return round(time.monotonic() - base, 3)
+    return time.monotonic() - base
 
 
 def _leg_record(source, destination, nonce, sent, seen_packets) -> dict:
@@ -749,10 +966,10 @@ async def _wait_leg_committed(
     def committed() -> bool:
         nonlocal snapshot
         snapshot = capture_nonce_state(db, leg["nonce"])
-        return _sent_receipt_identity(snapshot, destination) is not None
+        return _mixed_receipt_identity(snapshot, destination) is not None
 
     ok, waited = await _wait_for(committed, timeout, 0.2)
-    identity = _sent_receipt_identity(snapshot, destination)
+    identity = _mixed_receipt_identity(snapshot, destination)
     if not ok or identity is None:
         raise AssertionError(
             f"leg {leg['source']}->{leg['destination']} lacks one failure-free "
@@ -782,6 +999,10 @@ async def _run_leg_mixed(
     far-side observation.
     """
     sent = await owned_blocking(senders[source], nonce)
+    if source == MESH_ADAPTER and (
+        len(sent.get("sent", [])) != 1 or sent["sent"][0].get("error") is not False
+    ):
+        raise AssertionError("native mesh sender did not confirm the send")
     packets = await owned_blocking(
         _observe_window,
         peer,
@@ -791,6 +1012,28 @@ async def _run_leg_mixed(
         packets = [p for p in packets if p.get("room_id") == observation_room]
     leg = _leg_record(source, destination, nonce, sent, packets)
     await _wait_leg_committed(db, leg, destination, hw["observation_timeout"])
+    event = leg["durable"]["events"][0]
+    receipt = next(r for r in event["receipts"] if r["receipt_id"] == leg["receipt_id"])
+    matches = [p for p in packets if nonce in str(p.get("text", ""))]
+    if source == HEALTHY_SOURCE:
+        native_source = event["source_native"]
+        if (
+            native_source["source_adapter"] != source
+            or native_source["source_native_message_id"] != sent.get("event_id")
+            or native_source["source_native_channel_id"] != sent.get("room_id")
+        ):
+            raise AssertionError("leg canonical source does not match Matrix send")
+    if observation_room is not None:
+        leg["observed_once"] = leg["observed_once"] and (
+            receipt["target_channel"] == observation_room
+            and bool(receipt["adapter_message_id"])
+            and matches[0].get("event_id") == receipt["adapter_message_id"]
+        )
+    else:
+        leg["observed_once"] = (
+            leg["observed_once"]
+            and matches[0].get("channel") == hw["meshcore"]["channel"]
+        )
     return leg
 
 
@@ -802,7 +1045,7 @@ def _listener_lifetime(hw: dict) -> float:
     )
 
 
-def _sampler_counts(run: Path) -> dict:
+def _sampler_counts(run: Path, timeline: list, fault: dict) -> dict:
     path = run / "work-status-series.jsonl"
     counts: dict = {}
     if not path.exists():
@@ -815,9 +1058,25 @@ def _sampler_counts(run: Path) -> dict:
                 continue
             if "header" in record:
                 continue
-            phase = record.get("phase")
-            if record.get("ok") and phase:
-                counts.setdefault(phase, []).append(record.get("phase_elapsed"))
+            if not record.get("ok"):
+                continue
+            anchor = timeline[0]["monotonic"]
+            start = record["started_monotonic"] - anchor
+            end = record["completed_monotonic"] - anchor
+            if end < fault["disconnect_offset"] and record.get("phase") == "baseline":
+                phase = "baseline"
+            elif (
+                fault["disconnect_offset"]
+                < start
+                <= end
+                < fault["last_disconnected_offset"]
+            ):
+                phase = "interruption"
+            elif start > fault["rejoin_offset"]:
+                phase = "recovery"
+            else:
+                continue
+            counts.setdefault(phase, []).append({"start": start, "end": end})
     return counts
 
 
@@ -835,15 +1094,16 @@ async def _fault_action(app, run: Path, hw: dict, timeline: list) -> dict:
     diag_before = meshcore.diagnostics()
     if (diag_before.get("session") or {}).get("connected") is not True:
         raise RuntimeError("meshcore session not connected before the fault stage")
+    controller = verify_controller(hw)
     evidence: dict = {
         "occurred": False,
         "action": "worker-owned busctl disconnect of the MEDRE-owned board",
         "owned_address": owned_address,
-        "controller": hw.get("ble_adapter"),
+        "controller": controller,
         "pre_interrupt_diagnostics": diag_before.get("session", {}),
     }
     action = asyncio.create_task(
-        owned_blocking(_disconnect_owned, run, owned_address, hw.get("ble_adapter"))
+        owned_blocking(_disconnect_owned, run, owned_address, controller)
     )
     disconnected: dict = {}
 
@@ -859,6 +1119,8 @@ async def _fault_action(app, run: Path, hw: dict, timeline: list) -> dict:
         if not ok:
             raise RuntimeError("owned meshcore link did not disconnect within 60s")
         evidence["disconnect_offset"] = _phase_offset(timeline)
+        await asyncio.shield(action)
+        evidence["disconnect_command_succeeded"] = True
         evidence["disconnect_wait_seconds"] = round(waited, 3)
         evidence["disconnect_diagnostics"] = disconnected
         evidence["occurred"] = True
@@ -873,16 +1135,17 @@ async def _fault_action(app, run: Path, hw: dict, timeline: list) -> dict:
     return evidence
 
 
-async def _observe_rejoin(adapter, timeout: float, timeline: list):
+async def _observe_rejoin(adapter, timeout: float, timeline: list, phases: dict):
     """Poll the session diagnostics until the first connected observation.
 
     The MeshCore session resets its reconnect-attempt counter to zero on
-    success, so the peak observed counter is recorded as evidence only
-    (never asserted); the rejoin moment is the first connected observation,
-    expressed on the shared phase clock.
+    success, so the peak observed counter is evidence only. The transition
+    lies between the last disconnected and first connected observation;
+    neither poll is asserted to be the actual transition instant.
     """
     started = time.monotonic()
     peak = 0
+    last_disconnected = None
     while True:
         diag = _session_diag(adapter)
         try:
@@ -890,7 +1153,11 @@ async def _observe_rejoin(adapter, timeout: float, timeline: list):
         except (TypeError, ValueError):
             pass
         if diag.get("connected") is True and diag.get("reconnecting") is False:
-            return _phase_offset(timeline), peak
+            upper = _phase_offset(timeline)
+            phases.update(current="recovery", phase_started_monotonic=time.monotonic())
+            return upper, peak, last_disconnected
+        if diag.get("connected") is False:
+            last_disconnected = _phase_offset(timeline)
         if time.monotonic() - started > timeout:
             raise RuntimeError("meshcore session did not rejoin after the burst")
         await asyncio.sleep(0.5)
@@ -905,6 +1172,8 @@ async def run_mixed_baseline(
 ) -> bool:
     """Baseline owner phase: healthy legs, MeshCore fault, in-window proof."""
 
+    if role not in (0, 1):
+        raise ValueError("invalid mixed owner role")
     if not math.isfinite(interrupt_wait) or interrupt_wait <= 0:
         raise ValueError("interrupt_wait must be finite and positive")
     if not 1 <= int(burst_count) <= 6:
@@ -950,6 +1219,8 @@ async def _run_mixed_baseline_owned(
     armed: dict = {}
     tail_send: "asyncio.Future[dict] | None" = None
     sampler_task: "asyncio.Task | None" = None
+    rejoin_watch = None
+    witness_task = None
     phases = {"current": "baseline", "phase_started_monotonic": time.monotonic()}
     state: dict = {
         "phase": "mixed-baseline",
@@ -998,6 +1269,7 @@ async def _run_mixed_baseline_owned(
         mesh_armed = await _arm(
             listeners, {"mesh": listeners["mesh"]}, _listener_lifetime(hw)
         )
+        armed.update(mesh_armed)
         mesh_peer = mesh_armed["mesh"]["peer"]
         leg2 = await _run_leg_mixed(
             db,
@@ -1023,7 +1295,7 @@ async def _run_mixed_baseline_owned(
         )
         result["legs"].append(leg3)
         timeline.append({"stage": "leg3-m0-m1", "at": _now()})
-        await _disarm_listeners(mesh_armed)
+        await _disarm_listeners({"mesh": armed.pop("mesh")})
 
         state["completed_legs"] = [
             {
@@ -1039,27 +1311,37 @@ async def _run_mixed_baseline_owned(
         _write_json(run / "continuity-state.json", state)
 
         # -- declared fault window -----------------------------------------
-        await _disarm_listeners(armed)
-        armed = {}
+        # Arm both independent observers before interruption. The existing
+        # Matrix listener retains its cursor; the native peer uses the other board.
+        armed.update(
+            await _arm(listeners, {"mesh": listeners["mesh"]}, _listener_lifetime(hw))
+        )
+        mesh_peer = armed["mesh"]["peer"]
+        mesh_ready = time.monotonic()
+        witness = armed["witness"]["peer"]
+        # Poll continuously while the producer posts and rejoin is observed.
+        # The task ends after a successful sync beyond the upper rejoin bound.
+        witness_done = asyncio.Event()
+
+        async def collect_witness():
+            packets = []
+            while not witness_done.is_set():
+                packets = await owned_blocking(
+                    witness.packets_until, lambda _: False, 1.0
+                )
+            return packets
+
+        witness_task = asyncio.create_task(collect_witness())
         phases.update(current="interruption", phase_started_monotonic=time.monotonic())
         result["interrupt"] = await _fault_action(app, run, hw, timeline)
-        # Observe the rejoin continuously from the disconnect: the session's
-        # own recovery loop runs concurrently with the burst, so the honest
-        # rejoin moment is the FIRST connected observation after the fault,
-        # polled on the same phase clock the witness offsets use.
-        meshcore_adapter = app.adapters[MESH_ADAPTER]
         rejoin_watch = asyncio.create_task(
-            _observe_rejoin(meshcore_adapter, hw["startup_timeout"] + 300.0, timeline)
+            _observe_rejoin(
+                app.adapters[MESH_ADAPTER],
+                hw["startup_timeout"] + 300.0,
+                timeline,
+                phases,
+            )
         )
-
-        # Independent recipient armed INSIDE the window, before the burst.
-        # Its arm time anchors its packet offsets in the phase clock, so
-        # witness observations share one clock with the fault offsets.
-        armed = await _arm(
-            listeners, {"witness": listeners["witness"]}, _listener_lifetime(hw)
-        )
-        witness_arm_phase = _phase_offset(timeline)
-        witness = armed["witness"]["peer"]
         burst = [_nonce() for _ in range(burst_count)]
         posted = {}
         for nonce in burst:
@@ -1069,75 +1351,63 @@ async def _run_mixed_baseline_owned(
                 "send_event_id": sent.get("event_id"),
             }
         timeline.append({"stage": "fault-window-burst", "at": _now()})
-
-        # Bounded wait for the independent recipient; the fault window itself
-        # stays open until the rejoin is observed below.
-        witness_packets = await owned_blocking(
-            _observe_window, witness, FAULT_WINDOW_WITNESS_WAIT_SECONDS
+        rejoin_offset, rejoin_peak, last_disconnected = await rejoin_watch
+        rejoin_watch = None
+        if (
+            last_disconnected is None
+            or last_disconnected <= result["interrupt"]["disconnect_offset"]
+        ):
+            raise AssertionError("no conservatively bounded disconnected interval")
+        anchor = timeline[0]["monotonic"]
+        # Wait for a successful cursor advance after the upper transition bound.
+        ok, _ = await _wait_for(
+            lambda: witness_task.done()
+            or (witness.last_sync_monotonic or 0) > anchor + rejoin_offset,
+            FAULT_WINDOW_WITNESS_WAIT_SECONDS,
+            0.1,
         )
-        unaffected_obs = [
-            {
-                "nonce": nonce,
-                # Convert the listener-relative offset into the shared phase
-                # clock: witness armed at witness_arm_phase, packet seen
-                # observed_offset after that arm. Only room-B packets count:
-                # the assertion room is the independent recipient's room
-                # (the healthy route's delivery surface). Room-A sightings
-                # of the same nonce are the sender's ingress echo and are
-                # recorded separately, never as healthy-route deliveries.
-                "observed_offset": round(
-                    witness_arm_phase + packet.get("observed_offset", 0), 3
-                ),
-                "listener_offset": packet.get("observed_offset"),
-                "event_id": packet.get("event_id"),
-                "room_id": packet.get("room_id"),
-            }
-            for packet in witness_packets
-            for nonce in burst
-            if nonce in str(packet.get("text", ""))
-            and packet.get("room_id") == config["matrix"]["rooms"]["b"]
-        ]
-        ingress_echo = [
-            {
-                "nonce": nonce,
-                "observed_offset": round(
-                    witness_arm_phase + packet.get("observed_offset", 0), 3
-                ),
-                "room_id": packet.get("room_id"),
-            }
-            for packet in witness_packets
-            for nonce in burst
-            if nonce in str(packet.get("text", ""))
-            and packet.get("room_id") == config["matrix"]["rooms"]["a"]
-        ]
-        # The mesh peer arms before the rejoin so the affected route's
-        # silence inside the window is observable on the shared phase clock.
-        mesh_arm_phase = _phase_offset(timeline)
-        mesh_entry = await _arm(
-            listeners, {"mesh": listeners["mesh"]}, _listener_lifetime(hw)
-        )
-        mesh_peer = mesh_entry["mesh"]["peer"]
+        if not ok or witness_task.done():
+            if witness_task.done():
+                witness_task.result()
+            raise AssertionError("Matrix witness did not cover the fault window")
+        witness_done.set()
+        witness_packets = await witness_task
+        witness_task = None
 
-        # Rejoin completes the declared window: first connected observation
-        # after the disconnect, from the continuous watcher.
-        phases.update(current="recovery", phase_started_monotonic=time.monotonic())
-        try:
-            rejoin_offset, rejoin_peak = await asyncio.wait_for(
-                rejoin_watch, hw["startup_timeout"] + 60.0
+        def sightings(room):
+            return [
+                {
+                    "nonce": nonce,
+                    "observed_offset": packet["observed_monotonic"] - anchor,
+                    "event_id": packet.get("event_id"),
+                    "room_id": packet.get("room_id"),
+                    "sender": packet.get("sender"),
+                    "occurrences": str(packet.get("text", "")).count(nonce),
+                }
+                for packet in witness_packets
+                for nonce in burst
+                if nonce in str(packet.get("text", ""))
+                and packet.get("room_id") == room
+            ]
+
+        unaffected_obs = sightings(config["matrix"]["rooms"]["b"])
+        if any(
+            obs["sender"] != config["matrix"]["accounts"]["m1"]["user_id"]
+            for obs in unaffected_obs
+        ):
+            raise AssertionError(
+                "room-B witness saw a matching nonce from an unexpected sender"
             )
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(
-                "meshcore session did not rejoin after the burst"
-            ) from exc
+        ingress_echo = sightings(config["matrix"]["rooms"]["a"])
         timeline.append({"stage": "link-rejoined", "at": _now()})
         result["interrupt"].update(
             {
                 "rejoin_offset": rejoin_offset,
+                "last_disconnected_offset": last_disconnected,
                 "rejoined": True,
                 "rejoin_peak_reconnect_attempts": rejoin_peak,
-                "rejoin_window_total_seconds": round(
-                    rejoin_offset - result["interrupt"]["disconnect_offset"], 3
-                ),
+                "rejoin_window_total_seconds": rejoin_offset
+                - result["interrupt"]["disconnect_offset"],
             }
         )
 
@@ -1170,11 +1440,10 @@ async def _run_mixed_baseline_owned(
                     }
                     for nonce in burst
                 ],
-                "observations": [
-                    obs
-                    for obs in unaffected_obs
-                    if generation[obs["nonce"]]["single_event"]
-                ],
+                "observations": unaffected_obs,
+                "coverage_complete": witness.ready_monotonic
+                < anchor + result["interrupt"]["disconnect_offset"]
+                and witness.last_sync_monotonic > anchor + rejoin_offset,
             },
             "affected": {
                 "manifest": [
@@ -1207,59 +1476,137 @@ async def _run_mixed_baseline_owned(
         recovery_packets = await owned_blocking(
             _observe_window, mesh_peer, FAULT_RECOVERY_OBSERVE_SECONDS
         )
-        delivered_after = sorted(
-            {
-                nonce
-                for packet in recovery_packets
-                for nonce in burst
-                if nonce in str(packet.get("text", ""))
-            }
-        )
-        during_fault = [
+        # Native peer callbacks timestamp on the same host monotonic clock.
+        # Count uncertainty-boundary packets as contradictions, never silence.
+        mesh_sightings = [
             {
                 "nonce": nonce,
-                "observed_offset": round(mesh_arm_phase + packet["observed_offset"], 3),
+                "observed_offset": (
+                    packet["observed_monotonic"] - anchor
+                    if isinstance(packet.get("observed_monotonic"), (int, float))
+                    else None
+                ),
             }
             for packet in recovery_packets
             for nonce in burst
             if nonce in str(packet.get("text", ""))
-            and isinstance(packet.get("observed_offset"), (int, float))
-            and mesh_arm_phase + packet["observed_offset"] < rejoin_offset
         ]
+        if any(
+            sum(str(packet.get("text", "")).count(nonce) for nonce in burst) != 1
+            or packet.get("channel") != hw["meshcore"]["channel"]
+            for packet in recovery_packets
+            if any(nonce in str(packet.get("text", "")) for nonce in burst)
+        ):
+            raise AssertionError("ambiguous or mis-scoped MeshCore packet evidence")
+        during_fault = [
+            p
+            for p in mesh_sightings
+            if p["observed_offset"] is None
+            or not math.isfinite(p["observed_offset"])
+            or p["observed_offset"] <= rejoin_offset
+        ]
+        delivered_after = sorted(
+            p["nonce"]
+            for p in mesh_sightings
+            if p["observed_offset"] is not None and p["observed_offset"] > rejoin_offset
+        )
         result["a3"]["affected"].update(
             {
                 "post_rejoin_delivered_nonces": delivered_after,
                 "post_rejoin_outcome": (
                     "all_delivered"
-                    if ok and len(delivered_after) == burst_count
+                    if ok and delivered_after == sorted(burst)
                     else "partial" if delivered_after else "not_delivered"
                 ),
                 "observations_during_fault": during_fault,
+                "coverage_complete": mesh_ready
+                < anchor + result["interrupt"]["disconnect_offset"]
+                and mesh_peer._owner.poll() is None,
                 "recovery_wait_seconds": round(waited, 3),
                 "mesh_peer_window_packets": len(recovery_packets),
             }
         )
+
+        # Correlate independently observed room-B event IDs and actual ingress
+        # event IDs to the original durable generations, not nonce text alone.
+        final_snapshots = capture_nonce_states(db, *burst)
+        for nonce, snapshot in zip(burst, final_snapshots, strict=True):
+            binding = generation[nonce]
+            binding["matrix_ingress_event_id"] = posted[nonce]["send_event_id"]
+            binding["matrix_source_matches"] = False
+            binding["matrix_delivery_event_id"] = None
+            if len(snapshot["events"]) != 1:
+                continue
+            event = snapshot["events"][0]
+            source = event["source_native"]
+            binding["matrix_source_matches"] = (
+                event["event_id"] == binding["event_id"]
+                and source["source_adapter"] == HEALTHY_SOURCE
+                and source["source_native_channel_id"] == config["matrix"]["rooms"]["a"]
+                and source["source_native_message_id"] == posted[nonce]["send_event_id"]
+            )
+            identity = _mixed_receipt_identity(
+                snapshot,
+                HEALTHY_DEST,
+                outbox_id=binding["dest_outbox_ids"].get(HEALTHY_DEST),
+            )
+            if identity is not None and binding["dest_outbox_ids"].get(HEALTHY_DEST):
+                receipt = next(
+                    r for r in event["receipts"] if r["receipt_id"] == identity[1]
+                )
+                if receipt["target_channel"] == config["matrix"]["rooms"]["b"]:
+                    binding["matrix_delivery_event_id"] = receipt["adapter_message_id"]
 
         # The A-3 evaluation from captured offsets (pure evaluator).
         transcript = {
             "fault": {
                 "occurred": result["interrupt"].get("occurred") is True,
                 "action": result["interrupt"].get("action"),
+                "disconnect_command_succeeded": result["interrupt"].get(
+                    "disconnect_command_succeeded"
+                ),
                 "disconnect_offset": result["interrupt"].get("disconnect_offset"),
                 "rejoin_offset": result["interrupt"].get("rejoin_offset"),
+                "last_disconnected_offset": last_disconnected,
             },
             "unaffected": result["a3"]["unaffected"],
             "affected": result["a3"]["affected"],
             "generation_binding": generation,
-            "sampler": _sampler_counts(run),
+            "sampler": _sampler_counts(run, timeline, result["interrupt"]),
         }
         result["a3"]["evaluation"] = evaluate_a3(transcript)
         state["a3_transcript"] = transcript
         _write_json(run / "continuity-state.json", state)
 
         # -- pending capture for the reopen phase ---------------------------
-        await _disarm_listeners(armed)
-        armed = dict(mesh_entry)
+        if (
+            result["a3"]["evaluation"]["pass"]
+            and result["a3"]["affected"]["post_rejoin_outcome"] == "all_delivered"
+        ):
+            # Retain the completed burst generations, not just the initial legs.
+            for nonce, snapshot in zip(burst, final_snapshots, strict=True):
+                for dest in (HEALTHY_DEST, MESH_ADAPTER):
+                    identity = _mixed_receipt_identity(
+                        snapshot,
+                        dest,
+                        outbox_id=generation[nonce]["dest_outbox_ids"][dest],
+                    )
+                    if identity is None or identity[0] != generation[nonce]["event_id"]:
+                        raise AssertionError("burst delivery lacks exact sent receipt")
+                    state["completed_legs"].append(
+                        {
+                            "nonce": nonce,
+                            "destination": dest,
+                            "event_id": identity[0],
+                            "receipt_id": identity[1],
+                            "durable": snapshot,
+                        }
+                    )
+        else:
+            raise AssertionError("A-3 or affected-route recovery did not qualify")
+        await _retire_task(sampler_task, result, "sampler")
+        sampler_task = None
+        await _disarm_listeners({"witness": armed.pop("witness")})
         phases.update(
             current="pending-capture", phase_started_monotonic=time.monotonic()
         )
@@ -1271,27 +1618,25 @@ async def _run_mixed_baseline_owned(
 
         await teardown_owner_mixed(app, result, armed)
         app = None
-        result["pending_capture"]["pending"]["native_send"] = await tail_send
+        result["pending_capture"]["pending"]["native_send"] = await asyncio.shield(
+            tail_send
+        )
         tail_send = None
         _verify_stopped_capture_mixed(run, result["pending_capture"])
         state["pending_capture"] = result["pending_capture"]
         _write_json(run / "continuity-state.json", state)
+        _verify_completed(db, state["completed_legs"])
         timeline.append({"stage": "owner-stopped", "at": _now()})
         await _disarm_listeners(armed)
         armed = {}
-
-        if sampler_task is not None:
-            sampler_task.cancel()
-            try:
-                await sampler_task
-            except asyncio.CancelledError:
-                pass
-            sampler_task = None
 
         result["timeline"] = timeline
         result["pass"] = (
             all(leg.get("observed_once") for leg in result["legs"])
             and result["a3"]["evaluation"]["pass"] is True
+            and result["a3"]["affected"]["post_rejoin_outcome"] == "all_delivered"
+            and not result.get("sampler_error")
+            and not result.get("cancelled")
             and result["interrupt"].get("rejoined") is True
             and result["pending_capture"].get("captured") is True
             and not result.get("surviving_sdk_children")
@@ -1299,16 +1644,15 @@ async def _run_mixed_baseline_owned(
         )
     except BaseException as exc:
         result["error"] = type(exc).__name__ + ": " + str(exc)[-1600:]
-        result["cancelled"] = isinstance(exc, asyncio.CancelledError)
+        result["cancelled"] = bool(result.get("cancelled")) or isinstance(
+            exc, asyncio.CancelledError
+        )
         result["timeline"] = timeline
-        if sampler_task is not None:
-            sampler_task.cancel()
-            try:
-                await sampler_task
-            except asyncio.CancelledError:
-                pass
-            sampler_task = None
-        if tail_send is not None and not tail_send.done():
+        await _retire_task(sampler_task, result, "sampler")
+        sampler_task = None
+        await _retire_task(rejoin_watch, result, "rejoin_watcher")
+        await _retire_task(witness_task, result, "witness")
+        if tail_send is not None:
             await _drain_send(tail_send)
             tail_send = None
         try:
@@ -1334,6 +1678,8 @@ async def _run_mixed_baseline_owned(
         state["baseline_finished_at"] = _now()
         _write_json(run / "continuity-state.json", state)
         _write_json(run / "mixed-baseline-verdict.json", result)
+    if result.get("cancelled"):
+        raise asyncio.CancelledError
     return bool(result.get("pass"))
 
 
@@ -1425,8 +1771,7 @@ def _verify_stopped_capture_mixed(run: Path, capture: dict) -> None:
         or current_head["outbox_id"] != original_head["outbox_id"]
         or current_tail["outbox_id"] != original_tail["outbox_id"]
         or not _tail_pending_mixed(tail_snap)
-        or current_head["status"] in ("sent", "queued")
-        or not _pre_handoff(current_head)
+        or not _head_boundary_mixed(head_snap)
         or _mesh_receipts(head_snap)
         or _mesh_receipts(tail_snap)
     ):
@@ -1444,6 +1789,8 @@ def _verify_stopped_capture_mixed(run: Path, capture: dict) -> None:
 
 async def run_mixed_reopen(config: dict, role: int, run: Path) -> bool:
     """Fresh-process reopen on the same campaign database and profiles."""
+    if role not in (0, 1):
+        raise ValueError("invalid mixed owner role")
     with own_run(run):
         listeners, senders, destinations, endpoints = configure_mixed(config, role, run)
         with own(endpoints):
@@ -1484,6 +1831,8 @@ async def _run_mixed_reopen_owned(config, role, run, listeners, senders) -> bool
             baseline.get("phase") != "mixed-baseline"
             or baseline.get("pass") is not True
             or state.get("config_sha256") != config["matrix"]["fingerprint"]
+            or state.get("role") != result["role"]
+            or baseline.get("role") != result["role"]
         ):
             raise RuntimeError(
                 "reopen requires a matching successful mixed baseline and configuration"
@@ -1507,9 +1856,10 @@ async def _run_mixed_reopen_owned(config, role, run, listeners, senders) -> bool
         persisted_ok = True
         for leg in completed:
             snapshot = before[leg["nonce"]]
-            identity = _sent_receipt_identity(snapshot, leg["destination"])
+            identity = _mixed_receipt_identity(snapshot, leg["destination"])
             if identity is None or identity != (leg["event_id"], leg["receipt_id"]):
                 persisted_ok = False
+        _verify_completed(db, completed)
         result["persisted"] = {
             "completed_identities_retained": persisted_ok,
             "completed_count": len(completed),
@@ -1601,10 +1951,14 @@ async def _run_mixed_reopen_owned(config, role, run, listeners, senders) -> bool
             )
             result["legs"].append(leg)
 
+            await _retire_task(sampler_task, result, "sampler")
+            sampler_task = None
             await teardown_owner_mixed(app, result, armed)
             app = None
             timeline.append({"stage": "owner-restopped", "at": _now()})
         finally:
+            await _retire_task(sampler_task, result, "sampler")
+            sampler_task = None
             if app is not None:
                 try:
                     await teardown_owner_mixed(app, result, armed)
@@ -1615,14 +1969,6 @@ async def _run_mixed_reopen_owned(config, role, run, listeners, senders) -> bool
             else:
                 await _disarm_listeners(armed)
 
-        if sampler_task is not None:
-            sampler_task.cancel()
-            try:
-                await sampler_task
-            except asyncio.CancelledError:
-                pass
-            sampler_task = None
-
         # Completed deliveries stay settled: no durable change after the fact.
         all_completed = completed + [
             {
@@ -1632,9 +1978,11 @@ async def _run_mixed_reopen_owned(config, role, run, listeners, senders) -> bool
             }
             for leg in result["legs"]
         ]
-        _stale_backlog_observation(run, all_completed)
+        _verify_completed(db, all_completed)
         result["pending_after"] = capture_nonce_state(db, pending_nonce)
-        if result["pending_after"] != result["disposition"]["pending_after"]:
+        if _completed_evidence(
+            result["pending_after"], MESH_ADAPTER
+        ) != _completed_evidence(result["disposition"]["pending_after"], MESH_ADAPTER):
             raise AssertionError(
                 "pending replay durable state changed after observation"
             )
@@ -1644,7 +1992,7 @@ async def _run_mixed_reopen_owned(config, role, run, listeners, senders) -> bool
         outstanding = []
         for leg in all_completed:
             snapshot = capture_nonce_state(db, leg["nonce"])
-            if _sent_receipt_identity(snapshot, leg["destination"]) is None:
+            if _mixed_receipt_identity(snapshot, leg["destination"]) is None:
                 outstanding.append(leg["nonce"])
         result["final_reconciliation"] = {
             "completed_count": len(all_completed),
@@ -1656,20 +2004,19 @@ async def _run_mixed_reopen_owned(config, role, run, listeners, senders) -> bool
             result["disposition"].get("pending_reconciled") is True
             and all(leg.get("observed_once") for leg in result["legs"])
             and result["final_reconciliation"]["final_snapshot_matches_completed"]
+            and not result.get("sampler_error")
+            and not result.get("cancelled")
             and not result.get("surviving_sdk_children")
             and not _child_pids()
         )
     except BaseException as exc:
         result["error"] = type(exc).__name__ + ": " + str(exc)[-1600:]
-        result["cancelled"] = isinstance(exc, asyncio.CancelledError)
+        result["cancelled"] = bool(result.get("cancelled")) or isinstance(
+            exc, asyncio.CancelledError
+        )
         result["timeline"] = timeline
-        if sampler_task is not None:
-            sampler_task.cancel()
-            try:
-                await sampler_task
-            except asyncio.CancelledError:
-                pass
-            sampler_task = None
+        await _retire_task(sampler_task, result, "sampler")
+        sampler_task = None
         try:
             if app is not None:
                 await teardown_owner_mixed(app, result, armed)
@@ -1692,6 +2039,8 @@ async def _run_mixed_reopen_owned(config, role, run, listeners, senders) -> bool
         state["reopen_finished_at"] = _now()
         _write_state_mixed(run, state)
         _write_json(run / "mixed-reopen-verdict.json", result)
+    if result.get("cancelled"):
+        raise asyncio.CancelledError
     return bool(result.get("pass"))
 
 
@@ -1715,23 +2064,31 @@ async def _disposition_mixed(
     db = run / "state.sqlite"
     mesh_peer = armed["mesh"]["peer"]
 
-    ok, waited = await _wait_for(
-        lambda: _sent_receipt_event_id(
-            capture_nonce_state(db, pending_nonce),
-            MESH_ADAPTER,
-            outbox_id=pending_outbox_id,
-        )
-        is not None,
-        RECONCILE_WAIT_SECONDS,
-        0.2,
-    )
+    accepted = None
+
+    def pending_sent() -> bool:
+        nonlocal accepted
+        snapshot = capture_nonce_state(db, pending_nonce)
+        if (
+            _mixed_receipt_identity(snapshot, MESH_ADAPTER, outbox_id=pending_outbox_id)
+            is None
+        ):
+            return False
+        accepted = _completed_evidence(snapshot, MESH_ADAPTER)
+        return True
+
+    ok, waited = await _wait_for(pending_sent, RECONCILE_WAIT_SECONDS, 0.2)
     pending_reconciled = ok
     if pending_reconciled:
         observed = await owned_blocking(
             _observe_window, mesh_peer, hw["observation_timeout"]
         )
         hits = [p for p in observed if pending_nonce in str(p.get("text", ""))]
-        pending_reconciled = len(hits) == 1
+        pending_reconciled = (
+            len(hits) == 1
+            and str(hits[0].get("text", "")).count(pending_nonce) == 1
+            and hits[0].get("channel") == hw["meshcore"]["channel"]
+        )
     timeline.append(
         {
             "stage": "pending-disposition",
@@ -1749,14 +2106,17 @@ async def _disposition_mixed(
         db, pending_nonce, uncertain_nonce
     )
     pending_reconciled = pending_reconciled and (
-        _sent_receipt_event_id(pending_after, MESH_ADAPTER, outbox_id=pending_outbox_id)
+        _mixed_receipt_identity(
+            pending_after, MESH_ADAPTER, outbox_id=pending_outbox_id
+        )
         is not None
+        and _completed_evidence(pending_after, MESH_ADAPTER) == accepted
     )
     return {
         "pending_reconciled": pending_reconciled,
         "pending_after": pending_after,
         "uncertain_after": uncertain_after,
-        "uncertain_progressed": _sent_receipt_event_id(uncertain_after, MESH_ADAPTER)
+        "uncertain_progressed": _mixed_receipt_identity(uncertain_after, MESH_ADAPTER)
         is not None,
         "uncertain_final_statuses": sorted(
             {

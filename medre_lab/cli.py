@@ -176,6 +176,8 @@ def continuity(
     snapshot = run / "effective-config.toml"
     write_effective_config(snapshot, cfg)
     hw = cfg["hardware"]
+    # Include each native send plus both independent and durable observation
+    # waits for healthy legs, pending capture/disposition and fixed fault waits.
     baseline_timeout = (
         hw["startup_timeout"]
         + 3 * (hw["send_timeout"] + hw["observation_timeout"])
@@ -184,7 +186,8 @@ def continuity(
     )
     reopen_timeout = (
         hw["startup_timeout"]
-        + 2 * (hw["send_timeout"] + hw["observation_timeout"])
+        + 2 * hw["send_timeout"]
+        + 5 * hw["observation_timeout"]
         + 900
     )
     boundary: dict = {}
@@ -250,27 +253,37 @@ def mixed_continuity(
     hardware_toml: Path,
 ) -> int:
     """Mixed-transport A-3 continuity case: two owned worker phases."""
-    from .mixed_continuity import load_mixed
+    from .mixed_continuity import effective_fingerprint, load_mixed, verify_controller
 
+    if not 1 <= burst_count <= 6:
+        raise ValueError("burst-count must be between 1 and 6")
     matrix_path = Path(matrix_json).expanduser()
     if not matrix_path.is_file():
         raise ValueError(f"campaign matrix file not found: {matrix_path}")
     config = load_mixed(hardware_toml, matrix_path)
     hw = config["hardware"]
+    hw["ble_adapter"] = verify_controller(hw)
+    config["matrix"]["fingerprint"] = effective_fingerprint(config)
     transports = ("matrix", "meshcore", "meshtastic")
     run = _hardware_run_dir(
         root, transports, role, Path(run_root) if run_root else None
     )
     run.mkdir(parents=True, mode=0o700)
+    snapshot = run / "effective-mixed-config.json"
+    # Private directory and atomic publication; never copy credentials to logs.
+    _write_json(snapshot, config)
+    snapshot.chmod(0o600)
     baseline_timeout = (
         hw["startup_timeout"]
-        + 3 * (hw["send_timeout"] + hw["observation_timeout"])
+        + (5 + burst_count) * hw["send_timeout"]
+        + 7 * hw["observation_timeout"]
         + 240
         + 900
     )
     reopen_timeout = (
         hw["startup_timeout"]
-        + 2 * (hw["send_timeout"] + hw["observation_timeout"])
+        + 2 * hw["send_timeout"]
+        + 3 * hw["observation_timeout"]
         + 900
     )
     boundary: dict = {}
@@ -284,8 +297,8 @@ def mixed_continuity(
             sys.executable,
             "-m",
             "medre_lab.mixed_worker",
-            str(hardware_toml),
-            str(matrix_path),
+            "--effective-config",
+            str(snapshot),
             str(0 if role == "a" else 1),
             str(run),
             phase,
@@ -383,6 +396,11 @@ def main(argv=None):
         default=None,
         help="private directory for the run (default: <root>/evidence)",
     )
+    preflight = hw.add_parser(
+        "mixed-preflight", help="validate mixed inputs and controller without RF"
+    )
+    preflight.add_argument("--hardware-toml", required=True, type=Path)
+    preflight.add_argument("--matrix-json", required=True, type=Path)
     mixed = hw.add_parser(
         "mixed-continuity",
         help="mixed-transport A-3 case (matrix+meshcore+meshtastic, two owned phases)",
@@ -402,6 +420,7 @@ def main(argv=None):
     mixed.add_argument(
         "--burst-count",
         type=int,
+        choices=range(1, 7),
         default=3,
         help="fault-window burst size per route class (1-6)",
     )
@@ -426,6 +445,19 @@ def main(argv=None):
         if args.command == "hardware":
             if args.action == "run":
                 return hardware(root, config, args.pair, args.role, args.run_root)
+            if args.action == "mixed-preflight":
+                from .mixed_continuity import load_mixed, verify_controller
+
+                cfg = load_mixed(args.hardware_toml, args.matrix_json)
+                print(
+                    json.dumps(
+                        {
+                            "controller": verify_controller(cfg["hardware"]),
+                            "configuration_valid": True,
+                        }
+                    )
+                )
+                return 0
             if args.action == "mixed-continuity":
                 return mixed_continuity(
                     root,

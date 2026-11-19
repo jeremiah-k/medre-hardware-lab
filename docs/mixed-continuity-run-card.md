@@ -43,9 +43,20 @@ meshcore:lxmf case are unchanged.
    synapse admin API, log the accounts in again (fresh device ids +
    tokens), update `campaign-matrix.json`, clear `matrix-stores/`, and
    start from a fresh run.
-4. `medre-lab --config <campaign>/lab.toml doctor` is clean for `hci0`
-   (the campaign TOML overrides the committed `hci1`, which does not exist
-   on this host).
+4. Run the read-only mixed preflight (the pair-mode `doctor` requires two
+   Meshtastic ports):
+
+   ```sh
+   medre-lab --root <worktree> hardware mixed-preflight \
+     --hardware-toml <campaign>/lab.toml \
+     --matrix-json <campaign>/campaign-matrix.json
+   ```
+
+   The pinned MeshCore owner accepts a BLE address, not a scanner controller.
+   This qualification therefore requires exactly one host HCI controller,
+   matching the configured `ble_adapter` (hci0 on this bench). The worker
+   checks again before disconnect. Multi-controller hosts are unsupported for
+   this campaign until the owner can select and attest its controller.
 5. No other lab run owns the selected endpoints (endpoint locks fail fast);
    boards sit `Connected: no` at rest. A stale BLE link holds a connected
    board silent — clear it via a clean disconnect before starting.
@@ -58,7 +69,13 @@ core installed from the index (medre 0.1.2, wheel sha256
 the adapters at the 0.1.2 manifest pins (matrix 0.1.1[e2e] @ d2619ed8,
 meshcore 0.1.0 @ ba12d4d, meshtastic 0.1.1 @ e0008b52), plus the lab
 checkout installed editable from the campaign worktree. Never `uv sync` /
-`uv run` inside or from the worktree.
+`uv run` inside or from the worktree. Save the installed host package records
+separately from the running rig's actual Docker identities: retain `lab/VERSION`
+from bring-up, the selected source/bake provenance (including the MMRelay
+`medre-bake-pin.json` stamp where applicable), and current container image IDs
+from `docker inspect --format '{{.Name}} {{.Image}} {{.Config.Image}}'` for
+each participating container. A declared image tag or source lock is not proof
+of the running image. Note any unavailable record rather than inferring it.
 
 ## Invocation
 
@@ -80,7 +97,10 @@ process on the same database and matrix stores: persisted identity
 verification, pending disposition via core's replay authority, fresh
 legs, final stopped-snapshot equality). `--role b` swaps the owned and
 peer MeshCore boards. A failed or cancelled baseline never opens a
-replacement owner.
+replacement owner. The CLI freezes both inputs in `effective-mixed-config.json`
+inside the private run directory, retains the original persistent Matrix store
+path, and passes that snapshot to both workers. Do not publish it: it contains
+credentials.
 
 ## Expected status transitions
 
@@ -94,15 +114,23 @@ Baseline (`mixed-baseline-verdict.json`):
    board, observed from the adapter's own diagnostics.
 4. Fault-window burst: `burst-count` room-A messages, each fanning out to
    the healthy route (matrix1, room B) and the faulted route (meshcore
-   outbox rows). The independent room-B recipient observes every burst
-   nonce; its offsets share the phase clock and must fall strictly inside
-   [disconnect, rejoin].
-5. `link-rejoined` — observed from diagnostics; the peak reconnect-attempt
-   counter is evidence only (the session resets it on success).
+   outbox rows). The independent room-B recipient starts incremental observation before the fault and observes every
+   burst nonce exactly once inside the conservatively proven disconnected
+   interval. Both observers are armed before interruption. Matrix timeline gaps
+   or missing coverage invalidate the verdict.
+5. `link-rejoined` — diagnostic polls bound the actual transition between the
+   last disconnected and first connected readings. Sightings in that uncertainty
+   interval do not qualify as in-fault or recovered evidence. The peak
+   reconnect-attempt counter is evidence only (the session resets it on success).
 6. Affected-route recovery: the burst MeshCore rows reach sent receipts
    through the route's retry policy (transient failures recorded
    honestly); the peer board observes each nonce only after the rejoin.
-   Affected-side in-window delivery would be a contradiction and fails.
+   Affected-side in-window or ambiguously timed delivery contradicts the silence
+   assertion. A-3 itself records the affected outcome (`all_delivered`,
+   `partial`, or `not_delivered`); partial recovery alone need not fail the narrow
+   A-3 evaluator. The full baseline requires `all_delivered`, with matching
+   durable evidence and independent post-rejoin observations. Otherwise no
+   reopen starts.
 7. Generation binding: every burst nonce binds to exactly one canonical
    event with exact outbox ids read from durable state; a mismatch fails.
 8. `pending-captured` — the committed event-gated capture, keyed on the
@@ -132,6 +160,9 @@ action that was not worker-owned, healthy-route traffic missing, duplicated,
 or arriving outside the declared window or after the rejoin, affected-route
 delivery inside the window, generation/outbox binding mismatches, and
 sampler coverage below three successful work-status samples per phase.
+A sample must begin and finish within the proven interval to count as fault
+coverage. The full campaign also requires complete affected-route recovery and
+retirement checks. Historical partial-recovery results cannot qualify it.
 
 ## Sustained-load sampler
 
@@ -148,15 +179,26 @@ recorded, never fabricated.
 - Ctrl-C the CLI once: the worker process group gets SIGINT, then a
   bounded SIGKILL ladder; completed phases keep their verdicts.
 - If the CLI is killed hard, verify the worker process group is gone
-  (`ps -eo pid,ppid,pgid,args | grep medre_lab.mixed_worker`) before
-  starting another campaign; boards must sit `Connected: no` at rest.
+  before starting another campaign. Record the worker PGID while it is live
+  (`ps -eo pid,ppid,pgid,args`); the supervisor starts each worker in a new
+  session, so its recorded PID is its original PGID. Check **all** members,
+  even if the worker itself has exited:
+
+  ```sh
+  ps -eo pid,ppid,pgid,args | awk -v pgid=<recorded-pgid> '$3 == pgid'
+  ```
+
+  Separately check that both board links are `Connected: no`.
 - No firmware, channel, key, bond, or clock state is written to any board
   at any point. The operator's Docker rig is left in its brought-up state.
 
 ## Reading the verdicts
 
 `continuity-verdict.json` merges phase pass flags, exit codes, durations
-and log paths. Verdict offsets are durations relative to the phase start;
-no wall-clock claims appear in evidence. Private evidence (native ids,
+and log paths. A-3 verdict comparisons use phase-relative monotonic offsets;
+raw phase starts retain monotonic readings, and timeline `at` fields are
+wall-clock diagnostic timestamps, not ordering authority. The phase files
+contain the individual worker identity and detailed evidence. Completed
+identities are checked by destination, allowing ordinary sibling settlement. Private evidence (native ids,
 tokens, room ids, wire text) stays in the run directory and campaign
 files; publish only sanitized summaries.

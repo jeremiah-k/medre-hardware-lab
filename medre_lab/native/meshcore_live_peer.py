@@ -127,6 +127,9 @@ async def main():
 
             def on_any(event):
                 raw.append(f"{event.type.value}:{str(event.payload)[:60]}")
+                if event.type == EventType.DISCONNECTED:
+                    with open(scratch_path, "a") as fh:
+                        fh.write(json.dumps({"observation_gap": True, "observed_monotonic": time.monotonic()}) + "\n")
 
             raw_sub = mc.subscribe(None, on_any)
 
@@ -138,6 +141,7 @@ async def main():
                     "channel": p.get("channel_idx"),
                     "snr": p.get("SNR", p.get("snr")),
                     "sender_timestamp": p.get("sender_timestamp"),
+                    "observed_monotonic": time.monotonic(),
                 })
                 with open(scratch_path, "a") as fh:
                     fh.write(json.dumps(got[-1]) + "\n")
@@ -277,7 +281,10 @@ class MeshCorePeerListener:
         return self
 
     def _read_packets(self) -> list[dict]:
-        return read_jsonl(self._JSON_PATH)
+        packets = read_jsonl(self._JSON_PATH)
+        if any(packet.get("observation_gap") for packet in packets):
+            raise AssertionError("MeshCore witness disconnected during collection")
+        return packets
 
     def packets_until(
         self,
