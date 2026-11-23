@@ -76,6 +76,10 @@ Use the selected provider's `docs/qualification/native-quoted-replies.md` and
 recipient observations are required. This can use dedicated local profiles or
 another observation host; provisioning, invitation acceptance and group/contact
 selection are explicit campaign steps. A second physical radio is irrelevant.
+For a one-host campaign the local messaging server can be a disposable
+unprivileged container from the official `simplexchat/smp-server` image —
+unprivileged, with memory-backed state and a loopback-only port; the
+provider's qualification material owns the exact recipe.
 
 ```bash
 RUN="$PWD/.local/campaigns/simplexchat"
