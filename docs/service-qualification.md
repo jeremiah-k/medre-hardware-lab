@@ -69,6 +69,24 @@ exact quote identity, sender/origin presentation and declared SDK versions.
 SMTP acceptance is not recipient delivery. The checked-in older SDK evidence
 does not automatically qualify a later RPC client/server pin.
 
+The selected provider also owns an independent-recipient qualification:
+`scripts/qualify_independent_recipient.py` validates its content-free
+verdict, and `tests/test_live_independent_recipient.py` is the opt-in
+`live` module that produces one. Its checked-in tier record states gate
+logic proven and the harness delivered, with the live tier not executed.
+A campaign with a preconfigured relay runs the module per the provider's
+`docs/live-testing.md`; a positive verdict requires an independent
+recipient observation rather than queue or relay acceptance. The adapter
+owns that harness; the lab does not copy it.
+
+```bash
+RUN="$PWD/.local/campaigns/chatmail"
+PROVIDER="$PWD/sources/qualification/chatmail"
+MEDRE_CHATMAIL_RECIPIENT_CONFIG="$RUN/recipient.json" \
+  "$RUN/venv/bin/python" -m pytest -c "$PROVIDER/pyproject.toml" \
+  "$PROVIDER/tests/test_live_independent_recipient.py" -m live -q
+```
+
 ## SimpleX Chat
 
 Use the selected provider's `docs/qualification/native-quoted-replies.md` and
@@ -102,6 +120,15 @@ verifies the truth of linked observations. Replies were advertised as fallback
 until the completed campaign and promotion review; native replies are now
 advertised. This does not automatically qualify a later SDK/source pair. Any new
 capability change still requires the campaign and a separate promotion review.
+
+The selected provider also owns a two-profile local recipient
+qualification: `scripts/qualify_two_profile_recipient.py` is both the
+campaign harness and the version-2 offline gate, and the provider's
+`docs/qualification/two-profile-recipient.md` owns the procedure and the
+local messaging server recipe. Its evidence README records an executed
+version-2 campaign at the revisions it names, with the generated verdict
+and JUnit output kept private; a version-1 record is refused. The adapter
+owns that harness; the lab does not copy it.
 
 ## Completion and publication review
 
