@@ -47,6 +47,13 @@ relay. Stop other clients sharing those profiles. Keep a private fixture under
 `docs/live-testing.md`; its account and chat IDs must identify the same accepted
 encrypted group. The harness does not provision or reconfigure the relay.
 
+The official relay image (`ghcr.io/chatmail/docker`) starts systemd as PID 1,
+stops on `SIGRTMIN+3` and declares `VOLUME /sys/fs/cgroup`; started as an
+unprivileged container on a cgroup-v2 host it exits immediately without
+reaching a running state. The lab does not provide the relay as a container:
+a campaign uses a preconfigured relay or a disposable machine that can host
+the image's systemd and cgroup requirements.
+
 ```bash
 RUN="$PWD/.local/campaigns/chatmail"
 PROVIDER="$PWD/sources/qualification/chatmail"
@@ -69,6 +76,10 @@ Use the selected provider's `docs/qualification/native-quoted-replies.md` and
 recipient observations are required. This can use dedicated local profiles or
 another observation host; provisioning, invitation acceptance and group/contact
 selection are explicit campaign steps. A second physical radio is irrelevant.
+For a one-host campaign the local messaging server can be a disposable
+unprivileged container from the official `simplexchat/smp-server` image —
+unprivileged, with memory-backed state and a loopback-only port; the
+provider's qualification material owns the exact recipe.
 
 ```bash
 RUN="$PWD/.local/campaigns/simplexchat"
