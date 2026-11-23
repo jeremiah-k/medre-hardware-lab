@@ -47,6 +47,13 @@ relay. Stop other clients sharing those profiles. Keep a private fixture under
 `docs/live-testing.md`; its account and chat IDs must identify the same accepted
 encrypted group. The harness does not provision or reconfigure the relay.
 
+The official relay image (`ghcr.io/chatmail/docker`) starts systemd as PID 1,
+stops on `SIGRTMIN+3` and declares `VOLUME /sys/fs/cgroup`; started as an
+unprivileged container on a cgroup-v2 host it exits immediately without
+reaching a running state. The lab does not provide the relay as a container:
+a campaign uses a preconfigured relay or a disposable machine that can host
+the image's systemd and cgroup requirements.
+
 ```bash
 RUN="$PWD/.local/campaigns/chatmail"
 PROVIDER="$PWD/sources/qualification/chatmail"
