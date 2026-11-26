@@ -95,3 +95,18 @@ def test_ownership_blocks_overlap_and_releases():
             pass
     with own(["test-owned-endpoint"]):
         pass
+
+
+def test_effective_controller_rejects_a_conflicting_environment(tmp_path, monkeypatch):
+    from medre_lab.config import BLE_ADAPTER_ENV, load, write_effective_config
+
+    source = tmp_path / "hardware.toml"
+    source.write_text('[hardware]\nble_adapter = "hci2"\n')
+    monkeypatch.setenv(BLE_ADAPTER_ENV, "hci1")
+    snapshot = tmp_path / "effective-config.toml"
+    write_effective_config(snapshot, load(source))
+    assert load(snapshot, effective=True)["hardware"]["ble_adapter"] == "hci1"
+
+    monkeypatch.setenv(BLE_ADAPTER_ENV, "hci0")
+    with pytest.raises(ValueError, match="conflicts with the effective configuration"):
+        load(snapshot, effective=True)

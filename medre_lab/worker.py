@@ -360,7 +360,7 @@ def main(argv=None):
         path, selection, role, output, phase = args[:5]
         from .continuity import DEFAULT_INTERRUPT_WAIT_SECONDS, run_baseline, run_reopen
 
-        config = load(Path(path))
+        config = load(Path(path), effective=True)
         run = Path(output)
         if phase == "baseline":
             interrupt_wait = (
