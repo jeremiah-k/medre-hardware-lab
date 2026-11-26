@@ -1,0 +1,74 @@
+# =============================================================================
+# MEDRE fault-injection runtime - contract template.
+#
+# This committed file is the canonical MEDRE configuration for the lossy
+# link measurement. lab/openhop-radio/fault_matrix.sh copies it to
+# lab/state/config/medre-openhop-fault.yaml (no substitutions - it carries
+# no secret) and the generated copy is the one mounted read-only into the
+# medre-openhop-fault container.
+#
+# IT IS THE PHASE 3B BRIDGE CONFIG WITH ONE DIFFERENCE: the meshcore
+# adapter's peer is the FAULT PROXY, not the companion directly.
+#
+#     MEDRE --TCP 5050--> openhop-fault-proxy --TCP 5000--> openhop-repeater-a
+#
+# The proxy is a TRANSPARENT single-connection TCP splice: it forwards every
+# byte in both directions unchanged and never speaks the companion protocol,
+# so it cannot issue a GET_MSG and cannot stack one on another.  The
+# companion still sees exactly ONE client (this MEDRE session) at a time, so
+# the single-client rule holds.
+#
+# - ONE meshcore adapter, "openhop-a": the MEDRE <-> openHop companion link
+#   under qualification, reached THROUGH the splice.
+# - ONE meshtastic adapter, "radio-c": the MeshC sim endpoint, so the
+#   bridge route still exists and a delivered message is observable end to
+#   end exactly as in Phase 3B.
+# - ONE route, "openhop-bridge": openhop-a <-> radio-c, bidirectional.
+# =============================================================================
+
+runtime:
+  name: medre-lab-medre-openhop-fault
+  shutdown_timeout_seconds: 30
+
+logging:
+  level: DEBUG
+  format: text
+
+storage:
+  backend: sqlite
+  path: "{state}/medre.sqlite"
+
+adapters:
+  meshcore:
+    openhop-a:
+      enabled: true
+      adapter_kind: real
+      connection_type: tcp
+      host: "openhop-fault-proxy"
+      port: 5050
+      default_channel: 0
+      origin_label: "OpenHopFault"
+      relay_prefix: ""
+      message_delay_seconds: 0.5
+
+  meshtastic:
+    radio-c:
+      enabled: true
+      adapter_kind: real
+      connection_type: tcp
+      host: "meshtasticd-c-medre"
+      port: 4403
+      origin_label: "GammaLab"
+      relay_prefix: ""
+      channel_mapping:
+        "0": "LabPrimC"
+        "2": "LabSecC"
+
+routes:
+  openhop-bridge:
+    source_adapters: ["openhop-a"]
+    dest_adapters: ["radio-c"]
+    directionality: bidirectional
+    enabled: true
+    source_channel: "0"
+    dest_channel: "0"
