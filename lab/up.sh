@@ -22,6 +22,8 @@ SKIP_BUILD=0
 SKIP_SMOKE=0
 WITH_MEDRE=0
 WITH_NORMAL=0
+WITH_OPENHOP=0
+WITH_OPENHOP_RADIO=0
 for arg in "$@"; do
 	case "${arg}" in
 	--reset) DO_RESET=1 ;;
@@ -29,9 +31,11 @@ for arg in "$@"; do
 	--skip-smoke) SKIP_SMOKE=1 ;;
 	--with-medre) WITH_MEDRE=1 ;;
 	--normal) WITH_NORMAL=1 ;;
+	--openhop) WITH_OPENHOP=1 ;;
+	--openhop-radio) WITH_OPENHOP_RADIO=1 ;;
 	*)
 		echo "Unknown option: ${arg}" >&2
-		echo "Usage: lab/up.sh [--reset] [--skip-build] [--skip-smoke] [--with-medre] [--normal]" >&2
+		echo "Usage: lab/up.sh [--reset] [--skip-build] [--skip-smoke] [--with-medre] [--normal] [--openhop] [--openhop-radio]" >&2
 		exit 2
 		;;
 	esac
@@ -39,6 +43,26 @@ done
 
 if ((WITH_MEDRE)) && ((WITH_NORMAL)); then
 	echo "ERROR: --with-medre and --normal are mutually exclusive" >&2
+	exit 2
+fi
+
+# The openHop profile is exclusive with the other MEDRE topologies:
+# medre-openhop owns the meshtasticd-c-medre node (one API client per
+# node), and the openHop repeater's companion accepts exactly one client
+# at a time. Running two MEDRE instances against the same rig would
+# double-book that node and make the companion's single-client rule
+# ambiguous.
+if ((WITH_OPENHOP)) && ((WITH_MEDRE || WITH_NORMAL)); then
+	echo "ERROR: --openhop is mutually exclusive with --with-medre and --normal" >&2
+	exit 2
+fi
+
+# The virtual-radio profile is a STANDALONE rig of its own: the lab relay
+# holds EXACTLY two client slots (the two repeaters' radios), and each
+# repeater's companion holds exactly one client. It therefore cannot share
+# a rig with any other profile.
+if ((WITH_OPENHOP_RADIO)) && ((WITH_OPENHOP || WITH_MEDRE || WITH_NORMAL)); then
+	echo "ERROR: --openhop-radio is mutually exclusive with --openhop, --with-medre and --normal" >&2
 	exit 2
 fi
 
@@ -223,6 +247,381 @@ mkdir -p lab/state/config "${LOG_DIR}/scenarios"
 if ((DO_RESET)); then
 	log "Reset requested: wiping volumes and lab state"
 	bash lab/reset.sh
+fi
+
+# --- openHop profile (OPT-IN, self-contained) --------------------------------
+# The openHop profile is a STANDALONE rig: it needs neither Synapse nor the
+# mmrelay relays nor any Matrix room. It is the hardware-free
+# MEDRE<->openHop Docker qualifier:
+#   openhop-repeater  the openHop repeater (radio_type: null) serving the
+#                     MeshCore companion over TCP 5000 on the private
+#                     `openhop` compose network (never published);
+#   medre-openhop     the MEDRE runtime whose MeshCore adapter talks to
+#                     that companion, plus the existing MeshC sim node.
+#
+# Everything below is gated on WITH_OPENHOP, so a default bring-up stays
+# byte-identical to today's 2-relay topology.
+if ((WITH_OPENHOP)); then
+	COMPOSE=(docker compose --profile openhop)
+
+	# --- Pinned source checkouts ------------------------------------------
+	# The openHop profile carries its OWN pins (see sources.lock.json):
+	# the default rig's medre 0.1.0 pin cannot satisfy the meshcore
+	# adapter's `medre>=0.2.0,<0.3.0` requirement.
+	OPENHOP_CORE_SRC="${OPENHOP_CORE_SRC:-${LAB_ROOT}/sources/openhop-core}"
+	OPENHOP_REPEATER_SRC="${OPENHOP_REPEATER_SRC:-${LAB_ROOT}/sources/openhop-repeater}"
+	MEDRE_OPENHOP_SRC="${MEDRE_OPENHOP_SRC:-${LAB_ROOT}/sources/medre-openhop}"
+	MEDRE_MESHCORE_SRC="${MEDRE_MESHCORE_SRC:-${LAB_ROOT}/sources/medre-adapter-meshcore}"
+	MEDRE_MESHTASTIC_OPENHOP_SRC="${MEDRE_MESHTASTIC_OPENHOP_SRC:-${LAB_ROOT}/sources/medre-adapter-meshtastic-openhop}"
+	for src in \
+		"${OPENHOP_CORE_SRC}:openhop_core" \
+		"${OPENHOP_REPEATER_SRC}:openhop_repeater" \
+		"${MEDRE_OPENHOP_SRC}:medre" \
+		"${MEDRE_MESHCORE_SRC}:medre-adapter-meshcore" \
+		"${MEDRE_MESHTASTIC_OPENHOP_SRC}:medre-adapter-meshtastic"; do
+		dir="${src%%:*}"
+		label="${src##*:}"
+		[[ -d ${dir} ]] ||
+			die "openHop source ${dir} (${label}) is missing; run 'medre-lab sources fetch'"
+	done
+	export OPENHOP_CORE_SRC OPENHOP_REPEATER_SRC MEDRE_OPENHOP_SRC \
+		MEDRE_MESHCORE_SRC MEDRE_MESHTASTIC_OPENHOP_SRC
+	# The exact HEAD SHAs, so the images bake from the pinned commits.
+	OPENHOP_CORE_REF_HEAD="$(git -C "${OPENHOP_CORE_SRC}" rev-parse HEAD)"
+	export OPENHOP_CORE_REF="${OPENHOP_CORE_REF_HEAD}"
+	OPENHOP_REPEATER_REF_HEAD="$(git -C "${OPENHOP_REPEATER_SRC}" rev-parse HEAD)"
+	export OPENHOP_REPEATER_REF="${OPENHOP_REPEATER_REF_HEAD}"
+	MEDRE_OPENHOP_REF_HEAD="$(git -C "${MEDRE_OPENHOP_SRC}" rev-parse HEAD)"
+	export MEDRE_OPENHOP_REF="${MEDRE_OPENHOP_REF_HEAD}"
+	MEDRE_MESHCORE_REF_HEAD="$(git -C "${MEDRE_MESHCORE_SRC}" rev-parse HEAD)"
+	export MEDRE_MESHCORE_REF="${MEDRE_MESHCORE_REF_HEAD}"
+	MEDRE_MESHTASTIC_OPENHOP_REF_HEAD="$(git -C "${MEDRE_MESHTASTIC_OPENHOP_SRC}" rev-parse HEAD)"
+	export MEDRE_MESHTASTIC_OPENHOP_REF="${MEDRE_MESHTASTIC_OPENHOP_REF_HEAD}"
+	echo "openHop selected source checkouts:"
+	echo "  openhop_core:         ${OPENHOP_CORE_SRC} (${OPENHOP_CORE_REF})"
+	echo "  openhop_repeater:     ${OPENHOP_REPEATER_SRC} (${OPENHOP_REPEATER_REF})"
+	echo "  medre (openhop):      ${MEDRE_OPENHOP_SRC} (${MEDRE_OPENHOP_REF})"
+	echo "  adapter_meshcore:     ${MEDRE_MESHCORE_SRC} (${MEDRE_MESHCORE_REF})"
+	echo "  adapter_meshtastic:   ${MEDRE_MESHTASTIC_OPENHOP_SRC} (${MEDRE_MESHTASTIC_OPENHOP_REF})"
+
+	# --- Source provenance guard -------------------------------------------
+	# The openHop manifest names the openHop containers only; it is checked
+	# with live container inspection once the profile is up.
+	if [[ -n ${LAB_SOURCE_MANIFEST_OPENHOP:-} ]]; then
+		python3 lab/check_source_mounts.py "${LAB_SOURCE_MANIFEST_OPENHOP}" --host-only ||
+			die "openHop source provenance check failed"
+	fi
+
+	# --- Build -------------------------------------------------------------
+	if ((! SKIP_BUILD)); then
+		log "Building images (openhop repeater + medre openhop)"
+		"${COMPOSE[@]}" build openhop-repeater medre-openhop
+	else
+		log "Skipping image build"
+	fi
+
+	# --- Generated openHop configs (identities + credentials) -------------
+	# Identities and credentials are generated into the GITIGNORED
+	# lab/state/ tree and substituted into the committed contract configs.
+	# They never enter git, and they persist across bring-ups so the
+	# companion keeps the SAME identity across restarts (persistence
+	# evidence).
+	log "Generating openHop configs into lab/state/config/"
+	mkdir -p lab/state/openhop
+	OPENHOP_SECRETS="lab/state/openhop/secrets.env"
+	if [[ ! -f ${OPENHOP_SECRETS} ]]; then
+		python3 - "${OPENHOP_SECRETS}" <<'PYSECRETS'
+import os
+import secrets
+import sys
+
+path = sys.argv[1]
+if os.path.exists(path):
+    raise SystemExit(f"refusing to overwrite {path}")
+values = {
+    "OPENHOP_COMPANION_IDENTITY_KEY": secrets.token_bytes(32).hex(),
+    "OPENHOP_ADMIN_PASSWORD": secrets.token_urlsafe(24),
+    "OPENHOP_GUEST_PASSWORD": secrets.token_urlsafe(24),
+    "OPENHOP_JWT_SECRET": secrets.token_hex(32),
+}
+with open(path, "w", encoding="utf-8") as handle:
+    for key, value in values.items():
+        handle.write(f"{key}={value}\n")
+os.chmod(path, 0o600)
+print(f"  generated {path} (mode 0600, gitignored)")
+PYSECRETS
+	else
+		echo "  ${OPENHOP_SECRETS} present, reusing it (identity persists across restarts)"
+	fi
+	# shellcheck disable=SC1090
+	source "${OPENHOP_SECRETS}"
+	export OPENHOP_COMPANION_IDENTITY_KEY OPENHOP_ADMIN_PASSWORD \
+		OPENHOP_GUEST_PASSWORD OPENHOP_JWT_SECRET
+	python3 - <<'PYGEN'
+import os
+import sys
+
+pairs = (
+    ("__OPENHOP_COMPANION_IDENTITY_KEY__", "OPENHOP_COMPANION_IDENTITY_KEY"),
+    ("__OPENHOP_ADMIN_PASSWORD__", "OPENHOP_ADMIN_PASSWORD"),
+    ("__OPENHOP_GUEST_PASSWORD__", "OPENHOP_GUEST_PASSWORD"),
+    ("__OPENHOP_JWT_SECRET__", "OPENHOP_JWT_SECRET"),
+)
+for template, target, placeholders in (
+    (
+        "lab/config/openhop-repeater.yaml",
+        "lab/state/config/openhop-repeater.yaml",
+        pairs,
+    ),
+    (
+        "lab/config/medre-openhop.yaml",
+        "lab/state/config/medre-openhop.yaml",
+        (),
+    ),
+):
+    with open(template, encoding="utf-8") as handle:
+        text = handle.read()
+    for placeholder, env_key in placeholders:
+        text = text.replace(placeholder, os.environ[env_key])
+    for placeholder, _ in placeholders:
+        if placeholder in text:
+            raise SystemExit(f"unsubstituted placeholder remains in {template}: {placeholder}")
+    with open(target, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    print(f"  {target} generated")
+PYGEN
+	chmod 0600 lab/state/config/openhop-repeater.yaml
+
+	# --- Bring-up ----------------------------------------------------------
+	log "Starting the MeshC sim node (meshtasticd-c-medre)"
+	"${COMPOSE[@]}" up -d meshtasticd-c-medre
+	log "Starting the openHop repeater (radio_type: null)"
+	"${COMPOSE[@]}" up -d openhop-repeater
+	log "Starting medre-openhop (meshcore adapter -> openhop-repeater:5000)"
+	"${COMPOSE[@]}" up -d medre-openhop
+
+	openhop_wait_healthy() {
+		local container=$1 limit=$2 waited=0 state
+		while ((waited < limit)); do
+			state="$(docker inspect -f '{{.State.Health.Status}}' "${container}" 2>/dev/null || echo missing)"
+			case "${state}" in
+			healthy)
+				echo "  ${container}: healthy (${waited}s)"
+				return 0
+				;;
+			unhealthy)
+				die "${container} became unhealthy"
+				;;
+			esac
+			sleep 5
+			waited=$((waited + 5))
+		done
+		die "${container} did not become healthy within ${limit}s"
+	}
+	openhop_wait_healthy medre-lab-mesh-c-medre 240
+	openhop_wait_healthy medre-lab-openhop-repeater 240
+	openhop_wait_healthy medre-lab-medre-openhop 240
+
+	# --- Live source provenance -------------------------------------------
+	# Now that the containers are up, the openHop manifest is checked with
+	# LIVE container inspection: each pinned source must be mounted
+	# read-only at its target and its live import must resolve there.
+	if [[ -n ${LAB_SOURCE_MANIFEST_OPENHOP:-} ]]; then
+		log "Verifying the live openHop source mounts"
+		python3 lab/check_source_mounts.py "${LAB_SOURCE_MANIFEST_OPENHOP}" ||
+			die "openHop source provenance check failed"
+	fi
+
+	log "Capturing openHop logs"
+	docker logs medre-lab-openhop-repeater >"${LOG_DIR}/openhop-repeater-${TS}.log" 2>&1 || true
+	docker logs medre-lab-medre-openhop >"${LOG_DIR}/medre-openhop-${TS}.log" 2>&1 || true
+
+	# The openHop family's pins live in the shared "openhop_sources"
+	# section; this section describes the Phase 2 rig. Both REPLACE any
+	# earlier section of the same name (lab/version_record.py), so the
+	# record never carries two openHop sections with different pins.
+	python3 lab/openhop_pins.py "${LAB_SOURCE_MANIFEST_OPENHOP}" \
+		--record lab/VERSION >/dev/null ||
+		die "could not record the openHop pins"
+	python3 lab/version_record.py set openhop_profile <<EOF
+  source_pins: see the openhop_sources section (the SAME checkouts this rig builds and runs from)
+  image_openhop: medre-lab/openhop-repeater:latest (lab/openhop/Dockerfile; local checkouts installed in order: openhop_core, then openhop_repeater)
+  image_medre: medre-lab/medre-openhop-dev:latest (lab/medre-openhop/Dockerfile; medre 0.2.3 + meshcore 0.2.0 + meshtastic 0.2.1)
+  topology: openhop-repeater (radio_type null, companion TCP 5000 on the private medre-lab-openhop network, never published) + medre-openhop
+  radio: NONE (hardware-free qualifier; NullRadio raises on send, so no delivery is possible)
+EOF
+
+	log "openHop profile is UP"
+	cat <<EOF
+  openhop-repeater: medre-lab-openhop-repeater (companion TCP 5000, private network only)
+  medre-openhop:     medre-lab-medre-openhop (meshcore -> openhop-repeater:5000, meshtastic -> meshtasticd-c-medre)
+  MeshC sim node:    medre-lab-mesh-c-medre
+  Logs:              ${LOG_DIR}/openhop-repeater-${TS}.log, ${LOG_DIR}/medre-openhop-${TS}.log
+  Lifecycle check:   lab/openhop/lifecycle_check.sh
+  Teardown:          lab/down.sh
+EOF
+	exit 0
+fi
+
+# --- openHop VIRTUAL RADIO profile (OPT-IN, self-contained) -----------------
+# Two openHop repeaters wired to the LAB's virtual radio relay instead of to
+# hardware. The RF MEDIUM is simulated; the MeshCore packets that cross it
+# are real (encrypted by one repeater, decrypted by the other).
+#
+# This rig is standalone: the relay holds exactly two client slots (the two
+# repeaters' radios) and each companion holds exactly one client, so it can
+# never share a rig with another profile.
+if ((WITH_OPENHOP_RADIO)); then
+	COMPOSE=(docker compose --profile openhop-radio)
+
+	# --- Pinned source checkouts ------------------------------------------
+	OPENHOP_CORE_SRC="${OPENHOP_CORE_SRC:-${LAB_ROOT}/sources/openhop-core}"
+	OPENHOP_REPEATER_SRC="${OPENHOP_REPEATER_SRC:-${LAB_ROOT}/sources/openhop-repeater}"
+	MEDRE_MESHCORE_SRC="${MEDRE_MESHCORE_SRC:-${LAB_ROOT}/sources/medre-adapter-meshcore}"
+	for src in \
+		"${OPENHOP_CORE_SRC}:openhop_core" \
+		"${OPENHOP_REPEATER_SRC}:openhop_repeater" \
+		"${MEDRE_MESHCORE_SRC}:medre-adapter-meshcore"; do
+		dir="${src%%:*}"
+		label="${src##*:}"
+		[[ -d ${dir} ]] ||
+			die "openHop radio source ${dir} (${label}) is missing; run 'medre-lab sources fetch'"
+	done
+	export OPENHOP_CORE_SRC OPENHOP_REPEATER_SRC MEDRE_MESHCORE_SRC
+	OPENHOP_CORE_REF_HEAD="$(git -C "${OPENHOP_CORE_SRC}" rev-parse HEAD)"
+	export OPENHOP_CORE_REF="${OPENHOP_CORE_REF_HEAD}"
+	OPENHOP_REPEATER_REF_HEAD="$(git -C "${OPENHOP_REPEATER_SRC}" rev-parse HEAD)"
+	export OPENHOP_REPEATER_REF="${OPENHOP_REPEATER_REF_HEAD}"
+	echo "openHop virtual radio source checkouts:"
+	echo "  openhop_core:         ${OPENHOP_CORE_SRC} @ ${OPENHOP_CORE_REF}"
+	echo "  openhop_repeater:     ${OPENHOP_REPEATER_SRC} @ ${OPENHOP_REPEATER_REF}"
+
+	# --- Build -------------------------------------------------------------
+	if ((! SKIP_BUILD)); then
+		log "Building images (virtual radio relay + openhop repeater + medre openhop)"
+		"${COMPOSE[@]}" build openhop-radio-relay openhop-repeater-a openhop-repeater-b openhop-radio-probe
+	else
+		log "Skipping image build"
+	fi
+
+	# --- Generated repeater configs (identities + credentials) --------------
+	# Each repeater gets its OWN companion identity and credentials: the two
+	# nodes must never share an identity. Everything is generated into the
+	# GITIGNORED lab/state/ tree and substituted into the committed template.
+	log "Generating openHop radio configs into lab/state/config/"
+	mkdir -p lab/state/openhop-radio
+	RADIO_SECRETS="lab/state/openhop-radio/secrets.env"
+	if [[ ! -f ${RADIO_SECRETS} ]]; then
+		python3 - "${RADIO_SECRETS}" <<'PYSECRETS'
+import os
+import secrets
+import sys
+
+path = sys.argv[1]
+if os.path.exists(path):
+    raise SystemExit(f"refusing to overwrite {path}")
+values = {}
+for instance in ("a", "b"):
+    values[f"RADIO_{instance.upper()}_COMPANION_IDENTITY_KEY"] = secrets.token_bytes(32).hex()
+    values[f"RADIO_{instance.upper()}_ADMIN_PASSWORD"] = secrets.token_urlsafe(24)
+    values[f"RADIO_{instance.upper()}_GUEST_PASSWORD"] = secrets.token_urlsafe(24)
+    values[f"RADIO_{instance.upper()}_JWT_SECRET"] = secrets.token_hex(32)
+with open(path, "w", encoding="utf-8") as handle:
+    for key, value in values.items():
+        handle.write(f"{key}={value}\n")
+os.chmod(path, 0o600)
+print(f"  generated {path} (mode 0600, gitignored)")
+PYSECRETS
+	else
+		echo "  ${RADIO_SECRETS} present, reusing it (identities persist across restarts)"
+	fi
+	# shellcheck disable=SC1090
+	source "${RADIO_SECRETS}"
+	export RADIO_A_COMPANION_IDENTITY_KEY RADIO_A_ADMIN_PASSWORD \
+		RADIO_A_GUEST_PASSWORD RADIO_A_JWT_SECRET
+	export RADIO_B_COMPANION_IDENTITY_KEY RADIO_B_ADMIN_PASSWORD \
+		RADIO_B_GUEST_PASSWORD RADIO_B_JWT_SECRET
+	python3 - <<'PYGEN'
+import os
+import sys
+
+template = "lab/config/openhop-radio-repeater.yaml"
+for instance in ("a", "b"):
+    prefix = f"RADIO_{instance.upper()}_"
+    replacements = {
+        "__RADIO_INSTANCE__": instance,
+        "__RADIO_COMPANION_IDENTITY_KEY__": os.environ[prefix + "COMPANION_IDENTITY_KEY"],
+        "__RADIO_ADMIN_PASSWORD__": os.environ[prefix + "ADMIN_PASSWORD"],
+        "__RADIO_GUEST_PASSWORD__": os.environ[prefix + "GUEST_PASSWORD"],
+        "__RADIO_JWT_SECRET__": os.environ[prefix + "JWT_SECRET"],
+    }
+    with open(template, encoding="utf-8") as handle:
+        text = handle.read()
+    for placeholder, value in replacements.items():
+        text = text.replace(placeholder, value)
+    for placeholder in replacements:
+        if placeholder in text:
+            raise SystemExit(f"unsubstituted placeholder remains in {template}: {placeholder}")
+    target = f"lab/state/config/openhop-radio-repeater-{instance}.yaml"
+    with open(target, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.chmod(target, 0o600)
+    print(f"  {target} generated")
+PYGEN
+
+	# --- Bring-up ----------------------------------------------------------
+	log "Starting the virtual radio relay"
+	"${COMPOSE[@]}" up -d openhop-radio-relay
+	log "Starting the two openHop repeaters (radio_type: modem_tcp -> the relay)"
+	"${COMPOSE[@]}" up -d openhop-repeater-a openhop-repeater-b
+
+	openhop_radio_wait_healthy() {
+		local container=$1 limit=$2 waited=0 state
+		while ((waited < limit)); do
+			state="$(docker inspect -f '{{.State.Health.Status}}' "${container}" 2>/dev/null || echo missing)"
+			case "${state}" in
+			healthy)
+				echo "  ${container}: healthy (${waited}s)"
+				return 0
+				;;
+			unhealthy)
+				die "${container} became unhealthy"
+				;;
+			esac
+			sleep 5
+			waited=$((waited + 5))
+		done
+		die "${container} did not become healthy within ${limit}s"
+	}
+	openhop_radio_wait_healthy medre-lab-openhop-radio-relay 120
+	openhop_radio_wait_healthy medre-lab-openhop-repeater-a 240
+	openhop_radio_wait_healthy medre-lab-openhop-repeater-b 240
+
+	log "Capturing openHop radio logs"
+	docker logs medre-lab-openhop-radio-relay >"${LOG_DIR}/openhop-radio-relay-${TS}.log" 2>&1 || true
+	docker logs medre-lab-openhop-repeater-a >"${LOG_DIR}/openhop-radio-repeater-a-${TS}.log" 2>&1 || true
+	docker logs medre-lab-openhop-repeater-b >"${LOG_DIR}/openhop-radio-repeater-b-${TS}.log" 2>&1 || true
+
+	python3 lab/openhop_pins.py "${LAB_SOURCE_MANIFEST_OPENHOP}" \
+		--record lab/VERSION >/dev/null ||
+		die "could not record the openHop pins"
+	python3 lab/version_record.py set openhop_radio_profile <<EOF
+  source_pins: see the openhop_sources section (the SAME checkouts this rig builds and runs from)
+  image_relay: medre-lab/openhop-radio-relay:latest (lab/openhop-radio/Dockerfile; lab-owned asyncio service speaking the openHop Modem protocol)
+  topology: openhop-radio-relay + openhop-repeater-a + openhop-repeater-b on the private medre-lab-openhop-radio network (no host ports)
+  radio: VIRTUAL (the lab relay simulates the RF medium; the MeshCore packets crossing it are real)
+EOF
+
+	log "openHop virtual radio profile is UP"
+	cat <<EOF
+  relay:        medre-lab-openhop-radio-relay (openHop Modem protocol, TCP 5055, private network only)
+  repeater A:   medre-lab-openhop-repeater-a (companion TCP 5000, private network only)
+  repeater B:   medre-lab-openhop-repeater-b (companion TCP 5000, private network only)
+  Logs:         ${LOG_DIR}/openhop-radio-*-${TS}.log
+  Packet proof: lab/openhop-radio/packet_proof.sh
+  Teardown:     lab/down.sh
+EOF
+	exit 0
 fi
 
 # --- Build -------------------------------------------------------------------
