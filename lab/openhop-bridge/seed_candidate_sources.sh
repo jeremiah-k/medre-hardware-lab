@@ -55,6 +55,19 @@ bundle_override() {
 	echo "${!name:-}"
 }
 
+if ((CHECK_ONLY)); then
+	CANDIDATES+=("medre-adapter-meshtastic-openhop|")
+fi
+
+staging=""
+# shellcheck disable=SC2329 # Runs only from the EXIT trap.
+cleanup_stage() {
+	if [[ -n ${staging} ]]; then
+		rm -rf -- "${staging}"
+	fi
+}
+trap cleanup_stage EXIT
+
 status=0
 for entry in "${CANDIDATES[@]}"; do
 	IFS='|' read -r key repo <<<"${entry}"
@@ -71,7 +84,15 @@ for entry in "${CANDIDATES[@]}"; do
 			status=1
 			continue
 		fi
-		echo "${key}: creating ${target} from ${url}"
+		if [[ -e ${target} || -L ${target} ]]; then
+			echo "ERROR: ${target} exists but is not a checkout" >&2
+			exit 1
+		fi
+		mkdir -p sources
+		staging="$(mktemp -d "sources/.${key}.XXXXXX")"
+		echo "${key}: preparing ${target} from ${url}"
+		destination="${target}"
+		target="${staging}/checkout"
 		git clone --no-checkout --filter=blob:none "${url}" "${target}"
 		created=1
 	fi
@@ -106,6 +127,8 @@ for entry in "${CANDIDATES[@]}"; do
 		[[ -f ${bundle} ]] || {
 			echo "ERROR: bundle ${bundle} for ${key} does not exist" >&2
 			status=1
+			cleanup_stage
+			staging=""
 			continue
 		}
 		echo "${key}: seeding ${sha} from bundle ${bundle}"
@@ -119,6 +142,8 @@ for entry in "${CANDIDATES[@]}"; do
 		[[ -e "${repo}/.git" ]] || {
 			echo "ERROR: local candidate repository ${repo} is missing" >&2
 			status=1
+			cleanup_stage
+			staging=""
 			continue
 		}
 		echo "${key}: seeding exact ${sha} from ${repo}"
@@ -133,7 +158,15 @@ for entry in "${CANDIDATES[@]}"; do
 	if [[ "$(git -C "${target}" rev-parse HEAD)" != "${sha}" || -n "$(git -C "${target}" status --porcelain)" ]]; then
 		echo "ERROR: ${key} did not land on ${sha}" >&2
 		status=1
+	elif ((created)); then
+		if [[ -e ${destination} || -L ${destination} ]]; then
+			echo "ERROR: ${destination} appeared during seeding" >&2
+			exit 1
+		fi
+		mv -T -- "${target}" "${destination}"
 	fi
+	cleanup_stage
+	staging=""
 done
 
 exit "${status}"

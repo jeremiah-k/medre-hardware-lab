@@ -83,7 +83,18 @@ if ((! SKIP_BUILD)); then
 	log "Building images (openhop repeater + medre openhop)"
 	"${COMPOSE[@]}" build openhop-repeater medre-openhop-bridge
 else
-	log "Skipping image build"
+	log "Verifying pinned packages in the existing repeater image"
+	docker run --rm --network none --entrypoint python3 medre-lab/openhop-repeater:latest -I -c '
+import json
+import sys
+from pathlib import Path
+from sysconfig import get_path
+
+stamp = json.loads((Path(get_path("purelib")) / "openhop-bake-pin.json").read_text())
+if [stamp[key]["ref"] for key in ("openhop_core", "openhop_repeater")] != sys.argv[1:]:
+    raise SystemExit("existing image does not match the selected openHop pins")
+' "${OPENHOP_CORE_REF}" "${OPENHOP_REPEATER_REF}" ||
+		die "rebuild the repeater image with the selected revisions"
 fi
 
 # --- Generated configs ------------------------------------------------------
@@ -99,6 +110,7 @@ import os
 import secrets
 import sys
 
+os.umask(0o077)
 path = sys.argv[1]
 if os.path.exists(path):
     raise SystemExit(f"refusing to overwrite {path}")
@@ -108,7 +120,7 @@ for instance in ("a", "b"):
     values[f"RADIO_{instance.upper()}_ADMIN_PASSWORD"] = secrets.token_urlsafe(24)
     values[f"RADIO_{instance.upper()}_GUEST_PASSWORD"] = secrets.token_urlsafe(24)
     values[f"RADIO_{instance.upper()}_JWT_SECRET"] = secrets.token_hex(32)
-with open(path, "w", encoding="utf-8") as handle:
+with open(path, "x", encoding="utf-8") as handle:
     for key, value in values.items():
         handle.write(f"{key}={value}\n")
 os.chmod(path, 0o600)
@@ -128,6 +140,7 @@ python3 - <<'PYGEN'
 import os
 import sys
 
+os.umask(0o077)
 template = "lab/config/openhop-radio-repeater.yaml"
 for instance in ("a", "b"):
     prefix = f"RADIO_{instance.upper()}_"
@@ -241,7 +254,7 @@ wait_healthy medre-lab-medre-openhop-bridge 240
 log "Waiting for the MEDRE adapter sessions to attach"
 for attempt in $(seq 1 24); do
 	if docker logs medre-lab-medre-openhop-bridge 2>&1 |
-		grep -q "MeshCoreSession openhop-a started"; then
+		grep "MeshCoreSession openhop-a started" >/dev/null; then
 		echo "  meshcore session attached (${attempt}0s)"
 		break
 	fi
@@ -279,7 +292,7 @@ python3 lab/version_record.py set openhop_bridge <<EOF
   image_medre: medre-lab/medre-openhop-dev:latest (${MEDRE_IMAGE_ID}; lab/medre-openhop/Dockerfile; medre 0.2.3 + meshcore 0.2.0 + meshtastic 0.2.1)
   image_relay: medre-lab/openhop-radio-relay:latest (${RELAY_IMAGE_ID}; lab/openhop-radio/Dockerfile; lab-owned asyncio service speaking the openHop Modem protocol)
   build_args: OPENHOP_CORE_REF=${OPENHOP_CORE_REF} OPENHOP_REPEATER_REF=${OPENHOP_REPEATER_REF} (the exact HEAD SHAs of the checkouts named in openhop_sources)
-  topology: MEDRE (meshcore -> openhop-repeater-a:5000, meshtastic -> meshtasticd-c-medre:4403) on the private openhop-radio + mesh-c networks (no host ports)
+  topology: MEDRE (meshcore -> openhop-repeater-a:5000, meshtastic -> meshtasticd-c-medre:4403) on the openhop-radio + mesh-c networks (MeshC simulators also publish to host loopback)
   route: openhop-a <-> radio-c, bidirectional, enabled ONLY in lab/config/medre-openhop-bridge.yaml
   radio: VIRTUAL (the lab relay simulates the RF medium; the MeshCore packets crossing it are real)
   evidence: lab/logs/openhop-bridge/ (bridge-proof.json, evidence-mc-to-mesh.json, evidence-mesh-to-mc.json, verdict.json)

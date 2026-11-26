@@ -118,7 +118,7 @@ def lock(root):
         (root / "sources.lock.json").read_text(), object_pairs_hook=unique
     )
     if set(data) != set(SOURCES):
-        raise ValueError("source lock must name all five Docker dependencies")
+        raise ValueError("source lock must name the Docker dependencies for both rigs")
     for name, entry in data.items():
         if set(entry) != {"url", "ref"} or not re.fullmatch(
             r"[0-9a-f]{40}", entry["ref"]
@@ -178,8 +178,10 @@ def prepare(root):
     )
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
-    for entry in selected:
-        guard.check_source(entry)
+    for name, entry in zip(SOURCES, selected, strict=True):
+        # The openHop launchers validate their manifest before using these pins.
+        if name in DEFAULT_SOURCE_GROUP:
+            guard.check_source(entry)
     state = root / "lab/state"
     state.mkdir(parents=True, exist_ok=True)
     by_name = {entry["source"]: entry for entry in selected}

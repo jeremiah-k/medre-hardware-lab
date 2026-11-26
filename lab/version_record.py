@@ -132,7 +132,7 @@ def cmd_compact(path: Path) -> int:
 
 def cmd_show(section: str, path: Path) -> int:
     _, blocks = read(path)
-    for key, lines in blocks:
+    for key, lines in reversed(blocks):
         if key == section:
             sys.stdout.write("\n".join(lines) + "\n")
             return 0
