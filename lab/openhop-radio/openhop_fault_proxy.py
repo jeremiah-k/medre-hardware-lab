@@ -114,7 +114,6 @@ STATS = {
 
 # The dynamic flags live in the fault file; re-read with this pace while a
 # direction is held, so clearing the file restores forwarding promptly.
-BLACKHOLE_POLL_SECONDS = 0.25
 
 
 def read_dynamic_fault(path: str) -> dict:
@@ -223,19 +222,14 @@ class Blackhole:
     def disarm_announcement(self, flag: str, connection: int) -> None:
         self.announced.discard(f"{connection}:{flag}")
 
-    async def hold(self, flag: str, connection: int, counter: str) -> None:
-        """Hold one direction while its flag is armed.
-
-        Every held poll counts one stat and the arm is announced once, so
-        the evidence can tell a held direction from a quiet one.
-        """
+    def drops(self, flag: str, connection: int, counter: str) -> bool:
+        """Discard chunks while armed so EOF remains observable."""
         if not self.armed(flag):
             self.disarm_announcement(flag, connection)
-            return
+            return False
         self.announce(flag, connection)
-        while self.armed(flag):
-            STATS[counter] += 1
-            await asyncio.sleep(BLACKHOLE_POLL_SECONDS)
+        STATS[counter] += 1
+        return True
 
 
 class RequestStall:
@@ -252,15 +246,22 @@ class RequestStall:
     def __init__(self, path: str) -> None:
         self.path = path
         self.open = False
+        self.generation: object = None
 
     def armed(self) -> bool:
-        return bool(
-            read_dynamic_fault(self.path).get("stall_server_to_client_on_request")
-        )
+        fault = read_dynamic_fault(self.path)
+        generation = fault.get("request_stall_generation")
+        if generation != self.generation:
+            self.generation = generation
+            self.open = False
+        if not fault.get("stall_server_to_client_on_request"):
+            self.open = False
+            return False
+        return True
 
     def observe_request(self, connection: int) -> None:
         """Open the stall at the first client->server chunk while armed."""
-        if self.open or not self.armed():
+        if not self.armed() or self.open:
             return
         self.open = True
         STATS["request_stall_opens"] += 1
@@ -313,7 +314,8 @@ async def pipe(
                 # the window.
                 window.close_connection(connection, all_writers)
                 break
-            await blackhole.hold(flag, connection, counter)
+            if blackhole.drops(flag, connection, counter):
+                continue
             writer.write(data)
             await writer.drain()
     except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
@@ -396,11 +398,12 @@ async def handle(
                     # so clearing the flag restores forwarding at once).
                     STATS["request_stall_chunks_withheld"] += 1
                     continue
-                await blackhole.hold(
+                if blackhole.drops(
                     "stall_server_to_client",
                     connection,
                     "stalled_server_to_client",
-                )
+                ):
+                    continue
                 if delay_ms:
                     STATS["delayed_ms_total"] += delay_ms
                     await asyncio.sleep(delay_ms / 1000)
@@ -429,9 +432,14 @@ async def handle(
         ),
         asyncio.create_task(server_to_client()),
     ]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    with contextlib.suppress(Exception):
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
         client_writer.close()
+        server_writer.close()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def main() -> None:

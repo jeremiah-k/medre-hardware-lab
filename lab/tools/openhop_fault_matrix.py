@@ -97,6 +97,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -112,6 +113,7 @@ _TOOLS_DIR = str(Path(__file__).resolve().parent)
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 import openhop_case_summary as case_summary  # noqa: E402
+from openhop_fault_settings import write_fault  # noqa: E402
 
 LAB_ROOT = Path(__file__).resolve().parents[2]
 TOOLS = LAB_ROOT / "lab" / "tools"
@@ -191,6 +193,16 @@ PROBE_RETIREMENT = re.compile(
 ANSWERED_PROBE = re.compile(r"idle-link probe answered", re.IGNORECASE)
 
 
+def wall_timestamp(value: object) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return stamp.timestamp() if stamp.tzinfo is not None else None
+
+
 def nonce_index(text: str) -> int | None:
     match = NONCE_INDEX.search(str(text or ""))
     return int(match.group("index")) if match else None
@@ -222,7 +234,7 @@ def sent_markers(probe_result: dict) -> set[str]:
 
 
 def state_in(container: str, mode: str, needle: str = "") -> dict:
-    run(
+    rc, _, _ = run(
         [
             "docker",
             "cp",
@@ -230,6 +242,8 @@ def state_in(container: str, mode: str, needle: str = "") -> dict:
             f"{container}:/tmp/openhop_store_snapshot.py",
         ]
     )
+    if rc:
+        raise RuntimeError(f"could not copy the snapshot reader into {container}")
     cmd = [
         "docker",
         "exec",
@@ -241,11 +255,16 @@ def state_in(container: str, mode: str, needle: str = "") -> dict:
     ]
     if needle:
         cmd += ["--needle", needle]
-    rc, out, err = run(cmd, timeout=300)
+    rc, out, _ = run(cmd, timeout=300)
     try:
-        return json.loads(out)
-    except ValueError:
-        return {"error": f"state read failed (rc={rc}): {err[-400:]}"}
+        snapshot = json.loads(out)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid {mode} snapshot from {container}") from exc
+    if rc or not isinstance(snapshot, dict) or "error" in snapshot:
+        raise RuntimeError(
+            f"could not read {mode} snapshot from {container} (exit {rc})"
+        )
+    return snapshot
 
 
 def count_reconnects(log: str) -> dict:
@@ -572,20 +591,21 @@ def drain_stall_failures(
             f"{reconnect_successes_while_armed} reconnect(s) succeeded while "
             "the stall window still held"
         )
-    if retired_during_window:
-        if not reconnected_after_window:
+    if retired_during_window and not reconnected_after_window:
+        failures.append(
+            "the connection retired inside the window and never reconnected after it ended"
+        )
+    limit = 45.0 if retired_during_window else 15.0
+    if resume_seconds_after_window is None:
+        failures.append("no delivery was observed after the stall window ended")
+    elif resume_seconds_after_window > limit:
+        if retired_during_window:
             failures.append(
-                "the connection retired inside the window and never "
-                "reconnected after it ended"
+                "the drain resumed later than the reconnect backoff and probe budget (45 s)"
             )
-        elif (
-            resume_seconds_after_window is not None
-            and resume_seconds_after_window > 45.0
-        ):
+        else:
             failures.append(
-                f"the drain resumed {resume_seconds_after_window:.1f} s after "
-                "the window ended, later than the reconnect backoff plus one "
-                "gated probe budget (the case's measured bound is 45 s)"
+                "the surviving connection took longer than one probe interval (15 s) to resume"
             )
     return failures
 
@@ -626,9 +646,7 @@ class FaultMatrix:
         """
         state = LAB_ROOT / "lab/state/openhop-fault"
         state.mkdir(parents=True, exist_ok=True)
-        (state / "fault.json").write_text(
-            json.dumps(fault, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        write_fault(state / "fault.json", fault)
         run(["docker", "rm", "-f", PROXY], timeout=120)
         # The proxy is started with DOCKER RUN and an explicit network alias
         # rather than compose: the client resolves the proxy's NAME once, at
@@ -646,12 +664,12 @@ class FaultMatrix:
             "--network-alias",
             "openhop-fault-proxy",
             "--user",
-            "1000:1000",
+            f"{os.getuid()}:{os.getgid()}",
             "-v",
             f"{LAB_ROOT / 'lab/openhop-radio/openhop_fault_proxy.py'}:"
             "/opt/openhop-fault/openhop_fault_proxy.py:ro",
             "-v",
-            f"{state}:/opt/openhop-fault:rw",
+            f"{state}:/opt/openhop-fault:ro",
             "medre-lab/openhop-radio-relay:latest",
             "python3",
             "/opt/openhop-fault/openhop_fault_proxy.py",
@@ -801,6 +819,9 @@ class FaultMatrix:
                 return
             time.sleep(settle)
             send = self.peer_send(count, prefix)
+            if send.get("pass") is not True or len(sent_markers(send)) != count:
+                self.not_run(name, "the peer did not accept the complete traffic batch")
+                return
             time.sleep(settle)
             log = container_logs(MEDRE_FAULT)
             churn = count_reconnects(log)
@@ -914,6 +935,7 @@ class FaultMatrix:
         other frame.  Phase 3 (T1): the deadline passes and the case
         waits for the reconnect and the delivery of what was queued.
         """
+        fault_path = None
         try:
             self.stop_bridge_medre()
             self.stop_fault_medre()
@@ -946,17 +968,29 @@ class FaultMatrix:
             # and persists until the deadline passes, across every
             # connection established inside the window.
             fault = {key: armed_at + window_seconds for key in window_fault}
-            (state_dir / "fault.json").write_text(
-                json.dumps(fault, sort_keys=True) + "\n", encoding="utf-8"
-            )
+            fault_path = state_dir / "fault.json"
+            write_fault(fault_path, fault)
             send = self.peer_send(count, prefix)
+            if send.get("pass") is not True or len(sent_markers(send)) != count:
+                self.not_run(name, "the peer did not accept the complete traffic batch")
+                return
             # The splice itself stops faulting the moment the deadline
             # passes (it re-reads the file per chunk), so the deadline is
             # the authoritative window end even if queueing overran it.
             window_end = armed_at + window_seconds
+            if any(
+                (stamp := wall_timestamp(entry.get("finished_at"))) is None
+                or stamp >= window_end
+                for entry in send["sends"]
+            ):
+                self.not_run(
+                    name,
+                    "the peer traffic batch did not finish inside the fault window",
+                )
+                return
             if time.time() < window_end:
                 time.sleep(window_end - time.time())
-            (state_dir / "fault.json").write_text("{}\n", encoding="utf-8")
+            write_fault(state_dir / "fault.json", {})
             self.wait_for(
                 lambda: (
                     "reconnected successfully"
@@ -1010,7 +1044,7 @@ class FaultMatrix:
                     continue
                 if RECONNECT.search(line) and armed_at <= stamp <= window_end:
                     attempts_while_armed += 1
-                if "reconnected successfully" in line:
+                if "reconnected successfully" in line and stamp >= armed_at:
                     if stamp <= window_end:
                         successes_while_armed += 1
                     elif success_after is None:
@@ -1075,6 +1109,9 @@ class FaultMatrix:
             )
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+        finally:
+            if fault_path is not None:
+                write_fault(fault_path, {})
 
     def case_reply_stall(self) -> None:
         """Swallow every server->client frame for a window, on every
@@ -1133,6 +1170,7 @@ class FaultMatrix:
         window_seconds = 45.0
         state_dir = LAB_ROOT / "lab/state/openhop-fault"
         state_dir.mkdir(parents=True, exist_ok=True)
+        fault_path = None
         try:
             self.stop_bridge_medre()
             self.stop_fault_medre()
@@ -1183,15 +1221,12 @@ class FaultMatrix:
                 if delivered > 0:
                     armed_at = time.time()
                     window_end = armed_at + window_seconds
-                    (state_dir / "fault.json").write_text(
-                        json.dumps(
-                            {
-                                "stall_server_to_client_until": window_end,
-                            },
-                            sort_keys=True,
-                        )
-                        + "\n",
-                        encoding="utf-8",
+                    fault_path = state_dir / "fault.json"
+                    write_fault(
+                        fault_path,
+                        {
+                            "stall_server_to_client_until": window_end,
+                        },
                     )
                     delivered_before_arm = delivered
                     armed = True
@@ -1207,7 +1242,7 @@ class FaultMatrix:
             sender.join(timeout=600)
             if time.time() < window_end:
                 time.sleep(window_end - time.time())
-            (state_dir / "fault.json").write_text("{}\n", encoding="utf-8")
+            write_fault(state_dir / "fault.json", {})
             self.wait_for(
                 lambda: (
                     "reconnected successfully"
@@ -1226,6 +1261,9 @@ class FaultMatrix:
             log = timestamped_logs(MEDRE_FAULT)
             churn = count_reconnects(log)
             mine = sent_markers(send)
+            if send.get("pass") is not True or len(mine) != count:
+                self.not_run(name, "the peer did not accept the complete traffic batch")
+                return
             events = (
                 state_in(MEDRE_FAULT, "medre", prefix).get("canonical_events") or []
             )
@@ -1251,18 +1289,30 @@ class FaultMatrix:
             attempts_while_armed = 0
             successes_while_armed = 0
             retired_during_window = False
-            resume_seconds = None
+            reconnected_after_window = False
+            deliveries_after_window = [
+                stamp
+                for event in events
+                if nonce_marker(json.dumps(event, sort_keys=True)) in mine
+                and (stamp := wall_timestamp(event.get("created_at"))) is not None
+                and stamp >= window_end
+            ]
+            resume_seconds = (
+                min(deliveries_after_window) - window_end
+                if deliveries_after_window
+                else None
+            )
             for line in log.splitlines():
                 stamp = line_time(line)
                 if stamp is None:
                     continue
                 if RECONNECT.search(line) and armed_at <= stamp <= window_end:
                     attempts_while_armed += 1
-                if "reconnected successfully" in line:
+                if "reconnected successfully" in line and stamp >= armed_at:
                     if stamp <= window_end:
                         successes_while_armed += 1
-                    elif resume_seconds is None:
-                        resume_seconds = stamp - window_end
+                    else:
+                        reconnected_after_window = True
                 if "retiring connection" in line and armed_at <= stamp <= window_end:
                     retired_during_window = True
             failures = drain_stall_failures(
@@ -1272,9 +1322,11 @@ class FaultMatrix:
                 duplicate_wakes=duplicates,
                 reconnect_successes_while_armed=successes_while_armed,
                 retired_during_window=retired_during_window,
-                reconnected_after_window=resume_seconds is not None,
+                reconnected_after_window=reconnected_after_window,
                 resume_seconds_after_window=resume_seconds,
             )
+            if delivered_before_arm >= accepted:
+                failures.append("the backlog was exhausted when the stall was armed")
             self.write(
                 name,
                 {
@@ -1328,7 +1380,11 @@ class FaultMatrix:
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
 
-    # -- the silent dead-link case ---------------------------------------
+        # -- the silent dead-link case ---------------------------------------
+        finally:
+            if fault_path is not None:
+                write_fault(fault_path, {})
+
     def case_idle_blackhole(self) -> None:
         """Blackhole an up, idle link in both directions, no close.
 
@@ -1342,6 +1398,7 @@ class FaultMatrix:
         """
         name = "fault-idle-blackhole"
         prefix = "p4blackhole"
+        fault_path = None
         try:
             self.stop_bridge_medre()
             self.stop_fault_medre()
@@ -1370,18 +1427,18 @@ class FaultMatrix:
             time.sleep(25)
             armed_at = time.time()
             state_dir = LAB_ROOT / "lab/state/openhop-fault"
-            (state_dir / "fault.json").write_text(
-                json.dumps(
-                    {
-                        "stall_server_to_client": True,
-                        "stall_client_to_server": True,
-                    },
-                    sort_keys=True,
-                )
-                + "\n",
-                encoding="utf-8",
+            fault_path = state_dir / "fault.json"
+            write_fault(
+                fault_path,
+                {
+                    "stall_server_to_client": True,
+                    "stall_client_to_server": True,
+                },
             )
             send = self.peer_send(3, prefix)
+            if send.get("pass") is not True or len(sent_markers(send)) != 3:
+                self.not_run(name, "the peer did not accept the complete traffic batch")
+                return
             # Wait out the detection window (first probe within 15 s of
             # parking plus the probe timeout) for the retirement line.
             retired = self.wait_for(
@@ -1395,11 +1452,11 @@ class FaultMatrix:
                     name,
                     "no idle-link probe retirement was recorded while the fault held",
                 )
-                (state_dir / "fault.json").write_text("{}\n", encoding="utf-8")
+                write_fault(state_dir / "fault.json", {})
                 return
             time.sleep(4)
             cleared_at = time.time()
-            (state_dir / "fault.json").write_text("{}\n", encoding="utf-8")
+            write_fault(state_dir / "fault.json", {})
             self.wait_for(
                 lambda: (
                     "reconnected successfully"
@@ -1447,7 +1504,7 @@ class FaultMatrix:
                     continue
                 if RECONNECT.search(line) and armed_at <= stamp <= cleared_at:
                     attempts_while_armed += 1
-                if "reconnected successfully" in line:
+                if "reconnected successfully" in line and stamp >= armed_at:
                     if stamp <= cleared_at:
                         successes_while_armed += 1
                     elif success_after is None:
@@ -1504,6 +1561,9 @@ class FaultMatrix:
             )
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+        finally:
+            if fault_path is not None:
+                write_fault(fault_path, {})
 
 
 # fault dict -> what the splice injects on the server -> client direction,
@@ -1594,7 +1654,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     case_summary.write_summary(matrix.dir, summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
-    return 0
+    return (
+        0
+        if matrix.results and all(row["status"] == "PASS" for row in matrix.results)
+        else 1
+    )
 
 
 if __name__ == "__main__":

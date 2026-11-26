@@ -1102,7 +1102,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "bash -c 'for p in /proc/[0-9]*/cmdline; do tr \"\\0\" < \"$$p\" | grep -qx \"/usr/local/bin/medre\" && exit 0; done; exit 1'",
+          "bash -c 'for p in /proc/[0-9]*/cmdline; do tr \"\\0\" \"\\n\" < \"$$p\" | grep -qx \"/usr/local/bin/medre\" && exit 0; done; exit 1'",
         ]
       interval: 5s
       timeout: 5s
@@ -1133,7 +1133,7 @@ services:
     profiles: [openhop-fault]
     container_name: medre-lab-openhop-fault-proxy
     restart: "no"
-    user: "1000:1000"
+    user: "${LAB_UID:-1000}:${LAB_GID:-1000}"
     command:
       [
         "python3",

@@ -336,3 +336,15 @@ def test_the_registry_matches_each_verdict():
     for key in fault_matrix.WINDOW_RUNNERS:
         assert key not in fault_matrix.CASES
         assert hasattr(fault_matrix.FaultMatrix, fault_matrix.WINDOW_RUNNERS[key])
+
+
+def test_surviving_link_must_resume_inside_one_probe_interval():
+    failures = judge_drain_stall(
+        retired_during_window=False, resume_seconds_after_window=16.0
+    )
+    assert any("one probe interval" in failure for failure in failures)
+
+
+def test_reconnect_without_delivery_does_not_prove_drain_resumption():
+    failures = judge_drain_stall(resume_seconds_after_window=None)
+    assert any("no delivery was observed" in failure for failure in failures)

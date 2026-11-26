@@ -60,7 +60,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import select
 import subprocess
 import sys
 import time
@@ -73,6 +75,7 @@ _TOOLS_DIR = str(Path(__file__).resolve().parent)
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 import openhop_case_summary as case_summary  # noqa: E402
+from openhop_fault_settings import write_fault  # noqa: E402
 
 LAB_ROOT = Path(__file__).resolve().parents[2]
 TOOLS = LAB_ROOT / "lab" / "tools"
@@ -107,6 +110,63 @@ def utcnow() -> str:
 def run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def checked_docker(*args: str, timeout: int = 180) -> str:
+    rc, output, _ = run(["docker", *args], timeout=timeout)
+    if rc:
+        raise RuntimeError(f"docker {args[0]} failed (exit {rc})")
+    return output.strip()
+
+
+def restart_repeater(container: str) -> None:
+    before = checked_docker("inspect", "-f", "{{.State.StartedAt}}", container)
+    checked_docker("restart", container, timeout=300)
+    after = checked_docker("inspect", "-f", "{{.State.StartedAt}}", container)
+    if not after or before == after or not container_running(container):
+        raise RuntimeError(f"did not observe a new start of {container}")
+
+
+def hold_exclusive_lock(seconds: int) -> subprocess.Popen[bytes] | None:
+    script = (
+        "import sqlite3,time,sys;"
+        "c=sqlite3.connect('/var/lib/openhop_repeater/repeater.db',"
+        "timeout=1,isolation_level=None);"
+        "c.execute('BEGIN EXCLUSIVE');"
+        "print('locked',flush=True);"
+        "time.sleep(float(sys.argv[1]));"
+        "c.execute('ROLLBACK')"
+    )
+    proc = subprocess.Popen(
+        ["docker", "exec", REPEATER_A, "python3", "-c", script, str(seconds)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    assert proc.stdout is not None
+    confirmed = False
+    try:
+        # A partial line can block readline() even after select marks it ready.
+        deadline = time.monotonic() + 20
+        expected = b"locked\n"
+        marker = b""
+        while len(marker) < len(expected):
+            ready, _, _ = select.select(
+                [proc.stdout], [], [], max(0, deadline - time.monotonic())
+            )
+            if not ready or time.monotonic() >= deadline:
+                return None
+            chunk = os.read(proc.stdout.fileno(), len(expected) - len(marker))
+            if not chunk:
+                return None
+            marker += chunk
+        confirmed = marker == expected and proc.poll() is None
+        return proc if confirmed else None
+    finally:
+        proc.stdout.close()
+        if not confirmed:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +420,7 @@ def peer_send(
 
 def state_in(container: str, mode: str, needle: str = "") -> dict:
     """Read a store snapshot from inside a container (read-only)."""
-    run(
+    rc, _, _ = run(
         [
             "docker",
             "cp",
@@ -368,6 +428,8 @@ def state_in(container: str, mode: str, needle: str = "") -> dict:
             f"{container}:/tmp/openhop_store_snapshot.py",
         ]
     )
+    if rc:
+        raise RuntimeError(f"could not copy the snapshot reader into {container}")
     cmd = [
         "docker",
         "exec",
@@ -379,11 +441,16 @@ def state_in(container: str, mode: str, needle: str = "") -> dict:
     ]
     if needle:
         cmd += ["--needle", needle]
-    rc, out, err = run(cmd, timeout=300)
+    rc, out, _ = run(cmd, timeout=300)
     try:
-        return json.loads(out)
-    except ValueError:
-        return {"error": f"state read failed (rc={rc}): {err[-500:]}"}
+        snapshot = json.loads(out)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid {mode} snapshot from {container}") from exc
+    if rc or not isinstance(snapshot, dict) or "error" in snapshot:
+        raise RuntimeError(
+            f"could not read {mode} snapshot from {container} (exit {rc})"
+        )
+    return snapshot
 
 
 class Matrix:
@@ -511,9 +578,7 @@ class Matrix:
         restarting the splice.
         """
         FAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
-        (FAULT_STATE_DIR / "fault.json").write_text(
-            json.dumps(fault, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        write_fault(FAULT_STATE_DIR / "fault.json", fault)
         self.remove_splice()
         run(
             [
@@ -527,12 +592,12 @@ class Matrix:
                 "--network-alias",
                 "openhop-fault-proxy",
                 "--user",
-                "1000:1000",
+                f"{os.getuid()}:{os.getgid()}",
                 "-v",
                 f"{LAB_ROOT / 'lab/openhop-radio/openhop_fault_proxy.py'}:"
                 "/opt/openhop-fault/openhop_fault_proxy.py:ro",
                 "-v",
-                f"{FAULT_STATE_DIR}:/opt/openhop-fault:rw",
+                f"{FAULT_STATE_DIR}:/opt/openhop-fault:ro",
                 "medre-lab/openhop-radio-relay:latest",
                 "python3",
                 "/opt/openhop-fault/openhop_fault_proxy.py",
@@ -581,11 +646,13 @@ class Matrix:
     def case_c1(self, count: int = 120) -> None:
         name = "c1-backlog-120-medre-restart"
         prefix = "p4c1"
+        restore_bridge = False
         try:
             if not container_running(MEDRE_BRIDGE):
                 self.not_run(name, "the MEDRE bridge container is not running")
                 return
-            run(["docker", "stop", MEDRE_BRIDGE], timeout=180)
+            restore_bridge = True
+            checked_docker("stop", MEDRE_BRIDGE)
             pre = self.preconditions(
                 "MEDRE stopped, so companion A has no client attached"
             )
@@ -610,7 +677,7 @@ class Matrix:
             mine = sent_markers(send)
             persisted_count, persisted_indices = count_nonce_rows(rows, only=mine)
             persisted_report = ordering_report(persisted_indices)
-            run(["docker", "start", MEDRE_BRIDGE], timeout=180)
+            checked_docker("start", MEDRE_BRIDGE)
             self.wait_for(lambda: container_running(MEDRE_BRIDGE), 90)
             self.wait_for(
                 lambda: len(self.medre_events(prefix, only=mine)) >= persisted_count,
@@ -634,6 +701,10 @@ class Matrix:
             if persisted_count == 0:
                 failures.append(
                     "the repeater persisted no nonce-bearing message while no client was attached"
+                )
+            if set(persisted_indices) != mine or set(markers) != mine:
+                failures.append(
+                    "the persisted and delivered markers must match the accepted batch"
                 )
             if report["distinct"] != persisted_count:
                 failures.append(
@@ -678,16 +749,24 @@ class Matrix:
             )
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+        finally:
+            if restore_bridge and not container_running(MEDRE_BRIDGE):
+                try:
+                    checked_docker("start", MEDRE_BRIDGE)
+                except (RuntimeError, subprocess.SubprocessError) as exc:
+                    self.not_run(name, f"could not restore the MEDRE bridge: {exc}")
 
     def case_c2(self, backlog: int = 40, live: int = 20) -> None:
         name = "c2-backlog-with-live"
         back_prefix = "p4c2b"
         live_prefix = "p4c2l"
+        restore_bridge = False
         try:
             if not container_running(MEDRE_BRIDGE):
                 self.not_run(name, "the MEDRE bridge container is not running")
                 return
-            run(["docker", "stop", MEDRE_BRIDGE], timeout=180)
+            restore_bridge = True
+            checked_docker("stop", MEDRE_BRIDGE)
             pre = self.preconditions(
                 "MEDRE stopped, so companion A has no client attached"
             )
@@ -708,7 +787,7 @@ class Matrix:
             back_send = peer_send(self.profile, backlog, back_prefix, settle=3.0)
             rows, _ = self.repeater_queue(REPEATER_A, back_prefix)
             persisted_count, _ = count_nonce_rows(rows, only=sent_markers(back_send))
-            run(["docker", "start", MEDRE_BRIDGE], timeout=180)
+            checked_docker("start", MEDRE_BRIDGE)
             self.wait_for(lambda: container_running(MEDRE_BRIDGE), 90)
             time.sleep(4)
             live_send = peer_send(self.profile, live, live_prefix, settle=8.0)
@@ -743,6 +822,15 @@ class Matrix:
             ]
             live_report = ordering_report(live_markers)
             failures: list[str] = []
+            if (
+                back_send.get("pass") is not True
+                or live_send.get("pass") is not True
+                or persisted_count != backlog
+                or len(live_markers_sent) != live
+            ):
+                failures.append(
+                    "the case needs both a full persisted backlog and an accepted live batch"
+                )
             if report["distinct"] != persisted_count + int(
                 live_send.get("accepted_count") or 0
             ):
@@ -774,6 +862,12 @@ class Matrix:
             )
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+        finally:
+            if restore_bridge and not container_running(MEDRE_BRIDGE):
+                try:
+                    checked_docker("start", MEDRE_BRIDGE)
+                except (RuntimeError, subprocess.SubprocessError) as exc:
+                    self.not_run(name, f"could not restore the MEDRE bridge: {exc}")
 
     def case_c3(self, count: int = 10) -> None:
         name = "c3-client-sync-during-persist"
@@ -791,40 +885,8 @@ class Matrix:
             # Hold an EXCLUSIVE lock on the repeater's SQLite store from
             # inside the repeater container: the persist path and the
             # client's sync path then contend for the same database.
-            lock_script = (
-                "import sqlite3,time,sys;"
-                "c=sqlite3.connect('/var/lib/openhop_repeater/repeater.db',"
-                "timeout=1,isolation_level=None);"
-                "c.execute('BEGIN EXCLUSIVE');"
-                "print('locked',flush=True);"
-                "time.sleep(float(sys.argv[1]));"
-                "c.execute('ROLLBACK')"
-            )
-            lock_proc = subprocess.Popen(
-                [
-                    "docker",
-                    "exec",
-                    REPEATER_A,
-                    "python3",
-                    "-c",
-                    lock_script,
-                    "45",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            locked = False
-            deadline = time.monotonic() + 20
-            while time.monotonic() < deadline:
-                if lock_proc.poll() is not None:
-                    break
-                line = lock_proc.stdout.readline() if lock_proc.stdout else ""
-                if "locked" in line:
-                    locked = True
-                    break
-            if not locked:
-                lock_proc.kill()
+            lock_proc = hold_exclusive_lock(45)
+            if lock_proc is None:
                 self.not_run(name, "the repeater's SQLite store could not be locked")
                 return
             send = peer_send(self.profile, count, prefix, settle=3.0)
@@ -842,7 +904,7 @@ class Matrix:
                 )
                 if marker is not None and marker in mine
             ]
-            report = ordering_report(markers)
+            observed_while_locked = lock_proc.poll() is None and bool(markers)
             repeater_log = container_logs(REPEATER_A)
             lock_errors = [
                 line
@@ -853,19 +915,33 @@ class Matrix:
                 lock_proc.wait(timeout=60)
             except subprocess.TimeoutExpired:
                 lock_proc.kill()
+                lock_proc.wait()
+                raise
             rows, _ = self.repeater_queue(REPEATER_A, prefix)
-            persisted_count, _ = count_nonce_rows(rows, only=sent_markers(send))
+            persisted_count, persisted = count_nonce_rows(rows, only=mine)
+            events = self.medre_events(prefix, only=mine)
+            markers = [
+                marker
+                for event in events
+                if (marker := nonce_marker(json.dumps(event, sort_keys=True))) in mine
+            ]
+            report = ordering_report(markers)
             failures: list[str] = []
+            if not observed_while_locked:
+                failures.append("no delivery was observed while the lock was held")
+            if set(markers) | set(persisted) != mine:
+                failures.append(
+                    "delivered and preserved messages do not cover the accepted batch"
+                )
+            if report["duplicate_arrivals"] or set(markers) & set(persisted):
+                failures.append(
+                    "a marker was delivered twice or remained queued after delivery"
+                )
             if not send.get("accepted_count"):
                 failures.append(
                     "the peer sent no accepted message while the store was locked"
                 )
-            # The ORDER the client actually received the messages in. The
-            # companion drains its IN-MEMORY queue before its PERSISTED
-            # SQLite rows, so a newer message that has not been persisted
-            # yet can be delivered before an older persisted row: this
-            # records the first and second arrival by name so the order is
-            # a fact in the evidence rather than a summary.
+            # Use MEDRE's recorded arrival order across both queue tiers.
             order = [nonce_index(marker) for marker in markers]
             first_two = [index for index in order if index is not None][:2]
             ordering_verdict = "PASS"
@@ -890,12 +966,7 @@ class Matrix:
                     "arrival_order_indices": order,
                     "first_two_arrival_indices": first_two,
                     "ordering_verdict": ordering_verdict,
-                    "ordering_note": (
-                        "The companion drains its in-memory queue BEFORE its "
-                        "persisted SQLite rows, so a newer not-yet-persisted "
-                        "message can be delivered before an older persisted "
-                        "row. The indices above are the actual arrival order."
-                    ),
+                    "ordering_note": "Indices show the recorded arrival order.",
                     "persisted_after_unlock": persisted_count,
                     "repeater_lock_error_lines": lock_errors,
                     "probe": send,
@@ -941,11 +1012,18 @@ class Matrix:
                 "--window",
                 "45",
             ]
+            baseline = container_logs(REPEATER_B).count("evicting previous connection")
             first = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
-            time.sleep(6)
-            second = run(cmd, timeout=180)
+            try:
+                time.sleep(6)
+                second = run(cmd, timeout=180)
+                first_out, _ = first.communicate(timeout=120)
+            finally:
+                if first.poll() is None:
+                    first.kill()
+                    first.communicate()
             out = second[1].strip()
             payload: dict = {}
             start = out.find("{")
@@ -954,11 +1032,6 @@ class Matrix:
                     payload = json.loads(out[start:])
                 except ValueError:
                     payload = {"error": "the second client's JSON did not parse"}
-            first_out = ""
-            try:
-                first_out = first.communicate(timeout=120)[0]
-            except subprocess.TimeoutExpired:
-                first.kill()
             first_payload: dict = {}
             start = first_out.find("{")
             if start >= 0:
@@ -971,8 +1044,12 @@ class Matrix:
                 line for line in b_log.splitlines() if "evict" in line.lower()
             ][-5:]
             failures: list[str] = []
-            if payload.get("error"):
+            if second[0] or payload.get("pass") is not True:
                 failures.append("the replacing client produced no usable result")
+            if first.returncode or first_payload.get("pass") is not True:
+                failures.append("the replaced client produced no usable result")
+            if b_log.count("evicting previous connection") <= baseline:
+                failures.append("the repeater did not record a client replacement")
             self.write(
                 name,
                 {
@@ -1052,10 +1129,9 @@ class Matrix:
                     break
                 time.sleep(1.0)
             armed_at = time.time()
-            (FAULT_STATE_DIR / "fault.json").write_text(
-                json.dumps({"stall_server_to_client_on_request": True}, sort_keys=True)
-                + "\n",
-                encoding="utf-8",
+            write_fault(
+                FAULT_STATE_DIR / "fault.json",
+                {"stall_server_to_client_on_request": True},
             )
             send = peer_send(self.profile, count, prefix, settle=5.0)
             mine = sent_markers(send)
@@ -1084,11 +1160,16 @@ class Matrix:
             # pinned to "no" for the kill: an unless-stopped container is
             # restarted by the daemon on a kill, which would race the
             # controlled restart below.
-            run(["docker", "update", "--restart=no", MEDRE_FAULT], timeout=120)
-            run(["docker", "kill", MEDRE_FAULT], timeout=120)
+            checked_docker("update", "--restart=no", MEDRE_FAULT, timeout=120)
+            checked_docker("kill", MEDRE_FAULT, timeout=120)
             killed_at = time.time()
-            (FAULT_STATE_DIR / "fault.json").write_text("{}\n", encoding="utf-8")
-            run(["docker", "start", MEDRE_FAULT], timeout=180)
+            if (
+                checked_docker("inspect", "-f", "{{.State.Running}}", MEDRE_FAULT)
+                != "false"
+            ):
+                raise RuntimeError("MEDRE did not stop at the controlled kill")
+            write_fault(FAULT_STATE_DIR / "fault.json", {})
+            checked_docker("start", MEDRE_FAULT)
             run(
                 ["docker", "update", "--restart=unless-stopped", MEDRE_FAULT],
                 timeout=120,
@@ -1131,8 +1212,12 @@ class Matrix:
                     "case": name,
                     "pass": not failures,
                     "failures": failures,
-                    "armed_at": utcnow(),
-                    "killed_at": utcnow(),
+                    "armed_at": time.strftime(
+                        "%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(armed_at)
+                    ),
+                    "killed_at": time.strftime(
+                        "%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(killed_at)
+                    ),
                     "hold_seconds": hold_seconds,
                     "requested_messages": count,
                     "peer_accepted_sends": accepted,
@@ -1185,7 +1270,7 @@ class Matrix:
             # instance go, the fault file clears, and the bridge MEDRE
             # (stopped at the start of the case) runs again.
             if FAULT_STATE_DIR.exists():
-                (FAULT_STATE_DIR / "fault.json").write_text("{}\n", encoding="utf-8")
+                write_fault(FAULT_STATE_DIR / "fault.json", {})
             self.remove_fault_medre()
             self.remove_splice()
             if (
@@ -1193,16 +1278,18 @@ class Matrix:
                 and not container_running(MEDRE_BRIDGE)
                 and container_running(REPEATER_A)
             ):
-                run(["docker", "start", MEDRE_BRIDGE], timeout=180)
+                checked_docker("start", MEDRE_BRIDGE)
 
     def case_c6(self, count: int = 20) -> None:
         name = "c6-repeater-restart-persisted-queue"
         prefix = "p4c6"
+        restore_bridge = False
         try:
             if not container_running(MEDRE_BRIDGE):
                 self.not_run(name, "the MEDRE bridge container is not running")
                 return
-            run(["docker", "stop", MEDRE_BRIDGE], timeout=180)
+            restore_bridge = True
+            checked_docker("stop", MEDRE_BRIDGE)
             pre = self.preconditions(
                 "MEDRE stopped, so companion A has no client attached"
             )
@@ -1224,12 +1311,11 @@ class Matrix:
             mine = sent_markers(send)
             rows, _ = self.repeater_queue(REPEATER_A, prefix)
             persisted_before, indices_before = count_nonce_rows(rows, only=mine)
-            run(["docker", "restart", REPEATER_A], timeout=300)
-            self.wait_for(lambda: container_running(REPEATER_A), 90)
+            restart_repeater(REPEATER_A)
             time.sleep(3)
             rows_after, _ = self.repeater_queue(REPEATER_A, prefix)
-            persisted_after, _ = count_nonce_rows(rows_after, only=mine)
-            run(["docker", "start", MEDRE_BRIDGE], timeout=180)
+            persisted_after, indices_after = count_nonce_rows(rows_after, only=mine)
+            checked_docker("start", MEDRE_BRIDGE)
             self.wait_for(lambda: container_running(MEDRE_BRIDGE), 90)
             self.wait_for(
                 lambda: len(self.medre_events(prefix, only=mine)) >= persisted_after,
@@ -1246,6 +1332,15 @@ class Matrix:
             ]
             report = ordering_report(markers)
             failures: list[str] = []
+            if (
+                not mine
+                or set(indices_before) != mine
+                or set(indices_after) != mine
+                or set(markers) != mine
+            ):
+                failures.append(
+                    "the accepted marker set must survive restart and reach MEDRE"
+                )
             if persisted_after != persisted_before:
                 failures.append(
                     f"the persisted queue changed across the restart: "
@@ -1279,6 +1374,12 @@ class Matrix:
             )
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+        finally:
+            if restore_bridge and not container_running(MEDRE_BRIDGE):
+                try:
+                    checked_docker("start", MEDRE_BRIDGE)
+                except (RuntimeError, subprocess.SubprocessError) as exc:
+                    self.not_run(name, f"could not restore the MEDRE bridge: {exc}")
 
 
 CASES = {

@@ -2,7 +2,7 @@
 # MEDRE fault-injection runtime - contract template.
 #
 # This committed file is the canonical MEDRE configuration for the lossy
-# link measurement. lab/openhop-radio/fault_matrix.sh copies it to
+# link measurement. The Python qualification drivers copy it to
 # lab/state/config/medre-openhop-fault.yaml (no substitutions - it carries
 # no secret) and the generated copy is the one mounted read-only into the
 # medre-openhop-fault container.
@@ -12,9 +12,9 @@
 #
 #     MEDRE --TCP 5050--> openhop-fault-proxy --TCP 5000--> openhop-repeater-a
 #
-# The proxy is a TRANSPARENT single-connection TCP splice: it forwards every
-# byte in both directions unchanged and never speaks the companion protocol,
-# so it cannot issue a GET_MSG and cannot stack one on another.  The
+# The proxy forwards bytes unchanged in the absence of faults. It can
+# delay or discard traffic and close connections. It never sends companion
+# protocol commands, so it cannot issue a GET_MSG. The
 # companion still sees exactly ONE client (this MEDRE session) at a time, so
 # the single-client rule holds.
 #

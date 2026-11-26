@@ -238,12 +238,31 @@ async def run_listen(args) -> dict:
         result["pass"] = False
         return result
 
+    if client is None:
+        result.update(
+            {
+                "pass": False,
+                "finished_at": utcnow(),
+                "failures": ["companion did not complete the handshake"],
+            }
+        )
+        return result
+
     drain = MCDrain()
     try:
         await drain.start(client)
         deadline = time.monotonic() + args.window
         while time.monotonic() < deadline:
             await asyncio.sleep(0.25)
+    except Exception as exc:
+        result.update(
+            {
+                "pass": False,
+                "finished_at": utcnow(),
+                "failures": [f"companion listen failed: {type(exc).__name__}"],
+            }
+        )
+        return result
     finally:
         drain.stop(client)
         try:

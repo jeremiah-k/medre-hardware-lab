@@ -553,6 +553,8 @@ def test_verify_selection_accepts_and_appends_carry_forward(tmp_path, capsys):
         (directory / summary.CARRY_FORWARD_NAME).read_text(encoding="utf-8")
     )
     assert len(carry) == 1
+    rebuilt = json.loads((directory / summary.SUMMARY_NAME).read_text())
+    assert rebuilt["counts"] == {"PASS": 2, "FAIL": 0, "NOT RUN": 0}
     entry = carry[0]
     assert set(entry) == {"verified_at", "selection_sha256", "from", "to"}
     assert entry["from"]["lab_revision"] == first
@@ -638,3 +640,15 @@ def test_the_summary_path_regenerates_with_an_old_format_stamp(tmp_path, capsys)
         ]
         == 2
     )
+
+
+def test_carry_forward_refuses_missing_backlog_cases(tmp_path, capsys):
+    lab, directory, first = bound_legacy_directory(tmp_path)
+    (directory / summary.SCOPE_NAME).write_text(
+        json.dumps(legacy_stamp(lab, first, profile="openhop-bridge")),
+        encoding="utf-8",
+    )
+    code = summary.main(["--verify-selection", str(directory)], lab_root=lab)
+    assert code == 1
+    assert "missing planned cases: c3, c4, c5, c6" in capsys.readouterr().err
+    assert not (directory / summary.CARRY_FORWARD_NAME).exists()

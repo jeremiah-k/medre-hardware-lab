@@ -142,7 +142,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--until", default="")
     args = parser.parse_args(argv)
 
-    out = repeater_state(args) if args.mode == "repeater" else medre_state(args)
+    try:
+        out = repeater_state(args) if args.mode == "repeater" else medre_state(args)
+    except (OSError, sqlite3.Error) as exc:
+        out = {
+            "mode": args.mode,
+            "error": f"store snapshot failed: {type(exc).__name__}",
+        }
     print(json.dumps(out, indent=2, sort_keys=True))
     return 0 if "error" not in out else 1
 

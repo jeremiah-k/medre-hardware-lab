@@ -70,16 +70,6 @@ MEDRE_BRIDGE = backlog.MEDRE_BRIDGE
 # be read (repeater/companion/frame_server.py, _sync_message_locked).
 FALLBACK_WARNING = "persisted queue unreadable"
 
-LOCK_SCRIPT = (
-    "import sqlite3,time,sys;"
-    "c=sqlite3.connect('/var/lib/openhop_repeater/repeater.db',"
-    "timeout=1,isolation_level=None);"
-    "c.execute('BEGIN EXCLUSIVE');"
-    "print('locked',flush=True);"
-    "time.sleep(float(sys.argv[1]));"
-    "c.execute('ROLLBACK')"
-)
-
 
 def utcnow() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
@@ -154,31 +144,6 @@ def merged_block_verdict(markers: list[str], blocks: list[str]) -> dict:
 # ---------------------------------------------------------------------------
 # Rig plumbing (the backlog matrix's helpers, reused where possible)
 # ---------------------------------------------------------------------------
-def hold_exclusive_lock(seconds: int):
-    """Hold the repeater's SQLite store under an EXCLUSIVE lock.
-
-    Returns the lock process once the store is really locked, or None if
-    the lock could not be taken.  The caller is responsible for waiting
-    for the process to exit (the lock lifts when the sleep ends).
-    """
-    lock_proc = subprocess.Popen(
-        ["docker", "exec", REPEATER_A, "python3", "-c", LOCK_SCRIPT, str(seconds)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    deadline = time.monotonic() + 20
-    while time.monotonic() < deadline:
-        if lock_proc.poll() is not None:
-            lock_proc.kill()
-            return None
-        line = lock_proc.stdout.readline() if lock_proc.stdout else ""
-        if "locked" in line:
-            return lock_proc
-    lock_proc.kill()
-    return None
-
-
 class OrderingMatrix:
     def __init__(self, evidence_dir: Path, profile: str) -> None:
         self.dir = evidence_dir
@@ -252,20 +217,22 @@ class OrderingMatrix:
         return count, markers
 
     def stop_medre(self) -> None:
-        backlog.run(["docker", "stop", MEDRE_BRIDGE], timeout=180)
+        backlog.checked_docker("stop", MEDRE_BRIDGE)
 
     def start_medre(self) -> None:
-        backlog.run(["docker", "start", MEDRE_BRIDGE], timeout=180)
+        backlog.checked_docker("start", MEDRE_BRIDGE)
         self.wait_for(lambda: backlog.container_running(MEDRE_BRIDGE), 90)
 
     # -- cases -----------------------------------------------------------
     def case_o1(self, older: int = 5, newer: int = 5) -> None:
         name = "o1-older-persisted-newer-memory"
         old_prefix, new_prefix = "p4o1a", "p4o1b"
+        restore_bridge = False
         try:
             if not backlog.container_running(MEDRE_BRIDGE):
                 self.not_run(name, "the MEDRE bridge container is not running")
                 return
+            restore_bridge = True
             self.stop_medre()
             pre = self.preconditions(
                 "MEDRE stopped; the OLDER batch is persisted with no client "
@@ -291,7 +258,7 @@ class OrderingMatrix:
                 return
             # Lock the store so the NEWER batch cannot be persisted and
             # stays in the in-memory queue.
-            lock_proc = hold_exclusive_lock(30)
+            lock_proc = backlog.hold_exclusive_lock(30)
             if lock_proc is None:
                 self.not_run(
                     name,
@@ -309,6 +276,8 @@ class OrderingMatrix:
                 lock_proc.wait(timeout=60)
             except subprocess.TimeoutExpired:
                 lock_proc.kill()
+                lock_proc.wait()
+                raise
             mine = old_markers_sent | new_markers_sent
             self.start_medre()
             self.wait_for(
@@ -371,14 +340,22 @@ class OrderingMatrix:
             )
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+        finally:
+            if restore_bridge and not backlog.container_running(MEDRE_BRIDGE):
+                try:
+                    self.start_medre()
+                except (RuntimeError, subprocess.SubprocessError) as exc:
+                    self.not_run(name, f"could not restore the MEDRE bridge: {exc}")
 
     def case_o2(self, backlog_count: int = 5) -> None:
         name = "o2-restart-backlog-then-live"
         back_prefix, live_prefix = "p4o2a", "p4o2b"
+        restore_bridge = False
         try:
             if not backlog.container_running(MEDRE_BRIDGE):
                 self.not_run(name, "the MEDRE bridge container is not running")
                 return
+            restore_bridge = True
             self.stop_medre()
             pre = self.preconditions(
                 "MEDRE stopped; the backlog is persisted, then the repeater "
@@ -403,8 +380,7 @@ class OrderingMatrix:
                     {"preconditions": pre},
                 )
                 return
-            backlog.run(["docker", "restart", REPEATER_A], timeout=300)
-            self.wait_for(lambda: backlog.container_running(REPEATER_A), 90)
+            backlog.restart_repeater(REPEATER_A)
             time.sleep(3)
             rows_after_restart, _ = self.repeater_queue(back_prefix)
             persisted_after_restart, _ = backlog.count_nonce_rows(
@@ -413,7 +389,7 @@ class OrderingMatrix:
             # A short lock keeps the live message out of the store, so it
             # is genuinely "a new live message in memory" behind the
             # restarted backlog.
-            lock_proc = hold_exclusive_lock(25)
+            lock_proc = backlog.hold_exclusive_lock(25)
             if lock_proc is None:
                 self.not_run(
                     name,
@@ -427,6 +403,8 @@ class OrderingMatrix:
                 lock_proc.wait(timeout=50)
             except subprocess.TimeoutExpired:
                 lock_proc.kill()
+                lock_proc.wait()
+                raise
             mine = back_markers_sent | live_markers_sent
             self.start_medre()
             self.wait_for(
@@ -495,6 +473,12 @@ class OrderingMatrix:
             )
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+        finally:
+            if restore_bridge and not backlog.container_running(MEDRE_BRIDGE):
+                try:
+                    self.start_medre()
+                except (RuntimeError, subprocess.SubprocessError) as exc:
+                    self.not_run(name, f"could not restore the MEDRE bridge: {exc}")
 
     def case_o3(self, count: int = 8, lock_seconds: int = 40) -> None:
         name = "o3-store-locked-memory-served"
@@ -507,14 +491,15 @@ class OrderingMatrix:
                 "MEDRE stays attached to companion A while the store is locked"
             )
             warnings_before = self.repeater_log().count(FALLBACK_WARNING)
-            lock_proc = hold_exclusive_lock(lock_seconds)
+            lock_proc = backlog.hold_exclusive_lock(lock_seconds)
             if lock_proc is None:
                 self.not_run(name, "the repeater's SQLite store could not be locked")
                 return
             send = self.peer_send(count, prefix, settle=3.0)
             mine = backlog.sent_markers(send)
             # Serve what can be served WHILE the store is still locked.
-            served_while_locked = len(self.markers_from_store(prefix, mine))
+            during_lock = self.markers_from_store(prefix, mine)
+            served_while_locked = len(during_lock) if lock_proc.poll() is None else 0
             rows_while_locked, _ = self.repeater_queue(prefix)
             persisted_while_locked, _ = backlog.count_nonce_rows(
                 rows_while_locked, only=mine
@@ -523,6 +508,8 @@ class OrderingMatrix:
                 lock_proc.wait(timeout=lock_seconds + 30)
             except subprocess.TimeoutExpired:
                 lock_proc.kill()
+                lock_proc.wait()
+                raise
             # After the lock lifts: nothing new may appear and nothing may
             # duplicate; everything accepted must have been delivered or
             # must still be preserved at the companion.
@@ -547,11 +534,9 @@ class OrderingMatrix:
                 failures.append(
                     "nothing was served from memory while the store was locked"
                 )
-            if warning_delta > 1:
+            if warning_delta:
                 failures.append(
-                    f"the unreadable-store fallback warned {warning_delta} times "
-                    "in one lock episode; the warning is a once-per-episode "
-                    "signal, not a per-sync one"
+                    f"the readable WAL store triggered {warning_delta} unreadable-store warnings"
                 )
             if report["duplicate_arrivals"]:
                 failures.append(

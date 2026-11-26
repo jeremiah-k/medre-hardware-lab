@@ -102,3 +102,36 @@ def test_unreadable_fault_file_never_opens_the_stall(tmp_path):
     fault_file.unlink()
     stall.observe_request(connection=1)
     assert stall.withholds_replies() is False
+
+
+def test_new_request_stall_generation_resets_latch_without_intermediate_poll(tmp_path):
+    stall, fault_file = make_stall(tmp_path)
+    write_fault(
+        fault_file,
+        {"stall_server_to_client_on_request": True, "request_stall_generation": "one"},
+    )
+    stall.observe_request(connection=1)
+    assert stall.withholds_replies()
+
+    write_fault(fault_file, {})
+    write_fault(
+        fault_file,
+        {"stall_server_to_client_on_request": True, "request_stall_generation": "two"},
+    )
+    assert not stall.withholds_replies()
+    stall.observe_request(connection=2)
+    assert stall.withholds_replies()
+
+
+def test_blackhole_discards_chunks_until_cleared(tmp_path):
+    path = tmp_path / "fault.json"
+    fault = proxy.Blackhole(str(path))
+    flag = "stall_client_to_server"
+    counter = "stalled_client_to_server"
+    before = proxy.STATS[counter]
+    write_fault(path, {flag: True})
+    assert fault.drops(flag, 1, counter)
+    assert proxy.STATS[counter] == before + 1
+    write_fault(path, {})
+    assert not fault.drops(flag, 1, counter)
+    assert proxy.STATS[counter] == before + 1

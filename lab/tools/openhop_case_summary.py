@@ -42,6 +42,18 @@ CARRY_FORWARD_NAME = "selection-carry-forward.json"
 # are never rewritten; their selection is RECONSTRUCTED from the recorded
 # lab revision and compared by content (see bind_source_selection).
 LEGACY_STAMP_KEYS = {"lab_revision", "lock_sha256", "profile"}
+FAULT_CASES = {
+    "fault-idle-blackhole",
+    "fault-latency-under",
+    "fault-latency-over",
+    "fault-mid-fetch-close",
+    "fault-reconnect",
+    "fault-repeated-waiting",
+    "fault-reply-stall",
+    "fault-reply-stall-drain",
+    "fault-saturation",
+    "fault-selective-drop",
+}
 
 
 def _run_identifiers(lab_root: Path, revision: str) -> dict:
@@ -155,6 +167,22 @@ def verify_selection(
     cases = collect_cases(evidence_dir)
     if not cases:
         raise ValueError("the directory holds no case evidence")
+    names = {case["case"] for case in cases}
+    missing = set()
+    if recorded["profile"] == "openhop-fault":
+        missing = FAULT_CASES - names
+    elif recorded["profile"] == "openhop-bridge":
+        prefixes = {name.partition("-")[0] for name in names}
+        recognized = False
+        for family, size in (("c", 6), ("o", 3)):
+            planned = {f"{family}{index}" for index in range(1, size + 1)}
+            if planned & prefixes:
+                recognized = True
+                missing.update(planned - prefixes)
+        if not recognized:
+            raise ValueError("the directory holds no backlog or ordering evidence")
+    if missing:
+        raise ValueError("missing planned cases: " + ", ".join(sorted(missing)))
     failing = [case for case in cases if case["status"] != "PASS"]
     if failing:
         named = ", ".join(f"{case['case']}: {case['status']}" for case in failing)
@@ -173,6 +201,9 @@ def verify_selection(
     if carry.exists():
         history = json.loads(carry.read_text(encoding="utf-8"))
     history.append(entry)
+    write_summary(
+        evidence_dir, build_summary(evidence_dir, profile=recorded["profile"])
+    )
     carry.write_text(
         json.dumps(history, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
