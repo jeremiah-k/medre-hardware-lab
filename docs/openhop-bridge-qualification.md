@@ -62,9 +62,9 @@ Five services plus one one-shot proof container:
                               meshtasticd-c-medre -- MeshC -- meshtasticd-c-peer
 ```
 
-**Nothing is published to the host.** The relay, both companion ports and
-the MeshC sim nodes live only on the private `medre-lab-openhop-radio` and
-`medre-lab-mesh-c` networks.
+The relay and companion ports stay on the Docker networks. Compose also
+publishes the MeshC simulators on host loopback at `127.0.0.1:4409` and
+`127.0.0.1:4410`.
 
 ### The route is enabled ONLY here
 

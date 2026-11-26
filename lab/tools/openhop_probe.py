@@ -163,7 +163,9 @@ async def probe(host: str, port: int) -> dict:
                 evidence["clean_disconnect"] = False
                 evidence["disconnect_error"] = repr(exc)
 
-    evidence["pass"] = True
+    evidence["pass"] = evidence["clean_disconnect"]
+    if not evidence["pass"]:
+        evidence["reason"] = "companion did not disconnect cleanly"
     return evidence
 
 

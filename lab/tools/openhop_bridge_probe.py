@@ -289,8 +289,12 @@ async def run_bridge(args) -> dict:
         "started_at": utcnow(),
     }
 
-    observer = MeshCObserver(args.host_peer, args.port_peer)
     evidence["observer"] = {"host": args.host_peer, "port": args.port_peer}
+    try:
+        observer = MeshCObserver(args.host_peer, args.port_peer)
+    except Exception as exc:
+        evidence["reason"] = f"MeshC observer connection failed: {type(exc).__name__}"
+        return evidence
 
     try:
         client = await asyncio.wait_for(

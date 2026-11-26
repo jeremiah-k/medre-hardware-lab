@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import sys
 import time
 import uuid
@@ -97,6 +98,7 @@ class _Drain:
     def __init__(self, name: str) -> None:
         self.name = name
         self.messages: list[dict] = []
+        self.last_queue_reply = 0.0
 
     async def run(self, client, deadline: float) -> None:
         import meshcore
@@ -114,6 +116,7 @@ class _Drain:
                 continue
             event_type = str(getattr(event, "type", ""))
             if event_type == str(meshcore.EventType.NO_MORE_MSGS):
+                self.last_queue_reply = time.monotonic()
                 await asyncio.sleep(0.1)
                 continue
             if event_type == str(meshcore.EventType.ERROR):
@@ -121,6 +124,7 @@ class _Drain:
                 continue
             if event_type != str(meshcore.EventType.CHANNEL_MSG_RECV):
                 continue
+            self.last_queue_reply = time.monotonic()
             payload = getattr(event, "payload", None) or {}
             self.messages.append(
                 {
@@ -183,51 +187,49 @@ async def proof(args) -> dict:
             sender.commands.send_chan_msg(args.channel, nonce),
             timeout=COMMAND_TIMEOUT_SECONDS,
         )
+        sent_at = time.monotonic()
         evidence["send_event"] = str(getattr(sent, "type", ""))
         if evidence["send_event"] != str(meshcore.EventType.OK):
             evidence["reason"] = (
                 f"companion B refused the channel send: {evidence['send_event']}"
             )
-            await drains
             return evidence
     except asyncio.TimeoutError:
         evidence["reason"] = "the channel send timed out"
-        await drains
         return evidence
     except Exception as exc:
         evidence["reason"] = f"the channel send failed: {exc!r}"
-        await drains
         return evidence
 
-    await drains
+    finally:
+        try:
+            await drains
+        finally:
+            for client in (subscriber, sender):
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=5.0)
+                except Exception:  # pragma: no cover - best effort
+                    pass
 
-    expected_text = evidence.get("expected_text", nonce)
-    delivered = [m for m in sub_drain.messages if m.get("text") == expected_text]
+    delivered = [
+        msg
+        for msg in sub_drain.messages
+        if msg.get("text") == expected_text and msg.get("channel_idx") == args.channel
+    ]
     evidence["deliveries_at_a"] = sub_drain.messages
     evidence["deliveries_at_b"] = send_drain.messages
     evidence["delivered_count_at_a"] = len(delivered)
     evidence["echo_count_at_b"] = len(send_drain.messages)
-    # The companion layer can hand the SAME queued message to the client
-    # twice (upstream openHop keeps it in the in-memory queue and in SQLite
-    # at the same time). The RADIO path is what this proof measures, so the
-    # duplicate count is reported explicitly instead of being hidden: the
-    # packet_proof.sh cross-checks the relay's transmission log for exactly
-    # ONE crossing.
     evidence["duplicate_client_events_at_a"] = max(0, len(delivered) - 1)
+    evidence["sender_queue_observed_after_send"] = (
+        send_drain.last_queue_reply >= sent_at
+    )
 
-    for client in (subscriber, sender):
-        try:
-            await asyncio.wait_for(client.disconnect(), timeout=5.0)
-        except Exception:  # pragma: no cover - best effort
-            pass
-
-    if not delivered:
-        evidence["reason"] = (
-            f"the nonce was never delivered at A (saw {sub_drain.messages!r})"
-        )
+    if len(delivered) != 1 or len(sub_drain.messages) != 1:
+        evidence["reason"] = "A did not observe exactly one matching channel message"
         return evidence
-    if len(set(m.get("text") for m in delivered)) != 1:
-        evidence["reason"] = "A received the nonce with differing text"
+    if not evidence["sender_queue_observed_after_send"]:
+        evidence["reason"] = "B did not return a queue observation after the send"
         return evidence
     if send_drain.messages:
         evidence["reason"] = (
@@ -252,6 +254,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--channel", type=int, default=0)
     parser.add_argument("--window", type=float, default=60.0)
     args = parser.parse_args(argv)
+    if not math.isfinite(args.window) or args.window <= 0:
+        parser.error("--window must be finite and positive")
     result = asyncio.run(proof(args))
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result.get("pass") else 1

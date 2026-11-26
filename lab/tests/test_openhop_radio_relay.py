@@ -135,6 +135,7 @@ class _Peer:
         self.reader = reader
         self.writer = writer
         self.decoder = relay_mod.FrameDecoder()
+        self.pending: list[tuple[int, bytes]] = []
 
     async def send(self, cmd: int, payload: bytes = b"") -> None:
         self.writer.write(relay_mod.build_frame(cmd, payload))
@@ -142,13 +143,12 @@ class _Peer:
 
     async def recv(self, timeout: float = 5.0) -> tuple[int, bytes]:
         async def _read() -> tuple[int, bytes]:
-            while True:
+            while not self.pending:
                 data = await self.reader.read(4096)
                 if not data:
                     raise AssertionError("the relay closed the connection")
-                frames = self.decoder.feed(data)
-                if frames:
-                    return frames[0]
+                self.pending.extend(self.decoder.feed(data))
+            return self.pending.pop(0)
 
         return await asyncio.wait_for(_read(), timeout=timeout)
 

@@ -151,10 +151,10 @@ An openHop companion can hand the **same** queued message to a client
 twice: the message is persisted to SQLite _and_ kept in the in-memory
 queue, so a client that drains aggressively can see it twice. That is an
 **upstream openHop** behaviour, not a property of this profile: the
-radio path carried exactly one packet. The proof therefore asserts the
-**radio-level** single crossing (relay log + repeater A's reception
-count) and _reports_ the client-level duplicate count
-(`duplicate_client_events_at_a`) instead of hiding it.
+radio path carried exactly one packet. The proof requires a single
+radio-level crossing and zero client-level duplicates under the
+qualification pins. It records the client count as
+`duplicate_client_events_at_a`.
 
 ---
 

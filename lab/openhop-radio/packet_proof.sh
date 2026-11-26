@@ -47,6 +47,7 @@ while (($# > 0)); do
 	esac
 done
 mkdir -p "${EVIDENCE_DIR}"
+rm -f "${EVIDENCE_DIR}/verdict.json"
 
 COMPOSE=(docker compose --profile openhop-radio)
 RELAY_CONTAINER="medre-lab-openhop-radio-relay"
@@ -90,14 +91,16 @@ done
 # proofs, so the crossing count is measured as a DELTA over the proof
 # window: the log line count before the proof is the baseline.
 RELAY_LOG="${EVIDENCE_DIR}/relay.log"
-docker logs "${RELAY_CONTAINER}" >"${RELAY_LOG}" 2>&1 || true
+docker logs "${RELAY_CONTAINER}" >"${RELAY_LOG}" 2>&1 ||
+	fail "cannot read required logs from ${RELAY_CONTAINER}"
 RELAY_BASELINE="$(grep -c "transmitted" "${RELAY_LOG}" || true)"
 echo "  relay transmission baseline: ${RELAY_BASELINE}"
 
 # Repeater A's reception count is measured the same way: a baseline taken
 # BEFORE the proof, so the delta covers the proof window only.
 A_LOG="${EVIDENCE_DIR}/repeater-a.log"
-docker logs "${REPEATER_A}" >"${A_LOG}" 2>&1 || true
+docker logs "${REPEATER_A}" >"${A_LOG}" 2>&1 ||
+	fail "cannot read required logs from ${REPEATER_A}"
 A_RX_BASELINE="$(grep -c "RX GRP_TXT" "${A_LOG}" || true)"
 echo "  repeater A reception baseline: ${A_RX_BASELINE}"
 

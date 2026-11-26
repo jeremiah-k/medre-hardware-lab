@@ -91,7 +91,7 @@ try:
 except (OSError, ValueError):
     verdict = {"label": "protocol-simulated"}
 verdict["pass"] = False
-verdict["complete"] = False
+verdict.setdefault("complete", False)
 verdict["exit_status"] = int(sys.argv[2])
 path.write_text(json.dumps(verdict, indent=2, sort_keys=True) + "\n")
 PYVERDICT
@@ -190,8 +190,8 @@ failures = check_proof(proof)
 if int(sys.argv[3]) != 0:
     failures.append("probe exited unsuccessfully")
 
-d1 = proof["direction_mc_to_mesh"]
-d2 = proof["direction_mesh_to_mc"]
+d1 = proof.get("direction_mc_to_mesh") or {}
+d2 = proof.get("direction_mesh_to_mc") or {}
 
 arrivals = d1.get("observer_arrivals") or []
 text = arrivals[0].get("text") if arrivals else None
@@ -213,7 +213,7 @@ ev1 = dict(evidence_common)
 ev1.update(
     {
         "direction": "mc-peer -> MEDRE -> meshc-peer",
-        "nonce": d1["nonce"],
+        "nonce": d1.get("nonce"),
         "send_result": d1.get("send_event"),
         "send_started_at": d1.get("started_at"),
         "send_finished_at": d1.get("send_finished_at"),
@@ -236,26 +236,31 @@ ev1.update(
     json.dumps(ev1, indent=2, sort_keys=True) + "\n"
 )
 
+mc_arrivals = d2.get("mc_peer_arrivals") or []
+mc_arrival = mc_arrivals[0] if mc_arrivals else {}
+nonce = d2.get("nonce")
 ev2 = dict(evidence_common)
 ev2.update(
     {
         "direction": "meshc-peer -> MEDRE -> mc-peer",
-        "nonce": d2["nonce"],
+        "nonce": nonce,
         "send_result": d2.get("injection", {}).get("packet_id"),
         "send_started_at": d2.get("started_at"),
         "send_finished_at": d2.get("injection", {}).get("finished_at"),
         "observer": "virtual MeshCore peer on companion B (independent of MEDRE)",
-        "observer_bytes": d2.get("expected_text"),
-        "observer_arrivals": d2.get("mc_peer_arrivals"),
+        "expected_bytes": d2.get("expected_text"),
+        "observer_bytes": mc_arrival.get("text"),
+        "observer_arrivals": mc_arrivals,
         "arrival_count": d2.get("arrival_count"),
         "distinct_arrival_count": d2.get("distinct_arrival_count"),
         "duplicate_client_events": d2.get("duplicate_client_events"),
-        "arrival_timestamp": (d2.get("mc_peer_arrivals") or [{}])[0].get("received_at"),
+        "arrival_timestamp": mc_arrival.get("received_at"),
         "source_channel": "0",
         "destination_channel": "0",
-        "native_id": (d2.get("mc_peer_arrivals") or [{}])[0].get("channel_idx"),
-        "native_sender_id": proof.get("mc_peer", {}).get("self_info", {}).get("public_key"),
-        "openhop_wire_prefix": d2.get("expected_text", "")[: -len(d2["nonce"])],
+        "native_id": mc_arrival.get("message_id"),
+        "native_sender_id": mc_arrival.get("sender_id"),
+        "mc_peer": proof.get("mc_peer"),
+        "openhop_wire_prefix": (d2.get("expected_text") or "")[:-len(nonce)] if nonce else None,
     }
 )
 (evidence_dir / "evidence-mesh-to-mc.json").write_text(
@@ -293,7 +298,7 @@ verdict = {
             ),
         },
     },
-    "fresh_nonces": d1["nonce"] != d2["nonce"],
+    "fresh_nonces": bool(d1.get("nonce") and nonce and d1["nonce"] != nonce),
     "evidence": [
         "evidence-mc-to-mesh.json",
         "evidence-mesh-to-mc.json",
@@ -330,24 +335,31 @@ state = json.loads(Path(sys.argv[1]).read_text())
 evidence_dir = Path(sys.argv[2])
 proof = json.loads(Path(sys.argv[3]).read_text())
 
-# Scope the store to the proof window: the store is cumulative, the proof
-# is not.
-started = proof.get("started_at") or ""
-
-
-def in_window(rows: list[dict]) -> list[dict]:
-    return [row for row in rows if str(row.get("created_at", "")) >= started]
-
-
-events = in_window(state["canonical_events"])
-receipts = in_window(state["delivery_receipts"])
-outbox = in_window(state["delivery_outbox"])
-refs = in_window(state["native_message_refs"])
+# Select the test messages first, then associate every store transition
+# by event ID. A receipt can commit after the peer has observed delivery.
+nonces = {
+    nonce
+    for direction in ("direction_mc_to_mesh", "direction_mesh_to_mc")
+    if (nonce := (proof.get(direction) or {}).get("nonce"))
+}
+events = [
+    row for row in state["canonical_events"]
+    if any(nonce in (row.get("payload") or "") for nonce in nonces)
+]
+event_ids = {row["event_id"] for row in events}
+receipts = [row for row in state["delivery_receipts"] if row["event_id"] in event_ids]
+outbox = [row for row in state["delivery_outbox"] if row["event_id"] in event_ids]
+refs = [row for row in state["native_message_refs"] if row["event_id"] in event_ids]
 
 # Exactly ONE canonical event per bridged direction: no duplicate client
 # event at companion A, and no double-bridged event. The failures are
 # COLLECTED, not raised, so the rest of the evidence is still captured.
 store_failures: list[str] = []
+if len(nonces) != 2 or any(
+    sum(nonce in (row.get("payload") or "") for row in events) != 1
+    for nonce in nonces
+):
+    store_failures.append("expected one canonical event for each proof nonce")
 if len(events) != 2:
     store_failures.append(
         f"MEDRE created {len(events)} canonical events, expected 2"

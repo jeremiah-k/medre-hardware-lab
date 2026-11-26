@@ -54,6 +54,7 @@ while (($# > 0)); do
 	esac
 done
 mkdir -p "${EVIDENCE_DIR}"
+rm -f "${EVIDENCE_DIR}/verdict.json"
 
 COMPOSE=(docker compose --profile openhop)
 REPEATER_SERVICE="openhop-repeater"
@@ -141,7 +142,7 @@ log "Phase 1: protocol handshake against the companion (APP_START/SELF_INFO/chan
 "${COMPOSE[@]}" up -d "${REPEATER_SERVICE}" >/dev/null
 wait_healthy "${REPEATER_CONTAINER}" "${REPEATER_WAIT_SECONDS}"
 PROBE_BEFORE="${EVIDENCE_DIR}/probe-before-restart.json"
-run_probe "before-restart" | tee "${PROBE_BEFORE}"
+run_probe "before-restart"
 probe_passed "${PROBE_BEFORE}" ||
 	fail "protocol probe before the repeater restart did not pass"
 
@@ -150,16 +151,21 @@ log "Phase 2: MEDRE startup and adapter connection"
 # ---------------------------------------------------------------------------
 "${COMPOSE[@]}" up -d "${MEDRE_SERVICE}" >/dev/null
 wait_healthy "${MEDRE_CONTAINER}" "${MEDRE_WAIT_SECONDS}"
-docker logs "${MEDRE_CONTAINER}" >"${EVIDENCE_DIR}/medre-openhop.log" 2>&1 || true
-
-grep -q "MeshCoreSession openhop-companion started (mode=tcp, connected=True)" \
-	"${EVIDENCE_DIR}/medre-openhop.log" ||
-	fail "MEDRE did not report a CONNECTED MeshCore session (see medre-openhop.log)"
-
-# The startup banner carries the identity MEDRE read from SELF_INFO: the
-# companion's own device name and public-key prefix.
-grep -qE "device name .+ · pubkey [0-9a-f]+" "${EVIDENCE_DIR}/medre-openhop.log" ||
-	fail "MEDRE's startup banner carries no device name/pubkey (SELF_INFO was not read)"
+startup_log="${EVIDENCE_DIR}/medre-openhop.log"
+startup_at="$(docker inspect -f '{{.State.StartedAt}}' "${MEDRE_CONTAINER}")" ||
+	fail "cannot identify the MEDRE process start"
+waited=0
+while ((waited < MEDRE_WAIT_SECONDS)); do
+	if docker logs --since "${startup_at}" "${MEDRE_CONTAINER}" >"${startup_log}" 2>&1 &&
+		grep -q "MeshCoreSession openhop-companion started (mode=tcp, connected=True)" "${startup_log}" &&
+		grep -qE "device name .+ · pubkey [0-9a-f]+" "${startup_log}"; then
+		break
+	fi
+	sleep 5
+	waited=$((waited + 5))
+done
+((waited < MEDRE_WAIT_SECONDS)) ||
+	fail "MEDRE did not report a connected session and companion identity"
 
 # The read-only diagnostics snapshot proves which adapters MEDRE built and
 # with which configuration (no runtime, no network, no writes).
@@ -179,9 +185,9 @@ print("  diagnostics adapters:", ", ".join(sorted(adapters)))
 
 # ---------------------------------------------------------------------------
 log "Phase 3: reconnect after a repeater restart (MEDRE keeps running)"
-# The companion's identity and channel state must survive the restart, so
-# capture them from the companion's own persistent store BEFORE the
-# restart and compare after.
+# Compare identity and default-channel reads across the restart. The
+# configured identity and default channel can be reconstructed by a fresh
+# store; the separate backlog matrix checks persisted queue survival.
 "${COMPOSE[@]}" exec -T "${REPEATER_SERVICE}" \
 	sh -c 'ls -1 /var/lib/openhop_repeater' >"${EVIDENCE_DIR}/repeater-state-before.txt" 2>&1 || true
 
@@ -198,7 +204,7 @@ waited=0
 reconnected=0
 while ((waited < RECONNECT_WAIT_SECONDS)); do
 	if docker logs "${MEDRE_CONTAINER}" 2>&1 | tail -n "+$((LOG_MARK + 1))" |
-		grep -q "MeshCoreSession openhop-companion: reconnected successfully"; then
+		grep "MeshCoreSession openhop-companion: reconnected successfully" >/dev/null; then
 		reconnected=1
 		echo "  MEDRE reconnected after ${waited}s"
 		break
@@ -211,18 +217,18 @@ docker logs "${MEDRE_CONTAINER}" >"${EVIDENCE_DIR}/medre-openhop-after-restart.l
 	fail "MEDRE's adapter did not reconnect within ${RECONNECT_WAIT_SECONDS}s"
 
 # ---------------------------------------------------------------------------
-log "Phase 4: identity and state persistence across the repeater restart"
+log "Phase 4: stable identity and default channel across the repeater restart"
 # ---------------------------------------------------------------------------
 # Stop MEDRE again so the probe can be the sole client, then re-probe: the
 # companion's SELF_INFO identity must be IDENTICAL to the pre-restart one.
 "${COMPOSE[@]}" stop "${MEDRE_SERVICE}" >/dev/null 2>&1 || true
 sleep 2
 PROBE_AFTER="${EVIDENCE_DIR}/probe-after-restart.json"
-run_probe "after-restart" | tee "${PROBE_AFTER}"
+run_probe "after-restart"
 probe_passed "${PROBE_AFTER}" ||
 	fail "protocol probe after the repeater restart did not pass"
 
-python3 - "${PROBE_BEFORE}" "${PROBE_AFTER}" <<'PY'
+python3 - "${PROBE_BEFORE}" "${PROBE_AFTER}" <<'PY' || fail "the companion identity or channel read changed across restart"
 import json
 import sys
 
@@ -254,12 +260,15 @@ log "Phase 5: clean stop"
 # ---------------------------------------------------------------------------
 "${COMPOSE[@]}" up -d "${MEDRE_SERVICE}" >/dev/null
 wait_healthy "${MEDRE_CONTAINER}" "${MEDRE_WAIT_SECONDS}"
+stop_at="$(docker inspect -f '{{.State.StartedAt}}' "${MEDRE_CONTAINER}")" ||
+	fail "cannot identify the MEDRE process to stop"
 stop_rc=0
 "${COMPOSE[@]}" stop -t 30 "${MEDRE_SERVICE}" >/dev/null || stop_rc=$?
 ((stop_rc == 0)) || fail "MEDRE did not stop cleanly (compose exit ${stop_rc})"
-docker inspect -f '{{.State.Running}}' "${MEDRE_CONTAINER}" 2>/dev/null |
-	grep -qx false || fail "MEDRE container is still running after stop"
-docker logs "${MEDRE_CONTAINER}" >"${EVIDENCE_DIR}/medre-openhop-stopped.log" 2>&1 || true
+docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' "${MEDRE_CONTAINER}" 2>/dev/null |
+	grep -qx 'false 0' || fail "MEDRE container did not exit with status 0"
+docker logs --since "${stop_at}" "${MEDRE_CONTAINER}" >"${EVIDENCE_DIR}/medre-openhop-stopped.log" 2>&1 ||
+	fail "cannot read the stopped MEDRE process logs"
 grep -q "MEDRE stopped" "${EVIDENCE_DIR}/medre-openhop-stopped.log" ||
 	fail "MEDRE did not log a clean shutdown"
 
@@ -280,7 +289,7 @@ cat >"${EVIDENCE_DIR}/verdict.json" <<EOF
     "protocol_handshake_appstart_selfinfo_channel_read": "pass",
     "medre_adapter_connected": "pass",
     "reconnect_after_repeater_restart": "pass",
-    "identity_state_persistence": "pass",
+    "identity_and_default_channel_stable": "pass",
     "clean_stop": "pass"
   },
   "evidence_boundary": "Protocol handshake and adapter lifecycle only. The repeater runs radio_type: null, so NullRadio raises on every send: NO delivery and NO RF transmission is proven by this check."

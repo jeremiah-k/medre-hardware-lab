@@ -320,6 +320,8 @@ class VirtualRadioRelay:
             client.enqueue(CMD_PONG)
         elif cmd == CMD_AUTH:
             self._handle_auth(client, payload)
+        elif self.token and not client.authenticated:
+            client.enqueue(CMD_ERROR, bytes([ERR_UNAUTHORIZED]))
         elif cmd == CMD_SET_CONFIG:
             client.config = payload
             client.rx_armed = True
@@ -395,7 +397,7 @@ class VirtualRadioRelay:
 
     def _peer_of(self, client: RelayClient) -> Optional[RelayClient]:
         for candidate in self.clients:
-            if candidate is not client:
+            if candidate is not client and (not self.token or candidate.authenticated):
                 return candidate
         return None
 
