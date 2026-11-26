@@ -53,7 +53,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .a3_eval import evaluate_a3
-from .config import path_from
+from .config import path_from, resolve_ble_adapter
 from .continuity import (
     CONTINUITY_MESSAGE_DELAY_SECONDS,
     RECONCILE_WAIT_SECONDS,
@@ -166,11 +166,7 @@ def load_mixed(config_path: Path, matrix_path: Path) -> dict:
             or value <= 0
         ):
             raise MixedConfigError(f"{key} must be finite and positive")
-    adapter = hw.get("ble_adapter")
-    if adapter is not None and (
-        not isinstance(adapter, str) or not re.fullmatch(r"hci\d+", adapter)
-    ):
-        raise MixedConfigError("ble_adapter must be an HCI name such as hci0")
+    resolve_ble_adapter(hw, error=MixedConfigError)
 
     mesh = hw["meshcore"]
     if not isinstance(mesh, dict) or set(mesh) != {"addresses", "channel"}:
