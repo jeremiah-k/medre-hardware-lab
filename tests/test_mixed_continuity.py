@@ -738,7 +738,7 @@ def test_min_sampler_coverage_is_three():
         "wrong_delivery",
     ],
 )
-def test_adversarial_transcript_boundaries(fault):
+def test_tampered_transcript_boundaries(fault):
     transcript = passing_transcript()
     a = transcript["affected"]
     u = transcript["unaffected"]
