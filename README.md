@@ -10,14 +10,15 @@ continue to own routing, rendering, encoding and transport behavior.
 
 ## Choose a mode
 
-| Mode            | What it proves                                                          | Requirements                                                                     |
-| --------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| Docker `base`   | Two MMRelays, independent virtual meshnets and Matrix                   | Docker Compose with BuildKit additional contexts                                 |
-| Docker `normal` | MEDRE/MMRelay shared-room interop, virtual Meshtastic, LXMF counterpart | Same, plus exact source locks                                                    |
-| Docker `stress` | Deliberate shared-mesh loop topology                                    | Same; a separate diagnostic profile                                              |
-| Native services | Chatmail and SimpleX recipient-side publication campaigns               | Dedicated accounts/profiles; [campaign guide](docs/service-qualification.md)     |
-| Hardware        | Two-way ordinary-text routing between two physical transport pairs      | Linux, Python 3.12+, two boards per selected transport                           |
-| Mixed           | Docker relay with an explicitly mapped physical serial radio            | [Generic serial overlay](examples/hybrid/README.md); live qualification required |
+| Mode             | What it proves                                                          | Requirements                                                                     |
+| ---------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Docker `base`    | Two MMRelays, independent virtual meshnets and Matrix                   | Docker Compose with BuildKit additional contexts                                 |
+| Docker `normal`  | MEDRE/MMRelay shared-room interop, virtual Meshtastic, LXMF counterpart | Same, plus exact source locks                                                    |
+| Docker `stress`  | Deliberate shared-mesh loop topology                                    | Same; a separate diagnostic profile                                              |
+| Docker `openhop` | MEDRE ⇄ openHop protocol handshake, adapter lifecycle and reconnect     | Same; opt-in, hardware-free; [openHop guide](docs/openhop-qualification.md)      |
+| Native services  | Chatmail and SimpleX recipient-side publication campaigns               | Dedicated accounts/profiles; [campaign guide](docs/service-qualification.md)     |
+| Hardware         | Two-way ordinary-text routing between two physical transport pairs      | Linux, Python 3.12+, two boards per selected transport                           |
+| Mixed            | Docker relay with an explicitly mapped physical serial radio            | [Generic serial overlay](examples/hybrid/README.md); live qualification required |
 
 Hardware checks support any two of Meshtastic, MeshCore and LXMF. A role selects
 which endpoint in each configured pair MEDRE owns; the other endpoints are
@@ -132,7 +133,9 @@ Existing channel configuration, matching keys and firmware are operator
 prerequisites. The lab does not flash firmware, change radio channels/keys/bonds,
 synchronize clocks or reset Bluetooth. Stale clocks or a non-advertising device
 are investigation findings, not proof of a firmware defect. Controller numbering
-can remain `hci1` after `hci0` is removed.
+can remain `hci1` after `hci0` is removed: set `MEDRE_LAB_BLE_ADAPTER` to the
+present controller name to override the configured `ble_adapter` at runtime
+(unset, an absent `ble_adapter` defaults to `hci0`).
 
 ## Evidence and development
 
