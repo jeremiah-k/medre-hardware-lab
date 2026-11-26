@@ -194,40 +194,13 @@ def test_repeater_config_is_unchanged_by_the_bridge():
     assert radio["radio_type"] == "modem_tcp"
 
 
-def test_seed_script_is_present_and_pins_the_candidates():
-    """The seed script materialises the pinned candidate SHAs."""
+def test_seed_script_uses_the_lock_and_exact_revision():
+    """The seeder must not duplicate source pins or trust a local branch tip."""
     seed = (ROOT / "lab" / "openhop-bridge" / "seed_candidate_sources.sh").read_text()
-    assert "186ad7d1d5dcdbecec3337a06e3a213a33ee9956" in seed
-    assert "8ba54facbd8fc9e3a7d5b75f8b43b279cabe344f" in seed
-    assert "c404c8fe120bc8ec9671f969ca7ca14158cdd6ea" in seed
-    assert "05684df6ada1697d9df4fca912700c4aaf01751b" in seed
+    assert "sources.lock.json" in seed
     assert "--check" in seed
-    assert re.search(r"rev-parse HEAD", seed)
-
-
-def test_seed_script_fetches_each_candidate_by_its_branch_name():
-    """The seeder takes each revision by branch name, not by a source HEAD.
-
-    The revisions under qualification live on named branches in local
-    clones. Naming the branch keeps the seed independent of whatever the
-    source repository happens to have checked out, and naming it in plain
-    words keeps the lab free of private ref namespaces.
-    """
-    seed = (ROOT / "lab" / "openhop-bridge" / "seed_candidate_sources.sh").read_text()
-    assert "fix/meshcore-receive-pump" in seed
-    assert "fix/companion-frame-admission" in seed
-    assert "fix/companion-queue-ownership" in seed
-    assert "feat/openhop-live-status" in seed
-    # Every git ref the seeder names lives in a public namespace - the
-    # heads it fetches from the source clones, or the remote-tracking
-    # refs it creates inside its own throwaway seed checkout.  No
-    # private ref namespace appears anywhere in the tracked seeder.
-    named_refs = re.findall(r"refs/[\w./-]+", seed)
-    assert named_refs, "the seeder must name the branches it fetches"
-    assert all(
-        ref.startswith("refs/heads/") or ref.startswith("refs/remotes/")
-        for ref in named_refs
-    )
-    # The seeder must not fetch "whatever the branch points at": every
-    # candidate is also pinned by its exact SHA and checked out detached.
-    assert "${branch}" not in seed
+    assert "git bundle list-heads" in seed
+    assert 'fetch --no-tags "${repo}" "${sha}"' in seed
+    assert 'checkout --detach "${sha}"' in seed
+    assert "status --porcelain" in seed
+    assert not re.search(r"[0-9a-f]{40}", seed)

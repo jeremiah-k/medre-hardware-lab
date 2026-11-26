@@ -18,5 +18,25 @@
   "mmrelay": {
     "url": "https://github.com/jeremiah-k/meshtastic-matrix-relay.git",
     "ref": "427cd13fc5518f9ad0dd52f1c31964d3b5ce754c"
+  },
+  "medre-openhop": {
+    "url": "https://github.com/jeremiah-k/medre.git",
+    "ref": "b4d833cdddb923112de53afee4c692feae1aa42c"
+  },
+  "medre-adapter-meshcore": {
+    "url": "https://github.com/jeremiah-k/medre-adapter-meshcore.git",
+    "ref": "17c6ee2e7051896bb6e5f3f795ce06d39407a86e"
+  },
+  "medre-adapter-meshtastic-openhop": {
+    "url": "https://github.com/jeremiah-k/medre-adapter-meshtastic.git",
+    "ref": "711c65afa7b2baf79f69d93f95f40624ef1cecc1"
+  },
+  "openhop-core": {
+    "url": "https://github.com/openhop-dev/openhop_core.git",
+    "ref": "e6df15082b82f1c202086f966f576111819a3b86"
+  },
+  "openhop-repeater": {
+    "url": "https://github.com/openhop-dev/openhop_repeater.git",
+    "ref": "1b3abc0dfd8b5891fcff93a02c371cc80d6b9db3"
   }
 }

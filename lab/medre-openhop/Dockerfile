@@ -7,7 +7,7 @@
 # This is a SECOND MEDRE build anchor, separate from lab/medre/Dockerfile.
 # The default rig's image installs medre 0.1.0 (pinned fd2927d) with the
 # matrix/meshtastic/lxmf adapters; the openHop profile needs medre 0.2.3
-# (pinned 05684df6) because medre-adapter-meshcore 0.2.0 requires
+# (see sources.lock.json) because medre-adapter-meshcore 0.2.0 requires
 # medre>=0.2.0,<0.3.0. Changing the default image would silently move the
 # default rig, so the openHop profile gets its own anchor and its own
 # checkouts (sources/medre-openhop, sources/medre-adapter-meshcore,
