@@ -97,6 +97,7 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 import openhop_case_summary as case_summary  # noqa: E402
 from openhop_fault_settings import write_fault  # noqa: E402
+from openhop_observe import empty_reply_after  # noqa: E402
 
 LAB_ROOT = Path(__file__).resolve().parents[2]
 TOOLS = LAB_ROOT / "lab" / "tools"
@@ -120,13 +121,11 @@ FAULT_STATE_DIR = LAB_ROOT / "lab/state/openhop-fault"
 # cases, the index gives the order, and the unique tail makes one message
 # one message (the index alone repeats every run).
 NONCE_INDEX = re.compile(r"p4(?P<case>[a-z0-9]+)-(?P<index>\d+)-(?P<unique>[0-9a-f]+)")
-# The probe anchor for the c5 arm phasing: the parked pump repeats its
-# idle-link probe at one interval, and a healthy probe completes quietly
-# within milliseconds of its line.  Phasing the arm a couple of seconds
-# after a FRESH probe line puts the whole interval between the arm and the
-# next probe, so the wake-driven fetch is the first client->server chunk
-# the arm can see.
-PROBE_LINE = "probing the idle receive link"
+# The pinned MeshCore receive pump probes every 15 s. Wait for a
+# successful reply, which marks the start of a full idle interval.
+PROBE_LINE = "idle-link probe answered"
+C5_PROBE_PHASE_BOUND_S = 15.0 + 15.0 + 2.0  # interval, probe deadline, poll margin
+C5_RESTART_DRAIN_BOUND_S = 30.0 + 15.0 + 8.0  # reconnect cap, probe, local drain
 
 
 def utcnow() -> str:
@@ -627,12 +626,23 @@ def container_exists(name: str) -> bool:
     return run(["docker", "inspect", "-f", "{{.State.Status}}", name])[0] == 0
 
 
-def container_logs(name: str) -> str:
+def container_logs(name: str, *, timestamps: bool = False) -> str:
     """Return the container's logs.
 
     The repeater logs to STDERR, so both streams are needed: counting only
     stdout would silently report zero of everything.
     """
+    if timestamps:
+        # Keep stdout and stderr in Docker's original emission order.
+        result = subprocess.run(
+            ["docker", "logs", "--timestamps", name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=True,
+        )
+        return result.stdout
     _, out, err = run(["docker", "logs", name], timeout=120)
     return out + err
 
@@ -1544,28 +1554,16 @@ class Matrix:
             ):
                 self.not_run(name, "the fault MEDRE never completed its first connect")
                 return
-            # Let the start-up drain finish and the pump enter its parked
-            # probe cycle: the arm must land while no request is in
-            # flight, so the first client->server chunk after the arm is
-            # the wake-driven fetch for the fresh backlog.  The arm phases
-            # itself a couple of seconds after a FRESH probe line - the
-            # healthy probe completes within milliseconds of its line - so
-            # the whole probe interval separates the arm from the next
-            # probe.  A stall opened on a probe instead of the wake-driven
-            # fetch would withhold the notifications and pop nothing; the
-            # judge below fails that shape loudly.
-            time.sleep(25)
-            baseline_probes = container_logs(MEDRE_FAULT).count(PROBE_LINE)
             phasing_started = time.monotonic()
-            fresh_probe_phasing = False
-            probe_wait_seconds = None
-            while time.monotonic() - phasing_started < 90:
-                if container_logs(MEDRE_FAULT).count(PROBE_LINE) > baseline_probes:
-                    fresh_probe_phasing = True
-                    probe_wait_seconds = time.monotonic() - phasing_started
-                    time.sleep(2)
-                    break
-                time.sleep(1.0)
+            fresh_probe_phasing = self.wait_for(
+                lambda: PROBE_LINE in container_logs(MEDRE_FAULT),
+                C5_PROBE_PHASE_BOUND_S,
+                interval=0.25,
+            )
+            if not fresh_probe_phasing:
+                self.not_run(name, "no answered idle probe was observed before arming")
+                return
+            probe_wait_seconds = time.monotonic() - phasing_started
             armed_at = time.time()
             write_fault(
                 FAULT_STATE_DIR / "fault.json",
@@ -1614,12 +1612,13 @@ class Matrix:
                     },
                 )
                 return
-            for _ in range(4):
+            for index in range(4):
+                if index:
+                    time.sleep(2.5)
                 rows, _state = self.repeater_queue(REPEATER_A, prefix)
                 held, _markers = count_nonce_rows(rows, only=mine)
                 queue_samples.append(held)
                 sample_times.append(time.time())
-                time.sleep(2.5)
             hold_seconds = (
                 sample_times[-1] - sample_times[0] if len(sample_times) > 1 else None
             )
@@ -1644,16 +1643,21 @@ class Matrix:
                 ["docker", "update", "--restart=unless-stopped", MEDRE_FAULT],
                 timeout=120,
             )
-            self.wait_for(lambda: container_running(MEDRE_FAULT), 90)
-            self.wait_for(
-                lambda: len(self.medre_events(prefix, only=mine, container=MEDRE_FAULT))
-                >= accepted - 1,
-                timeout=240,
-                interval=3.0,
-            )
-            # The restarted drain: a ~30-message backlog drains in ~2 s on
-            # this rig, so a short margin is plenty.
-            time.sleep(15)
+            if not self.wait_for(
+                lambda: (
+                    len(self.medre_events(prefix, only=mine, container=MEDRE_FAULT))
+                    >= accepted - 1
+                    and empty_reply_after(
+                        container_logs(PROXY, timestamps=True), killed_at
+                    )
+                ),
+                C5_RESTART_DRAIN_BOUND_S,
+                interval=0.5,
+            ):
+                self.not_run(
+                    name, "the restarted receive pump did not finish the held backlog"
+                )
+                return
             events = self.medre_events(prefix, only=mine, container=MEDRE_FAULT)
             markers = [
                 marker
