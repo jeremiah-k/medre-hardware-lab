@@ -14,6 +14,14 @@ import openhop_config_access  # noqa: E402
 import openhop_qualify as qualify  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolated_lock_path(tmp_path, monkeypatch):
+    """Point the module's default lock at the test's tree: no test may
+    depend on the state of the checkout's real lock file, which a
+    running campaign holds."""
+    monkeypatch.setattr(qualify, "LOCK_PATH", tmp_path / "openhop-qualification.lock")
+
+
 def hold_lock(path):
     """Take the lock the way a second process would: a fresh open() is a
     new file description, so it is a real contender for the flock."""
@@ -90,8 +98,8 @@ def test_stage_records_exit_and_logs(tmp_path):
 
 
 def fresh_qualification(tmp_path, monkeypatch):
-    """Point the lock at the test's tree and forget any lock this test
-    process already holds, so each test negotiates the lock for real."""
+    """Forget any lock this test process already holds, so each test
+    negotiates the lock for real."""
     monkeypatch.setattr(qualify, "_qualification_lock", None)
     monkeypatch.setattr(qualify, "assert_rig_down", Mock())
     stage = Mock(return_value=0)
@@ -160,3 +168,15 @@ def test_a_readable_or_absent_repeater_config_does_not_refuse(tmp_path, monkeypa
         == 0
     )
     assert [call.args[1] for call in stage.call_args_list][-1] == "bridge-down"
+
+
+def test_the_ordinary_flow_holds_the_isolated_lock(tmp_path, monkeypatch):
+    """The ordinary qualify() flow, called the way the command calls it,
+    must hold its lock under the test's tree, never under the checkout's
+    lab/state, whose file a running campaign owns."""
+    fresh_qualification(tmp_path, monkeypatch)
+    assert qualify.qualify(tmp_path / "run", skip_build=True) == 0
+    held = Path(qualify._qualification_lock.name)
+    assert held == tmp_path / "openhop-qualification.lock"
+    assert held.is_relative_to(tmp_path)
+    assert not held.is_relative_to(qualify.ROOT / "lab/state")
