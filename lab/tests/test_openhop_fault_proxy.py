@@ -329,3 +329,16 @@ def test_trace_forward_records_on_empty_and_garbage():
     assert proxy.trace_forward_records(1, b"") == []
     records = proxy.trace_forward_records(1, b"\x00\x01\x02")
     assert records == []
+
+
+def test_trace_c2s_records_describe_command_frames():
+    app_start = b"<" + (8).to_bytes(2, "little") + b"\x01" + b"\x00" * 7
+    sync = b"<" + (1).to_bytes(2, "little") + b"\x0a"
+    records = proxy.trace_c2s_records(4, app_start + sync)
+    assert [r["command"] for r in records] == ["0x01", "0x0a"]
+    assert records[1]["marker"] is None
+
+
+def test_trace_c2s_records_ignores_foreign_starts_and_partials():
+    assert proxy.trace_c2s_records(1, b"\x3e\x01\x00") == []
+    assert proxy.trace_c2s_records(1, b"<\x05\x00") == []  # length 5, only 2 bytes

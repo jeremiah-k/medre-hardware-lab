@@ -318,6 +318,7 @@ MESSAGE_FRAME_TYPES = frozenset({0x07, 0x08, 0x0A, 0x10, 0x11})
 MESSAGES_WAITING_PUSH = 0x83
 PROBE_REPLY_TYPE = 0x0D
 DROP_MESSAGE_FRAMES_KEY = "drop_message_frames"
+FRAME_IN_START = 0x3C
 
 # When OPENHOP_FAULT_PROXY_TRACE=1, every server->client frame the splice
 # FORWARDS is logged with its inner packet type and, for message-carrying
@@ -337,6 +338,32 @@ def _marker_in(payload: bytes) -> str | None:
 
     match = re.search(rb"p4[a-z0-9]{1,4}-\d+-[0-9a-f]{6,12}", payload)
     return match.group(0).decode("ascii", "replace") if match else None
+
+
+def trace_c2s_records(connection: int, data: bytes) -> list[dict]:
+    """Observational only: describe the client→server command frames.
+
+    Frame format (client → server): "<" (0x3C) + 2-byte LE length + data,
+    where data[0] is the command byte (APP_START 0x01, DEVICE_QUERY 0x16,
+    the 0x0A sync/GET_MSG drain command).
+    """
+    records: list[dict] = []
+    buf = data
+    while len(buf) >= 3 and buf[0] == FRAME_IN_START:
+        length = int.from_bytes(buf[1:3], "little")
+        if len(buf) < 3 + length:
+            break
+        payload = buf[3 : 3 + length]
+        buf = buf[3 + length :]
+        records.append(
+            {
+                "event": "c2s_frame",
+                "connection": connection,
+                "command": "0x%02x" % (payload[0] if payload else 0),
+                "marker": _marker_in(payload),
+            }
+        )
+    return records
 
 
 def trace_forward_records(connection: int, data: bytes) -> list[dict]:
@@ -456,6 +483,9 @@ async def pipe(
             data = await reader.read(65536)
             if not data:
                 break
+            if trace_enabled():
+                for record in trace_c2s_records(connection, data):
+                    print(json.dumps(record), flush=True)
             STATS[f"{direction}_chunks"] += 1
             # The request-opened reply stall: the request itself keeps
             # passing; the stall opens on it and withholds the replies.

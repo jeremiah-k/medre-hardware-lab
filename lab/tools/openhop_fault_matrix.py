@@ -1353,7 +1353,6 @@ class FaultMatrix:
             ]
             preserved = len(set(persisted_indices))
             connection_evidence: dict = {}
-            queue_snapshots: list[dict] = []
             if verdict == "bounded":
                 # (b) CONTENT-TRIGGERED WAIT: the batch is already confirmed
                 # queued and the fault MEDRE has just attached, so the
@@ -1446,13 +1445,15 @@ class FaultMatrix:
                     **proof_report,
                     "splice_frame_events": [
                         {
-                            "event": event,
-                            "connection": c,
+                            "event": event["event"],
+                            "connection": event["connection"],
                             "at": time.strftime(
-                                "%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(s)
+                                "%Y-%m-%dT%H:%M:%S+00:00",
+                                time.gmtime(event["at"]),
                             ),
+                            "packet_type": event["packet_type"],
                         }
-                        for s, event, c in stalls
+                        for event in stalls
                     ],
                     "answered_probes_per_connection": answered_per_connection,
                     "consumed_per_connection": consumed_per_connection,
