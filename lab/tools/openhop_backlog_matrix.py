@@ -83,6 +83,7 @@ import re
 import select
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -487,6 +488,38 @@ def backlog_with_live_failures(
         failures.append(
             "the recorded arrival order does not cover the backlog and the "
             "live batch, so the queue's order contract cannot be judged"
+        )
+    return failures
+
+
+def replacement_failures(
+    first: dict, second: dict, send: dict, evictions: int
+) -> list[str]:
+    failures = []
+    if (
+        first.get("pass") is not True
+        or first.get("disconnected_before_window_end") is not True
+    ):
+        failures.append("the first client did not report its eviction")
+    if first.get("arrival_count") != 0:
+        failures.append(
+            "the first client did not report an empty post-replacement observation"
+        )
+    if evictions != 1:
+        failures.append(f"expected one client eviction, observed {evictions}")
+    mine = sent_markers(send)
+    if send.get("pass") is not True or len(mine) != 1:
+        failures.append("the opposite repeater did not accept the test packet")
+    arrivals = second.get("arrivals") or []
+    if (
+        second.get("pass") is not True
+        or second.get("arrival_count") != 1
+        or second.get("disconnected_before_window_end") is not False
+        or len(arrivals) != 1
+        or nonce_marker(arrivals[0].get("text", "")) not in mine
+    ):
+        failures.append(
+            "the replacement did not stay connected and receive exactly the test packet"
         )
     return failures
 
@@ -1354,13 +1387,24 @@ class Matrix:
 
     def case_c4(self) -> None:
         name = "c4-replaced-client"
+        needle = f"p4c4{uuid.uuid4().hex[:8]}"
+        restore_bridge = False
         try:
-            if not container_running(REPEATER_B):
-                self.not_run(name, "the peer repeater is not running")
+            if not all(container_running(name) for name in (REPEATER_A, REPEATER_B)):
+                self.not_run(name, "both repeaters must be running")
                 return
-            # Two clients on companion B: the second replaces the first.
-            # MEDRE is never touched: it is the only client of companion A.
-            cmd = [
+            restore_bridge = container_running(MEDRE_BRIDGE)
+            if restore_bridge:
+                checked_docker("stop", MEDRE_BRIDGE)
+            baseline = container_logs(REPEATER_B).count("evicting previous connection")
+            # A bounded SDK handshake takes up to 20 s. Allow another
+            # 5 s for the one-shot container to launch and signal readiness.
+            ready_bound_s = 25.0
+            # Send one packet after the replacement handshake. Cover the
+            # 20 s SDK send, 5 s sender launch, and 2 s fetch deadline;
+            # the replaced listener ends as soon as its socket closes.
+            observation_bound_s = 27.0
+            command = [
                 "docker",
                 "compose",
                 "--profile",
@@ -1368,8 +1412,12 @@ class Matrix:
                 "run",
                 "--rm",
                 "--no-deps",
+                "--user",
+                f"{os.getuid()}:{os.getgid()}",
                 "-v",
                 f"{PEER_PROBE}:/opt/openhop-peer-probe/openhop_peer_probe.py:ro",
+            ]
+            listener = [
                 "openhop-bridge-probe",
                 "python3",
                 "/opt/openhop-peer-probe/openhop_peer_probe.py",
@@ -1380,66 +1428,84 @@ class Matrix:
                 "--port-b",
                 "5000",
                 "--needle",
-                "p4c4",
-                "--window",
-                "45",
+                needle,
             ]
-            baseline = container_logs(REPEATER_B).count("evicting previous connection")
-            first = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            try:
-                time.sleep(6)
-                second = run(cmd, timeout=180)
-                first_out, _ = first.communicate(timeout=120)
-            finally:
-                if first.poll() is None:
-                    first.kill()
-                    first.communicate()
-            out = second[1].strip()
-            payload: dict = {}
-            start = out.find("{")
-            if start >= 0:
+            with tempfile.TemporaryDirectory(dir=self.dir) as directory:
+                peers = []
                 try:
-                    payload = json.loads(out[start:])
-                except ValueError:
-                    payload = {"error": "the second client's JSON did not parse"}
-            first_payload: dict = {}
-            start = first_out.find("{")
-            if start >= 0:
-                try:
-                    first_payload = json.loads(first_out[start:])
-                except ValueError:
-                    first_payload = {"error": "the first client's JSON did not parse"}
+                    for role in ("first", "second"):
+                        ready = Path(directory).resolve() / role
+                        peer = subprocess.Popen(
+                            [
+                                *command,
+                                "-v",
+                                f"{ready.parent}:/case-ready",
+                                *listener,
+                                "--window",
+                                str(
+                                    ready_bound_s + 5
+                                    if role == "first"
+                                    else observation_bound_s
+                                ),
+                                "--ready-file",
+                                f"/case-ready/{role}",
+                            ],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                        )
+                        peers.append(peer)
+                        if not self.wait_for(
+                            lambda: ready.is_file(), ready_bound_s, interval=0.25
+                        ):
+                            self.not_run(
+                                name, f"the {role} client did not finish its handshake"
+                            )
+                            return
+                    send = peer_send(
+                        self.profile, 1, needle, host="openhop-repeater-a", timeout=30
+                    )
+                    reports = []
+                    for peer in peers:
+                        output, _ = peer.communicate(timeout=observation_bound_s + 5)
+                        start = output.find("{")
+                        reports.append(
+                            json.loads(output[start:])
+                            if start >= 0 and not peer.returncode
+                            else {}
+                        )
+                finally:
+                    for peer in peers:
+                        if peer.poll() is None:
+                            peer.kill()
+                            peer.communicate()
+            first, second = reports
             b_log = container_logs(REPEATER_B)
-            evictions = [
-                line for line in b_log.splitlines() if "evict" in line.lower()
-            ][-5:]
-            failures: list[str] = []
-            if second[0] or payload.get("pass") is not True:
-                failures.append("the replacing client produced no usable result")
-            if first.returncode or first_payload.get("pass") is not True:
-                failures.append("the replaced client produced no usable result")
-            if b_log.count("evicting previous connection") <= baseline:
-                failures.append("the repeater did not record a client replacement")
+            eviction_count = b_log.count("evicting previous connection") - baseline
+            failures = replacement_failures(first, second, send, eviction_count)
             self.write(
                 name,
                 {
                     "case": name,
                     "pass": not failures,
                     "failures": failures,
-                    "replacing_client": payload,
-                    "replaced_client": first_payload,
-                    "repeater_b_eviction_lines": evictions,
-                    "note": (
-                        "The companion serves one client at a time; the second "
-                        "connection replaces the first. MEDRE was NOT touched: it "
-                        "is the only client of companion A."
-                    ),
+                    "replacing_client": second,
+                    "replaced_client": first,
+                    "repeater_b_eviction_lines": [
+                        line for line in b_log.splitlines() if "evict" in line.lower()
+                    ][-5:],
+                    "probe": send,
+                    "evictions_during_case": eviction_count,
                 },
             )
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+        finally:
+            if restore_bridge and not container_running(MEDRE_BRIDGE):
+                try:
+                    checked_docker("start", MEDRE_BRIDGE)
+                except (RuntimeError, subprocess.SubprocessError) as exc:
+                    self.not_run(name, f"could not restore the MEDRE bridge: {exc}")
 
     def case_c5(self, count: int = 30) -> None:
         name = "c5-kill-mid-drain-one-in-flight"

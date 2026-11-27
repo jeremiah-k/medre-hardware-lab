@@ -530,3 +530,19 @@ def test_c3_order_check_passes_a_fully_ordered_sequence():
     markers = [f"p4c3-{index}-deadbeef" for index in range(10)]
     report = matrix.ordering_report(markers)
     assert report["out_of_order_arrivals"] == 0
+
+
+def test_client_replacement_requires_the_new_client_to_observe_one_packet():
+    nonce = "p4c4a1-0-a1b2c3d4"
+    send = {"pass": True, "nonces": [nonce]}
+    first = {"pass": True, "arrival_count": 0, "disconnected_before_window_end": True}
+    second = {
+        "pass": True,
+        "arrival_count": 1,
+        "disconnected_before_window_end": False,
+        "arrivals": [{"text": f"sender: {nonce}"}],
+    }
+    assert matrix.replacement_failures(first, second, send, 1) == []
+    assert matrix.replacement_failures(first, {**second, "arrival_count": 0}, send, 1)
+    assert matrix.replacement_failures({**first, "arrival_count": 1}, second, send, 1)
+    assert matrix.replacement_failures(first, second, send, 0)

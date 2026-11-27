@@ -32,9 +32,9 @@ import argparse
 import asyncio
 import json
 import sys
-import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 CONNECT_TIMEOUT_SECONDS = 20.0
 COMMAND_TIMEOUT_SECONDS = 20.0
@@ -219,6 +219,8 @@ async def run_send(args) -> dict:
 
 
 async def run_listen(args) -> dict:
+    import meshcore
+
     result: dict = {
         "case": args.case,
         "mode": "listen",
@@ -249,11 +251,19 @@ async def run_listen(args) -> dict:
         return result
 
     drain = MCDrain()
+    disconnected = asyncio.Event()
+    subscription = None
     try:
+        subscription = client.subscribe(
+            meshcore.EventType.DISCONNECTED, lambda _event: disconnected.set()
+        )
         await drain.start(client)
-        deadline = time.monotonic() + args.window
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.25)
+        if args.ready_file is not None:
+            args.ready_file.touch(exist_ok=False)
+        try:
+            await asyncio.wait_for(disconnected.wait(), timeout=args.window)
+        except TimeoutError:
+            pass
     except Exception as exc:
         result.update(
             {
@@ -264,6 +274,8 @@ async def run_listen(args) -> dict:
         )
         return result
     finally:
+        if subscription is not None:
+            client.unsubscribe(subscription)
         drain.stop(client)
         try:
             await asyncio.wait_for(client.disconnect(), timeout=5.0)
@@ -282,6 +294,7 @@ async def run_listen(args) -> dict:
     result["get_msg_commands"] = drain.get_msg_calls
     result["max_in_flight_get_msg"] = drain.max_in_flight_get_msg
     result["frames_received"] = len(drain.messages)
+    result["disconnected_before_window_end"] = disconnected.is_set()
     result["finished_at"] = utcnow()
     result["pass"] = True
     return result
@@ -298,6 +311,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prefix", default="openhop-peer-probe")
     parser.add_argument("--needle", default="")
     parser.add_argument("--window", type=float, default=30.0)
+    parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--settle", type=float, default=DEFAULT_SETTLE_SECONDS)
     args = parser.parse_args(argv)
 
