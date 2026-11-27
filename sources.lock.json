@@ -25,7 +25,7 @@
   },
   "medre-adapter-meshcore": {
     "url": "https://github.com/jeremiah-k/medre-adapter-meshcore.git",
-    "ref": "b09cdbb55a585be10e05e4fe7d15d8099b20f2cd"
+    "ref": "1bf1d9e7dd31bf4dd52853d05a9d66ee0415d642"
   },
   "medre-adapter-meshtastic-openhop": {
     "url": "https://github.com/jeremiah-k/medre-adapter-meshtastic.git",

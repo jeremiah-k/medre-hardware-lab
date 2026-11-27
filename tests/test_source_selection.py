@@ -46,12 +46,14 @@ def test_openhop_pins_are_exact():
     data = lock(ROOT)
     assert data["medre-openhop"]["ref"] == ("60f79a4797b86dfbf785ca2809329ce933a1aa12")
     # The receive-pump revision with its callbacks fenced to their SDK
-    # connection: the idle-link liveness probe on top of the
-    # receive-ownership fix, the park-on-silent-window rule with its
-    # answered-probe re-arm, the stop-and-wait drain, and the accounted
-    # binary channel-data pop.
+    # connection: the idle-link liveness probe on top of the parked drain,
+    # the park-on-silent-window rule with its answered-probe re-arm, the
+    # stop-and-wait drain, the accounted binary channel-data pop, and the
+    # follow-up fixes that fence probe replies to their connection, redact
+    # receive-pump retirement errors, and retain admission slots through
+    # unresolved fetches.
     assert data["medre-adapter-meshcore"]["ref"] == (
-        "b09cdbb55a585be10e05e4fe7d15d8099b20f2cd"
+        "1bf1d9e7dd31bf4dd52853d05a9d66ee0415d642"
     )
     assert data["medre-adapter-meshtastic-openhop"]["ref"] == (
         "711c65afa7b2baf79f69d93f95f40624ef1cecc1"
