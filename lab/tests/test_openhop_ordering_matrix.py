@@ -121,3 +121,36 @@ def test_summary_only_exits_zero_without_running_cases(tmp_path):
     assert (
         ordering.main(["--evidence-dir", str(tmp_path / "ev4"), "--summary-only"]) == 0
     )
+
+
+# ---------------------------------------------------------------------------
+# The cross-store merge premise: the newer (or live) block must be in
+# memory ONLY when the client drains - nothing persisted while the store
+# was locked, and at least one row still unpersisted at the drain.  The
+# decision is a pure function; both counts land in the record either way,
+# and the drain runs before the NOT RUN so no rows are left behind.
+# ---------------------------------------------------------------------------
+
+
+def test_the_merge_premise_holds_with_nothing_persisted_early():
+    assert ordering.merge_premise_reason(0, 0, 3) is None
+
+
+def test_the_merge_premise_holds_with_some_but_not_all_persisted_before_the_drain():
+    assert ordering.merge_premise_reason(0, 1, 3) is None
+
+
+def test_the_merge_premise_fails_when_the_lock_did_not_hold():
+    reason = ordering.merge_premise_reason(2, 2, 3)
+    assert reason is not None
+    assert "while the store was locked" in reason
+
+
+def test_the_merge_premise_fails_when_everything_was_persisted_before_the_drain():
+    reason = ordering.merge_premise_reason(0, 3, 3)
+    assert reason is not None
+    assert "before the drain" in reason
+
+
+def test_the_merge_premise_tolerates_an_empty_block():
+    assert ordering.merge_premise_reason(0, 0, 0) is None

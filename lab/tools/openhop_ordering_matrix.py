@@ -146,6 +146,37 @@ def merged_block_verdict(markers: list[str], blocks: list[str]) -> dict:
     }
 
 
+def merge_premise_reason(
+    persisted_while_locked: int, persisted_before_drain: int, requested: int
+) -> str | None:
+    """Return why the cross-store merge premise failed, or None.
+
+    The merge claim (the sync serves the lowest outstanding arrival
+    number across the in-memory AND the persisted queue) needs the newer
+    (or live) block to be IN MEMORY ONLY when the client drains:
+    nothing of it persisted while the store was locked, and at least one
+    row of it still unpersisted when the drain began.  A row persisted
+    WHILE THE LOCK WAS HELD means the lock did not hold; every row
+    persisted BEFORE THE DRAIN means the in-memory block is empty, and
+    FIFO over the persisted store alone would produce the asserted
+    order.  Either way the case is NOT RUN - but only AFTER the drain,
+    so no rows are left behind.
+    """
+    if persisted_while_locked > 0:
+        return (
+            f"{persisted_while_locked} row(s) were persisted while the store "
+            "was locked: the lock did not hold, so the newer block was not "
+            "in memory only and the merge premise cannot be verified"
+        )
+    if requested > 0 and persisted_before_drain >= requested:
+        return (
+            f"every one of the {requested} newer row(s) was already persisted "
+            "before the drain began: the in-memory block is empty, and FIFO "
+            "over the persisted store alone would produce the asserted order"
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Rig plumbing (the backlog matrix's helpers, reused where possible)
 # ---------------------------------------------------------------------------
@@ -283,6 +314,15 @@ class OrderingMatrix:
                 lock_proc.kill()
                 lock_proc.wait()
                 raise
+            # The merge premise, read BEFORE the drain: how much of the
+            # NEWER block the store had already swallowed.
+            rows_before_drain, _ = self.repeater_queue(new_prefix)
+            newer_persisted_before_drain, _ = backlog.count_nonce_rows(
+                rows_before_drain, only=new_markers_sent
+            )
+            premise_failure = merge_premise_reason(
+                persisted_while_locked, newer_persisted_before_drain, newer
+            )
             mine = old_markers_sent | new_markers_sent
             self.start_medre()
             self.wait_for(
@@ -319,6 +359,20 @@ class OrderingMatrix:
                 failures.append(
                     f"{remaining_count} marker(s) remained persisted after the drain"
                 )
+            if premise_failure:
+                # The premise failed AFTER the drain ran, so no rows are
+                # left behind; the case is NOT RUN with both counts in
+                # the record.
+                self.not_run(
+                    name,
+                    premise_failure,
+                    {
+                        "newer_persisted_while_store_locked": persisted_while_locked,
+                        "newer_persisted_before_drain": newer_persisted_before_drain,
+                        "preconditions": pre,
+                    },
+                )
+                return
             self.write(
                 name,
                 {
@@ -331,6 +385,7 @@ class OrderingMatrix:
                     "newer_requested": newer,
                     "newer_accepted": new_send.get("accepted_count"),
                     "newer_persisted_while_store_locked": persisted_while_locked,
+                    "newer_persisted_before_drain": newer_persisted_before_drain,
                     "block_verdict": verdict,
                     "remaining_persisted": remaining_markers,
                     "ordering_promise": (
@@ -404,12 +459,25 @@ class OrderingMatrix:
                 return
             live_send = self.peer_send(1, live_prefix, settle=3.0)
             live_markers_sent = backlog.sent_markers(live_send)
+            rows_live_locked, _ = self.repeater_queue(live_prefix)
+            live_persisted_while_locked, _ = backlog.count_nonce_rows(
+                rows_live_locked, only=live_markers_sent
+            )
             try:
                 lock_proc.wait(timeout=50)
             except subprocess.TimeoutExpired:
                 lock_proc.kill()
                 lock_proc.wait()
                 raise
+            # The merge premise, read BEFORE the drain: whether the live
+            # message really stayed out of the store.
+            rows_live_before_drain, _ = self.repeater_queue(live_prefix)
+            live_persisted_before_drain, _ = backlog.count_nonce_rows(
+                rows_live_before_drain, only=live_markers_sent
+            )
+            premise_failure = merge_premise_reason(
+                live_persisted_while_locked, live_persisted_before_drain, 1
+            )
             mine = back_markers_sent | live_markers_sent
             self.start_medre()
             self.wait_for(
@@ -453,6 +521,20 @@ class OrderingMatrix:
                 failures.append(
                     f"{remaining_count} marker(s) remained persisted after the drain"
                 )
+            if premise_failure:
+                # The premise failed AFTER the drain ran, so no rows are
+                # left behind; the case is NOT RUN with both counts in
+                # the record.
+                self.not_run(
+                    name,
+                    premise_failure,
+                    {
+                        "live_persisted_while_store_locked": live_persisted_while_locked,
+                        "live_persisted_before_drain": live_persisted_before_drain,
+                        "preconditions": pre,
+                    },
+                )
+                return
             self.write(
                 name,
                 {
@@ -465,6 +547,8 @@ class OrderingMatrix:
                     "backlog_persisted_before_restart": len(back_markers_sent),
                     "backlog_persisted_after_restart": persisted_after_restart,
                     "live_accepted": live_send.get("accepted_count"),
+                    "live_persisted_while_store_locked": live_persisted_while_locked,
+                    "live_persisted_before_drain": live_persisted_before_drain,
                     "block_verdict": verdict,
                     "remaining_persisted": remaining_markers,
                     "ordering_promise": (
