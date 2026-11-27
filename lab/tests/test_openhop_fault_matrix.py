@@ -147,7 +147,7 @@ def judge_bounded(**overrides):
         "consumed_per_connection": {3: 2},
         "answered_per_connection": {3: 1},
         "unattributed_consumed": 0,
-        "same_connection_proven": True,
+        "same_connection_proof": True,
     }
     kwargs.update(overrides)
     return fault_matrix.selective_drop_failures(**kwargs)
@@ -184,7 +184,7 @@ def test_zero_consumption_fails_the_bounded_case_without_the_proof():
         preserved_distinct=0,
         consumed_per_connection={},
         answered_per_connection={3: 1},
-        same_connection_proven=False,
+        same_connection_proof=False,
     )
     assert any("does not prove the selective drop" in failure for failure in failures)
 
@@ -204,7 +204,7 @@ def test_aggregate_counts_without_attribution_fail_the_bounded_case():
     failures = judge_bounded(
         consumed_per_connection={3: 1, 5: 1},
         answered_per_connection={3: 0, 5: 1},
-        same_connection_proven=False,
+        same_connection_proof=False,
     )
     assert any("does not prove the selective drop" in failure for failure in failures)
 
@@ -214,7 +214,7 @@ def test_a_connection_both_probe_answered_and_frame_lost_proves_the_drop():
         judge_bounded(
             consumed_per_connection={3: 1, 5: 1},
             answered_per_connection={3: 0, 5: 1},
-            same_connection_proven=True,
+            same_connection_proof=True,
         )
         == []
     )
@@ -268,31 +268,19 @@ def test_splice_events_include_the_content_triggered_frame_drops():
     assert events[0]["at"] < events[1]["at"]
 
 
-def test_connection_attribution_follows_the_stall_boundaries():
-    events = fault_matrix.splice_stall_events(
-        "\n".join(
-            [
-                '2026-11-26T18:00:02.000000Z {"event": "stalled", "connection": 1}',
-                '2026-11-26T18:00:40.000000Z {"event": "stalled", "connection": 2}',
-            ]
-        )
-    )
-    of = lambda stamp: fault_matrix.connection_of(stamp, events)  # noqa: E731
-    assert of(0.0) == 1  # before the first stall: connection 1's live phase
-    assert of(events[0]["at"]) == 1
-    assert of(events[0]["at"] + 1) == 2  # after connection 1 stalled, client is on 2
-    assert of(events[1]["at"] + 1) is None  # after the last stall: unattributable
-
-
-def test_per_connection_counts_ignore_unattributable_stamps():
-    events = fault_matrix.splice_stall_events(
-        '2026-11-26T18:00:40.000000Z {"event": "stalled", "connection": 2}'
-    )
-    stall_stamp = events[0]["at"]
-    counts = fault_matrix.per_connection_counts(
-        [stall_stamp - 1, stall_stamp, stall_stamp + 1], events
-    )
-    assert counts == {2: 2}
+def test_answered_probes_come_from_the_splices_forwarded_replies():
+    """The answered probes per connection ARE the splice's own forwarded
+    probe replies: a probe answered just before its connection retires is
+    credited to the connection that answered it, never to the next one."""
+    events = [
+        link_event(1.0, "probe_reply_forwarded", 1, 13),
+        link_event(2.0, "message_frame_dropped", 1, 7),
+        link_event(3.0, "probe_reply_forwarded", 1, 13),
+        link_event(4.0, "probe_reply_forwarded", 2, 13),
+    ]
+    counts = fault_matrix.probe_replies_forwarded_per_connection(events)
+    assert counts == {1: 2, 2: 1}
+    assert sum(counts.values()) == 3
 
 
 def judge_drain_stall(**overrides):
@@ -618,7 +606,7 @@ def test_the_proof_report_proves_one_connection_with_both():
         link_event(3.0, "message_frame_dropped", 1, 8),
     ]
     report = fault_matrix.selective_drop_proof_report(events)
-    assert report["same_connection_proven"] is True
+    assert report["same_connection_proof"] is True
     assert report["message_frames_dropped_per_connection"] == {1: 2}
     assert report["probe_replies_forwarded_per_connection"] == {1: 1}
 
@@ -632,7 +620,7 @@ def test_the_proof_report_ignores_pushes_and_no_more_replies():
         link_event(3.0, "probe_reply_forwarded", 1, 13),
     ]
     report = fault_matrix.selective_drop_proof_report(events)
-    assert report["same_connection_proven"] is False
+    assert report["same_connection_proof"] is False
     assert report["message_frames_dropped_per_connection"] == {}
 
 
@@ -642,12 +630,12 @@ def test_the_proof_report_fails_when_the_kinds_split_across_connections():
         link_event(2.0, "message_frame_dropped", 2, 7),
     ]
     report = fault_matrix.selective_drop_proof_report(events)
-    assert report["same_connection_proven"] is False
+    assert report["same_connection_proof"] is False
 
 
 def test_the_proof_report_is_empty_without_events():
     report = fault_matrix.selective_drop_proof_report([])
-    assert report["same_connection_proven"] is False
+    assert report["same_connection_proof"] is False
     assert report["probe_replies_forwarded_per_connection"] == {}
     assert report["message_frames_dropped_per_connection"] == {}
 
@@ -786,7 +774,7 @@ def judge_selective_drop(**overrides):
         "consumed_per_connection": {1: 1},
         "answered_per_connection": {1: 2},
         "unattributed_consumed": 0,
-        "same_connection_proven": True,
+        "same_connection_proof": True,
     }
     kwargs.update(overrides)
     return fault_matrix.selective_drop_failures(**kwargs)
@@ -1434,3 +1422,28 @@ def make_blackhole_fakes(monkeypatch, tmp_path, count=3, prefix="p4blackhole"):
         fault_matrix, "timestamped_logs", lambda name: medre_log["text"]
     )
     monkeypatch.setattr(fault_matrix.time, "sleep", lambda seconds: None)
+
+
+def test_the_recorded_answered_probes_equal_the_per_connection_sum(
+    tmp_path, monkeypatch
+):
+    """One quantity, one source: answered_probes in the record is the sum
+    of the per-connection counts the splice reported."""
+    preserved = [f"p4qd-{index}-{index:06d}abc" for index in range(1, 6)]
+    make_bounded_fakes(monkeypatch, tmp_path, preserved)
+    matrix = fault_matrix.FaultMatrix(tmp_path / "evidence")
+    matrix.run_case(
+        "fault-selective-drop",
+        {"drop_message_frames": True},
+        6,
+        "p4qd",
+        0.0,
+        False,
+        "bounded",
+    )
+    record = json.loads(
+        (tmp_path / "evidence" / "fault-selective-drop.json").read_text()
+    )
+    per_connection = record["answered_probes_per_connection"]
+    assert record["answered_probes"] == sum(per_connection.values())
+    assert record["answered_probes"] == 1

@@ -258,11 +258,6 @@ PROBE_RETIREMENT = re.compile(
     re.IGNORECASE,
 )
 
-# The parked pump's probe reply lines: the adapter logs one DEBUG line per
-# answered liveness probe ("idle-link probe answered ..."), and the
-# selective-drop bound is counted in answered probes.
-ANSWERED_PROBE = re.compile(r"idle-link probe answered", re.IGNORECASE)
-
 
 def wall_timestamp(value: object) -> float | None:
     if not isinstance(value, str):
@@ -401,8 +396,26 @@ def selective_drop_proof_report(link_events: list[dict]) -> dict:
     return {
         "probe_replies_forwarded_per_connection": probe_replies_forwarded,
         "message_frames_dropped_per_connection": message_frames_dropped,
-        "same_connection_proven": proven,
+        "same_connection_proof": proven,
     }
+
+
+def probe_replies_forwarded_per_connection(events: list[dict]) -> dict[int, int]:
+    """Count the liveness-probe replies the splice FORWARDED, per connection.
+
+    The splice's own ``probe_reply_forwarded`` events ARE the answered
+    probes - one forwarded DEVICE_INFO reply each, with the connection
+    id the splice recorded on the wire - so a probe answered just before
+    its connection retires is credited to the connection that answered
+    it, never to the connection that followed it.
+    """
+    counts: dict[int, int] = {}
+    for event in events:
+        if event.get("event") != "probe_reply_forwarded":
+            continue
+        connection = event["connection"]
+        counts[connection] = counts.get(connection, 0) + 1
+    return counts
 
 
 def swallowed_message_frames(events: list[dict]) -> list[dict]:
@@ -479,34 +492,6 @@ def selective_drop_cross_check(events: list[dict], lost_markers: list[str]) -> d
         "unattributed_lost_messages": unattributed_lost,
         "equal": equal,
     }
-
-
-def connection_of(stamp: float, stalls: list[tuple[float, int]]) -> int | None:
-    """Return the splice connection a timestamp belongs to, or None.
-
-    Connection N forwards its first chunks - so probes are ANSWERED on it -
-    until its own budget exhausts at its stall event; only then does the
-    client retire and hand over to the next connection.  A stamp is
-    therefore attributed to the connection of the FIRST stall event at or
-    after it.  A stamp after the last stall belongs to a connection the
-    splice never recorded stalling and cannot be attributed.
-    """
-    for event in stalls:
-        if stamp <= event["at"]:
-            return event["connection"]
-    return None
-
-
-def per_connection_counts(
-    stamps: list[float], stalls: list[tuple[float, int]]
-) -> dict[int, int]:
-    """Count the timestamps per attributed splice connection."""
-    counts: dict[int, int] = {}
-    for stamp in stamps:
-        connection = connection_of(stamp, stalls)
-        if connection is not None:
-            counts[connection] = counts.get(connection, 0) + 1
-    return counts
 
 
 def nonce_marker(text: str) -> str | None:
@@ -932,7 +917,7 @@ def selective_drop_failures(
     consumed_per_connection: dict[int, int],
     answered_per_connection: dict[int, int],
     unattributed_consumed: int,
-    same_connection_proven: bool,
+    same_connection_proof: bool,
     accounting_cross_check: dict | None = None,
 ) -> list[str]:
     """Judge the per-connection worst case by the spec's documented bound.
@@ -975,7 +960,7 @@ def selective_drop_failures(
             f"{unattributed_consumed} lost message(s) could not be attributed "
             "to any connection the splice recorded stalling"
         )
-    if not same_connection_proven:
+    if not same_connection_proof:
         failures.append(
             "no connection had both an answered liveness probe and a lost "
             "message frame attributed to it: the per-connection attribution "
@@ -1595,7 +1580,7 @@ class FaultMatrix:
                     proof_report = selective_drop_proof_report(
                         splice_link_events(timestamped_logs(PROXY))
                     )
-                    if proof_report["same_connection_proven"]:
+                    if proof_report["same_connection_proof"]:
                         break
                     if time.monotonic() >= observation_deadline:
                         break
@@ -1653,19 +1638,15 @@ class FaultMatrix:
                 preserved = len(persisted_markers)
                 persisted_at_companion = len(persisted_markers)
                 lost_messages = sorted(mine - set(indices) - persisted_markers)
-                # Per-connection attribution: the answered probes are
-                # attributed to the connection of the stall boundary they
-                # precede; a LOST message belongs to the connection of the
-                # swallowed frame that carried its marker - the send-time
-                # connection has no relation to the fetch that popped the
-                # row later.
-                probe_stamps = [
-                    stamp
-                    for line in log.splitlines()
-                    if ANSWERED_PROBE.search(line)
-                    and (stamp := line_time(line)) is not None
-                ]
-                answered_per_connection = per_connection_counts(probe_stamps, stalls)
+                # Per-connection attribution: the answered probes are the
+                # splice's own forwarded probe replies, counted per
+                # connection; a LOST message belongs to the connection of
+                # the swallowed frame that carried its marker - the
+                # send-time connection has no relation to the fetch that
+                # popped the row later.
+                answered_per_connection = probe_replies_forwarded_per_connection(
+                    link_events
+                )
                 frame_connections = swallowed_marker_connections(link_events)
                 consumed_per_connection: dict[int, int] = {}
                 unattributed_consumed = 0
@@ -1678,13 +1659,10 @@ class FaultMatrix:
                             consumed_per_connection.get(connection, 0) + 1
                         )
                 cross_check = selective_drop_cross_check(link_events, lost_messages)
-                same_connection_proven = any(
-                    consumed_on_connection > 0
-                    and answered_per_connection.get(connection, 0) > 0
-                    for connection, consumed_on_connection in (
-                        consumed_per_connection.items()
-                    )
-                )
+                # ONE proof field, from the splice's own events: one
+                # connection both forwarded a probe reply and swallowed a
+                # message-carrying frame.  The marker-based attribution
+                # lives in the cross-check alone.
                 failures = selective_drop_failures(
                     accepted=int(send.get("accepted_count") or 0),
                     delivered_distinct=distinct,
@@ -1693,7 +1671,7 @@ class FaultMatrix:
                     consumed_per_connection=consumed_per_connection,
                     answered_per_connection=answered_per_connection,
                     unattributed_consumed=unattributed_consumed,
-                    same_connection_proven=same_connection_proven,
+                    same_connection_proof=proof_report["same_connection_proof"],
                     accounting_cross_check=cross_check,
                 )
                 connection_evidence = {
@@ -1728,7 +1706,6 @@ class FaultMatrix:
                     "answered_probes_per_connection": answered_per_connection,
                     "consumed_per_connection": consumed_per_connection,
                     "unattributed_consumed": unattributed_consumed,
-                    "same_connection_proof": same_connection_proven,
                     "queue_drain": drain_report,
                 }
                 verdict_rule = (
@@ -1828,7 +1805,7 @@ class FaultMatrix:
                     "queue_snapshots": queue_snapshots,
                     "reconnect_churn": churn,
                     "answered_probes": (
-                        len(ANSWERED_PROBE.findall(log))
+                        sum(answered_per_connection.values())
                         if verdict == "bounded"
                         else None
                     ),
