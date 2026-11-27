@@ -25,6 +25,7 @@ current lock, and the lock may equal any saved preset's pins.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import re
@@ -214,3 +215,111 @@ def validate_preset_library(root: Path) -> list[dict]:
             "save the current configuration first"
         )
     return library
+
+
+# --- CLI actions ---------------------------------------------------------------
+
+
+def read_last_bringup(root: Path) -> dict:
+    """The lab/up.sh last-bringup record (see lab/last_bringup.py)."""
+    path = Path(root) / "lab" / "state" / "last-bringup.json"
+    if not path.is_file():
+        raise ValueError(
+            f"no last-bringup record at {path}; bring the rig up first "
+            "(lab/up.sh writes lab/state/last-bringup.json)"
+        )
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"{path}: invalid JSON ({exc})") from exc
+    if not isinstance(record, dict) or record.get("topology") not in TOPOLOGIES:
+        raise ValueError(f"{path}: no valid topology choice recorded")
+    sha = record.get("sources_lock_sha256")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise ValueError(f"{path}: no valid sources_lock_sha256 recorded")
+    return record
+
+
+def detected_suite(root: Path, topology: str) -> list[str]:
+    """The suite a topology runs by default.
+
+    The MEDRE rig topologies run the compose scenario suite; the openHop
+    topologies are qualified by the driver, which sequences its own
+    up/down transitions across both -- so a preset of either openHop
+    topology records the driver's full stage list.
+    """
+    if topology in ("openhop", "openhop-radio"):
+        return [f"{QUAL_PREFIX}{stage}" for stage in qualify_stage_names(root)]
+    return [SUITE_RUNNER_ENTRY]
+
+
+def save_preset(root: Path, name: str, description: str | None, force: bool) -> int:
+    """Record the current configuration as lab/presets/<name>.json.
+
+    Reads the live sources.lock.json, the last-bringup record (which
+    names the topology that actually came up), and the suite that
+    topology runs by default. Refuses to overwrite an existing preset
+    name unless --force, and refuses a topology recorded against a
+    different lock content: a preset must record a pairing that ran.
+    """
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"preset name {name!r} must match {NAME_RE.pattern} "
+            "(it names lab/presets/<name>.json)"
+        )
+    target = preset_path(root, name)
+    if target.exists() and not force:
+        raise ValueError(
+            f"preset {name!r} already exists at {target}; "
+            "pass --force to overwrite it"
+        )
+    record = read_last_bringup(root)
+    topology = record["topology"]
+    live_sha = hashlib.sha256(
+        (Path(root) / "sources.lock.json").read_bytes()
+    ).hexdigest()
+    if record["sources_lock_sha256"] != live_sha:
+        raise ValueError(
+            "the last bring-up ran against a different sources.lock.json "
+            f"(recorded {record['sources_lock_sha256'][:12]}, "
+            f"live {live_sha[:12]}); bring the current lock up first, or "
+            "the preset would record a topology pairing that never ran"
+        )
+    data = {
+        "name": name,
+        "description": description
+        or f"the {topology} rig recorded from the last bring-up",
+        "topology": topology,
+        "sources": rig.lock(root),
+        "suite": detected_suite(root, topology),
+    }
+    validate_preset(root, data, name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, indent=2) + "\n")
+    print(
+        json.dumps({"saved": str(target), "topology": topology, "suite": data["suite"]})
+    )
+    return 0
+
+
+def list_presets(root: Path) -> int:
+    """List the preset library with each preset's pins-matched state."""
+    pins = rig.lock(root)
+    entries = [
+        {
+            "name": preset["name"],
+            "description": preset["description"],
+            "topology": preset["topology"],
+            "suite": preset["suite"],
+            "pins_match_lock": preset["sources"] == pins,
+        }
+        for preset in load_library(root)
+    ]
+    print(json.dumps({"presets": entries}, indent=2))
+    return 0
+
+
+def show_preset(root: Path, name: str) -> int:
+    """Print one preset's recorded choices, exactly as committed."""
+    print(json.dumps(read_preset(root, name), indent=2))
+    return 0

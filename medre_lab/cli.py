@@ -351,6 +351,24 @@ def main(argv=None):
         "init", help="copy local config template, without hardware writes"
     )
     commands.add_parser("doctor", help="read-only host/config inventory; no RF")
+    preset = commands.add_parser(
+        "preset", help="save, inspect and load named rig configurations"
+    ).add_subparsers(dest="action", required=True)
+    preset.add_parser("list", help="list the saved rig presets")
+    preset_show = preset.add_parser("show", help="print one preset's recorded choices")
+    preset_show.add_argument("name")
+    preset_save = preset.add_parser(
+        "save", help="record the current rig configuration as a preset"
+    )
+    preset_save.add_argument("name")
+    preset_save.add_argument(
+        "--description",
+        default=None,
+        help="one-line description (default: derived from the topology)",
+    )
+    preset_save.add_argument(
+        "--force", action="store_true", help="overwrite an existing preset of this name"
+    )
     sources = commands.add_parser("sources").add_subparsers(
         dest="action", required=True
     )
@@ -446,6 +464,14 @@ def main(argv=None):
             return 0
         if args.command == "doctor":
             return doctor(config)
+        if args.command == "preset":
+            from . import presets
+
+            if args.action == "list":
+                return presets.list_presets(root)
+            if args.action == "show":
+                return presets.show_preset(root, args.name)
+            return presets.save_preset(root, args.name, args.description, args.force)
         if args.command == "hardware":
             if args.action == "run":
                 return hardware(root, config, args.pair, args.role, args.run_root)
