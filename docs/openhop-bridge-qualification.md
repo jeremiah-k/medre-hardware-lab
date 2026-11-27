@@ -138,6 +138,23 @@ the two images are rebuilt from the pinned checkouts. `bridge_up.sh`
 dies with a clear message when `prepare` has not run (it needs `.env`
 and the source manifests).
 
+### The generated repeater configs and the container identity
+
+The three repeater services run as uid 1000 (compose pins
+`user: "1000:1000"`) and each mounts its generated config read-only. The
+configs carry credentials, so the generators write them mode 0600 for
+the invoking user and then grant the container identity read access
+through a POSIX ACL entry (`setfacl -m u:1000:r`, confirmed effective
+with `getfacl`): the grant needs no privilege, the file stays private,
+and it is never made group- or world-readable. On a host whose invoking
+user is uid 1000 nothing changes. On any other host the grant makes the
+configs readable; when it cannot (`acl` tools missing, or a filesystem
+that refuses ACLs) the bring-up stops before it starts anything, naming
+the file, its owner and its mode, with the ways to proceed. The
+qualification runs the same readability check before every bring-up
+stage, so a host that cannot make a config readable is refused before
+any rig is touched.
+
 The matrices run against the up bridge rig, one bounded invocation at a
 time, and `lab/down.sh` takes everything down afterwards (including the
 fault splice and the fault MEDRE the fault matrix starts):
@@ -506,6 +523,14 @@ process. Read `lab/logs/openhop-bridge/repeater-*.log`; a companion that
 fails to bind usually means the config's `identities.companions[].settings.tcp_port`
 is taken or the identity key is malformed.
 
+**`cannot make <config> readable by the repeater containers`**
+The repeater containers read their generated configs as uid 1000; the
+file is owned by another uid with mode 0600, and no ACL entry could be
+granted (the `acl` tools are missing, or the filesystem refuses POSIX
+ACLs). Either run the lab as uid 1000, or install the `acl` tools
+(`setfacl`/`getfacl`) on a filesystem that supports ACLs. Never widen
+the file's permissions to group or other.
+
 **MEDRE logs `initial connection unavailable`**
 Repeater A is not up yet, or its companion port is unreachable. MEDRE
 recovers on its own (1s → 30s backoff) — that is the reconnect path.
@@ -552,6 +577,7 @@ companion identities survive); `lab/reset.sh` wipes them.
 | `lab/tools/openhop_bridge_probe.py`            | The probe: virtual MeshCore peer + independent MeshC observer/injector.                           |
 | `lab/tools/openhop_bridge_check.py`            | The strict single-delivery assertions the proof enforces (shared with the unit tests).            |
 | `lab/tools/openhop_bridge_medre_state.py`      | Reads MEDRE's own mapping store (canonical events, native ids, receipts) read-only.               |
+| `lab/tools/openhop_config_access.py`           | Grants or checks the repeater identity's read access to the generated configs (uid 1000).         |
 | `lab/openhop_pins.py`                          | Derives the openHop source pins and their upstream/local-candidate status for the version record. |
 | `lab/version_record.py`                        | Maintains `lab/VERSION`: one section per rig, no stale duplicates.                                |
 | `lab/config/medre-openhop-bridge.yaml`         | The MEDRE bridge config (no secrets); the only enabled bidirectional openHop↔MeshC route.         |

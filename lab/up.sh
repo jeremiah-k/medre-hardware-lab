@@ -391,6 +391,10 @@ for template, target, placeholders in (
     print(f"  {target} generated")
 PYGEN
 	chmod 0600 lab/state/config/openhop-repeater.yaml
+	# The repeater container reads this as uid 1000; grant it a POSIX ACL
+	# entry when the invoking user has another uid (refuses otherwise).
+	python3 lab/tools/openhop_config_access.py grant \
+		lab/state/config/openhop-repeater.yaml
 
 	# --- Bring-up ----------------------------------------------------------
 	log "Starting the MeshC sim node (meshtasticd-c-medre)"
@@ -568,6 +572,12 @@ for instance in ("a", "b"):
     os.chmod(target, 0o600)
     print(f"  {target} generated")
 PYGEN
+	# The repeater containers read these as uid 1000; grant them a POSIX
+	# ACL entry when the invoking user has another uid (refuses otherwise).
+	python3 lab/tools/openhop_config_access.py grant \
+		lab/state/config/openhop-radio-repeater-a.yaml
+	python3 lab/tools/openhop_config_access.py grant \
+		lab/state/config/openhop-radio-repeater-b.yaml
 
 	# --- Bring-up ----------------------------------------------------------
 	log "Starting the virtual radio relay"

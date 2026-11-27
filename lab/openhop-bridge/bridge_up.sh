@@ -165,6 +165,14 @@ for instance in ("a", "b"):
     print(f"  {target} generated")
 PYGEN
 
+# The repeater containers read these configs as uid 1000; grant them a
+# POSIX ACL entry when the invoking user has another uid (refuses
+# otherwise). A failed grant stops the bring-up here.
+python3 lab/tools/openhop_config_access.py grant \
+	lab/state/config/openhop-radio-repeater-a.yaml
+python3 lab/tools/openhop_config_access.py grant \
+	lab/state/config/openhop-radio-repeater-b.yaml
+
 # The MEDRE bridge config carries no secret: it is copied verbatim.
 cp lab/config/medre-openhop-bridge.yaml lab/state/config/medre-openhop-bridge.yaml
 echo "  lab/state/config/medre-openhop-bridge.yaml generated"

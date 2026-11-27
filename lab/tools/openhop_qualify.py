@@ -14,9 +14,28 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import openhop_config_access  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[2]
 DOWN = ["bash", "lab/down.sh"]
 LOCK_PATH = ROOT / "lab/state/openhop-qualification.lock"
+
+# The generated repeater configs each bring-up stage mounts; the
+# repeater containers read them as uid 1000. The check runs only for
+# configs that exist: a bring-up generates and grants a config that is
+# absent.
+UP_STAGE_CONFIGS = {
+    "lifecycle-up": [Path("lab/state/config/openhop-repeater.yaml")],
+    "radio-up": [
+        Path("lab/state/config/openhop-radio-repeater-a.yaml"),
+        Path("lab/state/config/openhop-radio-repeater-b.yaml"),
+    ],
+    "bridge-up": [
+        Path("lab/state/config/openhop-radio-repeater-a.yaml"),
+        Path("lab/state/config/openhop-radio-repeater-b.yaml"),
+    ],
+}
 
 # The open file description holding this checkout's qualification lock.
 # flock locks belong to the description, not the path, so a second
@@ -142,6 +161,16 @@ def run_command(command: list[str], log) -> int:
     return result if result >= 0 else 128 - result
 
 
+def assert_configs_readable(stage: str) -> None:
+    """Refuse a bring-up stage while an existing repeater config it
+    mounts is unreadable by the repeater containers; the stage's
+    generator writes and grants a config that does not exist yet."""
+    for relative in UP_STAGE_CONFIGS.get(stage, []):
+        path = ROOT / relative
+        if path.exists() and not openhop_config_access.uid_can_read(path):
+            raise ValueError(openhop_config_access.refusal(path))
+
+
 def run_stage(evidence: Path, name: str, command: list[str]) -> int:
     started = datetime.now(timezone.utc)
     clock = time.monotonic()
@@ -174,6 +203,9 @@ def qualify(evidence: Path, *, skip_build: bool, lock_path: Path | None = None) 
     needs_down = False
     try:
         for name, command in stages(evidence, skip_build):
+            # Before the stage starts anything: the refusal must not
+            # leave a rig of ours that teardown has to chase.
+            assert_configs_readable(name)
             if name.endswith("-up"):
                 needs_down = True
             status = run_stage(evidence, name, command)

@@ -2,6 +2,7 @@
 
 import fcntl
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import Mock
@@ -9,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import openhop_config_access  # noqa: E402
 import openhop_qualify as qualify  # noqa: E402
 
 
@@ -128,3 +130,33 @@ def test_a_stale_lock_file_does_not_block(tmp_path, monkeypatch):
     lock_path.write_text("31337\n", encoding="utf-8")
     fresh_qualification(tmp_path, monkeypatch)
     assert qualify.qualify(tmp_path / "run", skip_build=True, lock_path=lock_path) == 0
+
+
+def test_an_unreadable_repeater_config_refuses_before_any_stage(tmp_path, monkeypatch):
+    """A config a repeater container cannot read stops the bring-up
+    before that stage runs, naming the file and the remedy; a config
+    that does not exist yet is fine, the bring-up generates it."""
+    config = tmp_path / "lab/state/config/openhop-repeater.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("credentials\n", encoding="utf-8")
+    os.chmod(config, 0o000)
+    monkeypatch.setattr(qualify, "ROOT", tmp_path)
+    stage = fresh_qualification(tmp_path, monkeypatch)
+    with pytest.raises(ValueError) as exc:
+        qualify.qualify(tmp_path / "run", skip_build=True, lock_path=tmp_path / "lock")
+    assert str(config) in str(exc.value)
+    assert f"uid {openhop_config_access.REPEATER_UID}" in str(exc.value)
+    stage.assert_not_called()
+
+
+def test_a_readable_or_absent_repeater_config_does_not_refuse(tmp_path, monkeypatch):
+    config = tmp_path / "lab/state/config/openhop-radio-repeater-a.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("credentials\n", encoding="utf-8")  # owner-readable
+    monkeypatch.setattr(qualify, "ROOT", tmp_path)
+    stage = fresh_qualification(tmp_path, monkeypatch)
+    assert (
+        qualify.qualify(tmp_path / "run", skip_build=True, lock_path=tmp_path / "lock")
+        == 0
+    )
+    assert [call.args[1] for call in stage.call_args_list][-1] == "bridge-down"
