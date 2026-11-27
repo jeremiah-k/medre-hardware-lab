@@ -152,18 +152,36 @@ def restart_repeater(container: str) -> None:
         raise RuntimeError(f"did not observe a new start of {container}")
 
 
-def hold_exclusive_lock(seconds: int) -> subprocess.Popen[bytes] | None:
+def hold_exclusive_lock(
+    seconds: int, *, release_on_close: bool = False
+) -> subprocess.Popen[bytes] | None:
+    # An interactive lock can be released when its last under-lock
+    # observation is captured. The deadline still releases an orphan.
+    wait = (
+        "select.select([sys.stdin],[],[],float(sys.argv[1]));"
+        if release_on_close
+        else "time.sleep(float(sys.argv[1]));"
+    )
     script = (
-        "import sqlite3,time,sys;"
+        "import select,sqlite3,time,sys;"
         "c=sqlite3.connect('/var/lib/openhop_repeater/repeater.db',"
         "timeout=1,isolation_level=None);"
         "c.execute('BEGIN EXCLUSIVE');"
-        "print('locked',flush=True);"
-        "time.sleep(float(sys.argv[1]));"
-        "c.execute('ROLLBACK')"
+        "print('locked',flush=True);" + wait + "c.execute('ROLLBACK')"
     )
+    interactive = ["-i"] if release_on_close else []
     proc = subprocess.Popen(
-        ["docker", "exec", REPEATER_A, "python3", "-c", script, str(seconds)],
+        [
+            "docker",
+            "exec",
+            *interactive,
+            REPEATER_A,
+            "python3",
+            "-c",
+            script,
+            str(seconds),
+        ],
+        stdin=subprocess.PIPE if release_on_close else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
@@ -189,6 +207,8 @@ def hold_exclusive_lock(seconds: int) -> subprocess.Popen[bytes] | None:
     finally:
         proc.stdout.close()
         if not confirmed:
+            if proc.stdin is not None:
+                proc.stdin.close()
             if proc.poll() is None:
                 proc.kill()
             proc.wait()
@@ -1297,7 +1317,8 @@ class Matrix:
             # Hold an EXCLUSIVE lock on the repeater's SQLite store from
             # inside the repeater container: the persist path and the
             # client's sync path then contend for the same database.
-            lock_proc = hold_exclusive_lock(45)
+            lock_started = time.monotonic()
+            lock_proc = hold_exclusive_lock(45, release_on_close=True)
             if lock_proc is None:
                 self.not_run(name, "the repeater's SQLite store could not be locked")
                 return
@@ -1323,12 +1344,15 @@ class Matrix:
                 for line in repeater_log.splitlines()
                 if "locked" in line.lower() or "database is locked" in line.lower()
             ][-5:]
+            assert lock_proc.stdin is not None
+            lock_proc.stdin.close()
             try:
-                lock_proc.wait(timeout=60)
+                lock_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 lock_proc.kill()
                 lock_proc.wait()
                 raise
+            lock_hold_seconds = time.monotonic() - lock_started
             rows, _ = self.repeater_queue(REPEATER_A, prefix)
             persisted_count, persisted = count_nonce_rows(rows, only=mine)
             events = self.medre_events(prefix, only=mine)
@@ -1383,6 +1407,7 @@ class Matrix:
                     "ordering_verdict": ordering_verdict,
                     "ordering_note": "Indices show the recorded arrival order.",
                     "persisted_after_unlock": persisted_count,
+                    "lock_hold_seconds": lock_hold_seconds,
                     "repeater_lock_error_lines": lock_errors,
                     "probe": send,
                     "note": (

@@ -902,7 +902,8 @@ class OrderingMatrix:
                 "MEDRE stays attached to companion A while the store is locked"
             )
             warnings_before = self.repeater_log().count(FALLBACK_WARNING)
-            lock_proc = backlog.hold_exclusive_lock(lock_seconds)
+            lock_started = time.monotonic()
+            lock_proc = backlog.hold_exclusive_lock(lock_seconds, release_on_close=True)
             if lock_proc is None:
                 self.not_run(name, "the repeater's SQLite store could not be locked")
                 return
@@ -915,12 +916,15 @@ class OrderingMatrix:
             persisted_while_locked, _ = backlog.count_nonce_rows(
                 rows_while_locked, only=mine
             )
+            assert lock_proc.stdin is not None
+            lock_proc.stdin.close()
             try:
-                lock_proc.wait(timeout=lock_seconds + 30)
+                lock_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 lock_proc.kill()
                 lock_proc.wait()
                 raise
+            lock_hold_seconds = time.monotonic() - lock_started
             # After the lock lifts: nothing new may appear and nothing may
             # duplicate; everything accepted must have been delivered or
             # must still be preserved at the companion.
@@ -981,6 +985,7 @@ class OrderingMatrix:
                     "peer_accepted_sends": send.get("accepted_count"),
                     "served_while_store_locked": served_while_locked,
                     "persisted_while_store_locked": persisted_while_locked,
+                    "lock_hold_seconds": lock_hold_seconds,
                     "delivered_after_unlock": report["arrivals"],
                     "distinct_at_medre": report["distinct"],
                     "duplicate_arrivals": report["duplicate_arrivals"],
