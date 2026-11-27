@@ -269,7 +269,7 @@ def test_a_path_with_a_space_is_included(tmp_path):
 def test_a_gitattributes_change_hashes_different(tmp_path):
     commits = make_source_repo(tmp_path / "repo")
     assert selection.content_digest(
-        tmp_path / "repo", commits["nested"]
+        tmp_path / "repo", commits["space"]
     ) != selection.content_digest(tmp_path / "repo", commits["attrs"])
 
 
@@ -356,7 +356,9 @@ def test_lab_tree_includes_what_the_rig_builds_and_drives(tmp_path):
     ):
         write_files(repo, {name: text})
         commit_all(repo, f"change {name}")
-        assert lab_digest(repo) != baseline, name
+        changed = lab_digest(repo)
+        assert changed != baseline, name
+        baseline = changed
 
 
 def test_the_lab_rule_differs_from_the_plain_rule(tmp_path):
