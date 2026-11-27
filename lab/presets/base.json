@@ -1,0 +1,48 @@
+{
+  "name": "base",
+  "description": "the default two-relay rig (no MEDRE profile); the compose scenario suite via lab/run-scenarios.sh",
+  "topology": "base",
+  "sources": {
+    "medre": {
+      "url": "https://github.com/jeremiah-k/medre.git",
+      "ref": "fd2927d1a518c792f85bf8c31c297dbe6e7e7cb8"
+    },
+    "medre-adapter-matrix": {
+      "url": "https://github.com/jeremiah-k/medre-adapter-matrix.git",
+      "ref": "d39212bc0c3c2e021c9427bc0e958870baaa1afa"
+    },
+    "medre-adapter-meshtastic": {
+      "url": "https://github.com/jeremiah-k/medre-adapter-meshtastic.git",
+      "ref": "8e59552cd32bc43147d873c991ded7c5f082756f"
+    },
+    "medre-adapter-lxmf": {
+      "url": "https://github.com/jeremiah-k/medre-adapter-lxmf.git",
+      "ref": "935faefd3d67be13a6fab445846338c8fc2f150d"
+    },
+    "mmrelay": {
+      "url": "https://github.com/jeremiah-k/meshtastic-matrix-relay.git",
+      "ref": "427cd13fc5518f9ad0dd52f1c31964d3b5ce754c"
+    },
+    "medre-openhop": {
+      "url": "https://github.com/jeremiah-k/medre.git",
+      "ref": "60f79a4797b86dfbf785ca2809329ce933a1aa12"
+    },
+    "medre-adapter-meshcore": {
+      "url": "https://github.com/jeremiah-k/medre-adapter-meshcore.git",
+      "ref": "b09cdbb55a585be10e05e4fe7d15d8099b20f2cd"
+    },
+    "medre-adapter-meshtastic-openhop": {
+      "url": "https://github.com/jeremiah-k/medre-adapter-meshtastic.git",
+      "ref": "711c65afa7b2baf79f69d93f95f40624ef1cecc1"
+    },
+    "openhop-core": {
+      "url": "https://github.com/openhop-dev/openhop_core.git",
+      "ref": "7eb2b9ea44de6ae2b7a02993a93e75d7cb8c49a6"
+    },
+    "openhop-repeater": {
+      "url": "https://github.com/openhop-dev/openhop_repeater.git",
+      "ref": "a261da7d834fe6ea8f638772654b25b98828d9b1"
+    }
+  },
+  "suite": ["scenarios"]
+}

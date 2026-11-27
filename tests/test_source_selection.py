@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from medre_lab import presets
 from medre_lab.docker import (
     DEFAULT_MANIFEST,
     DEFAULT_SOURCE_GROUP,
@@ -114,3 +115,59 @@ def test_duplicate_lock_key_rejected(tmp_path):
     (tmp_path / "sources.lock.json").write_text('{"medre":{},"medre":{}}')
     with pytest.raises(ValueError, match="duplicate"):
         lock(tmp_path)
+
+
+def test_every_committed_preset_is_structurally_valid():
+    """Every lab/presets/*.json validates against the preset schema.
+
+    The library check also fails on an EMPTY presets directory and on a
+    library that does not record the current lock's pin set, so a preset
+    edit can never silently orphan the rig's own lock.
+    """
+    library = presets.validate_preset_library(ROOT)
+    assert {preset["name"] for preset in library} >= {"base", "openhop-companion"}
+
+
+def test_the_locks_pin_set_is_recorded_by_a_preset():
+    """Membership, not uniqueness: the lock's pin set must equal AT LEAST
+    ONE preset's pin set. Distinct presets may share pins (they differ in
+    topology, suite or intent) -- the seeds do exactly that."""
+    pins = lock(ROOT)
+    library = presets.load_library(ROOT)
+    matching = [preset["name"] for preset in library if preset["sources"] == pins]
+    assert matching, "no preset records the current lock's pin set"
+
+
+def test_seed_presets_record_the_ruled_choices():
+    """base: the plain rig and the compose suite. openhop-companion: the
+    qualification rig with the driver's stages. Both record the same pin
+    set -- that is the point of the membership rule."""
+    base = presets.read_preset(ROOT, "base")
+    companion = presets.read_preset(ROOT, "openhop-companion")
+    assert base["topology"] == "base"
+    assert base["suite"] == ["scenarios"]
+    assert companion["topology"] == "openhop"
+    assert companion["suite"] == [
+        f"qual:{stage}" for stage in presets.qualify_stage_names(ROOT)
+    ]
+    assert base["sources"] == companion["sources"] == lock(ROOT)
+
+
+def test_an_empty_preset_library_is_a_failure(tmp_path):
+    (tmp_path / "lab" / "presets").mkdir(parents=True)
+    with pytest.raises(ValueError, match="empty"):
+        presets.load_library(tmp_path)
+
+
+def test_a_library_without_the_current_pins_is_a_failure(tmp_path):
+    (tmp_path / "lab" / "presets").mkdir(parents=True)
+    (tmp_path / "lab" / "run-scenarios.sh").write_text("")
+    (tmp_path / "sources.lock.json").write_text(
+        (ROOT / "sources.lock.json").read_text()
+    )
+    data = json.loads((ROOT / "lab/presets/base.json").read_text())
+    data["name"] = "base"
+    data["sources"]["medre"]["ref"] = "0" * 40
+    (tmp_path / "lab" / "presets" / "base.json").write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="no preset records"):
+        presets.validate_preset_library(tmp_path)

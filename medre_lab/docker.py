@@ -104,6 +104,10 @@ OPENHOP_MANIFEST = {
     "medre-lab-openhop-repeater": OPENHOP_SOURCE_GROUP[3:],
 }
 
+# Public HTTPS GitHub URLs without credentials; shared with the preset
+# schema (medre_lab.presets) so both validate pins identically.
+SOURCE_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+(?:\.git)?")
+
 
 def lock(root):
     def unique(pairs):
@@ -124,9 +128,7 @@ def lock(root):
             r"[0-9a-f]{40}", entry["ref"]
         ):
             raise ValueError(f"{name}: exact full commit SHA required")
-        if not re.fullmatch(
-            r"https://github\.com/[\w.-]+/[\w.-]+(?:\.git)?", entry["url"]
-        ):
+        if not SOURCE_URL_RE.fullmatch(entry["url"]):
             raise ValueError(
                 "source URLs must be public HTTPS GitHub URLs without credentials"
             )
