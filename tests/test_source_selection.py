@@ -60,7 +60,7 @@ def test_openhop_pins_are_exact():
     # and queue-ownership revisions.
     assert data["openhop-core"]["ref"] == ("7eb2b9ea44de6ae2b7a02993a93e75d7cb8c49a6")
     assert data["openhop-repeater"]["ref"] == (
-        "43c028e3f1558cc3a6839163484e970967cf1674"
+        "a261da7d834fe6ea8f638772654b25b98828d9b1"
     )
 
 
