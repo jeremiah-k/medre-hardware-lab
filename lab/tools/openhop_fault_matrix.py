@@ -1138,6 +1138,7 @@ class FaultMatrix:
         self.dir = evidence_dir
         self.dir.mkdir(parents=True, exist_ok=True)
         self.results: list[dict] = []
+        self.observations: list[dict] = []
         # Pass-through control for the selective-drop case: when set, the
         # case arms its link WITHOUT drop_message_frames, so nothing is
         # lost and the verdict fails on the missing proof by design.  The
@@ -1198,6 +1199,9 @@ class FaultMatrix:
         return {"label": label, "rows": rows}
 
     def write(self, name: str, payload: dict) -> None:
+        if self.observations:
+            payload["observation_waits"] = self.observations
+            self.observations = []
         payload.setdefault("label", "protocol-simulated")
         payload.setdefault("generated_at", utcnow())
         path = self.dir / f"{name}.json"
@@ -1285,11 +1289,24 @@ class FaultMatrix:
             time.sleep(interval)
         return False
 
+    def observe(self, name: str, predicate, timeout: float) -> bool:
+        started = time.monotonic()
+        observed = self.wait_for(predicate, timeout, interval=0.5)
+        self.observations.append(
+            {
+                "name": name,
+                "bound_seconds": timeout,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "observed": observed,
+            }
+        )
+        return observed
+
     def wait_for_parked_link(self) -> bool:
-        return self.wait_for(
+        return self.observe(
+            "initial-empty-queue",
             lambda: empty_reply_after(timestamped_logs(PROXY), 0),
             PARK_BOUND_S,
-            interval=0.5,
         )
 
     def wait_for_drain(
@@ -1314,7 +1331,7 @@ class FaultMatrix:
             # Both observations must be newer than the fault boundary.
             return empty_reply_after(timestamped_logs(PROXY), since)
 
-        return self.wait_for(complete, timeout, interval=0.5)
+        return self.observe("delivery-and-empty-queue", complete, timeout)
 
     def stop_fault_medre(self) -> None:
         run(["docker", "rm", "-f", MEDRE_FAULT], timeout=180)
