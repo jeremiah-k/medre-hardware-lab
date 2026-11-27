@@ -58,9 +58,9 @@ def test_openhop_pins_are_exact():
     )
     # The openHop core/repeater builds carry the companion frame-admission
     # and queue-ownership revisions.
-    assert data["openhop-core"]["ref"] == ("e6df15082b82f1c202086f966f576111819a3b86")
+    assert data["openhop-core"]["ref"] == ("6265a10c175900bef2de08441042c7285025af81")
     assert data["openhop-repeater"]["ref"] == (
-        "1b3abc0dfd8b5891fcff93a02c371cc80d6b9db3"
+        "43c028e3f1558cc3a6839163484e970967cf1674"
     )
 
 
