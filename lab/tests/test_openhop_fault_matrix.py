@@ -1505,3 +1505,14 @@ def test_reconnected_after_retirement_reads_one_snapshot():
         is False
     )
     assert fault_matrix.reconnected_after_retirement("no retirement at all") is False
+
+
+def test_the_shell_entry_point_forwards_the_passthrough_control():
+    """The control run goes through the committed entry point: the script
+    accepts --selective-drop-passthrough and forwards it to the driver."""
+    script = (
+        Path(__file__).resolve().parents[1] / "openhop-radio" / "fault_matrix.sh"
+    ).read_text()
+    assert "--selective-drop-passthrough" in script
+    assert 'PASSTHROUGH="--selective-drop-passthrough"' in script
+    assert "${PASSTHROUGH}" in script

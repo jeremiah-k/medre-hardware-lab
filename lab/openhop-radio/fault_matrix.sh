@@ -79,7 +79,8 @@
 #   consumed_wakes   nonces in neither store (bounded per the verdict
 #                    that judges the case)
 #
-# Usage: lab/openhop-radio/fault_matrix.sh [--case NAME]
+# Usage: lab/openhop-radio/fault_matrix.sh [--case NAME] [--evidence-dir DIR]
+#                                         [--selective-drop-passthrough]
 # Exit:  0 = every case that ran passed, 1 = a case failed.
 # =============================================================================
 set -euo pipefail
@@ -89,6 +90,7 @@ cd "${LAB_ROOT}"
 
 EVIDENCE_DIR="${LAB_ROOT}/lab/logs/openhop-fault"
 CASE="all"
+PASSTHROUGH=""
 while (($# > 0)); do
 	case "$1" in
 	--case)
@@ -98,6 +100,13 @@ while (($# > 0)); do
 	--evidence-dir)
 		EVIDENCE_DIR="$2"
 		shift 2
+		;;
+	--selective-drop-passthrough)
+		# The control run: arm the selective-drop link WITHOUT the frame
+		# drop, so nothing is lost and the verdict fails on the missing
+		# proof by design.
+		PASSTHROUGH="--selective-drop-passthrough"
+		shift
 		;;
 	*)
 		echo "unknown argument: $1" >&2
@@ -143,4 +152,4 @@ docker inspect -f '{{.State.Running}}' "${PROXY_CONTAINER}" 2>/dev/null | grep -
 echo "  ${PROXY_CONTAINER}: running"
 
 log "Phase 2: the fault matrix"
-exec python3 lab/tools/openhop_fault_matrix.py --evidence-dir "${EVIDENCE_DIR}" --case "${CASE}"
+exec python3 lab/tools/openhop_fault_matrix.py --evidence-dir "${EVIDENCE_DIR}" --case "${CASE}" ${PASSTHROUGH}
