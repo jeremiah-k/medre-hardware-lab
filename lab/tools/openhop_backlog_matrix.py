@@ -491,6 +491,19 @@ def backlog_with_live_failures(
     return failures
 
 
+def hold_state_reached(held: int, accepted: int) -> bool:
+    """The held state the c5 samples must wait for before the first one.
+
+    With the first fetch's reply withheld, the companion has popped
+    exactly one message whose frame never left the splice: the queue
+    holds exactly accepted - 1 of this run's markers.  Messages may
+    still be propagating when peer_send returns, so sampling before this
+    state is reached would fail the hold on propagation, not on the
+    fault.
+    """
+    return accepted > 0 and held == accepted - 1
+
+
 def kill_mid_drain_failures(
     *,
     accepted: int,
@@ -529,7 +542,7 @@ def kill_mid_drain_failures(
         failures.append("no queue-depth sample was taken across the hold")
     elif len(set(queue_samples)) != 1:
         failures.append(
-            "the companion's queue kept shrinking while the one message was "
+            "the companion's queue did not hold still while one message was "
             f"outstanding: samples {queue_samples}"
         )
     elif queue_samples[0] != accepted - 1:
@@ -1492,12 +1505,44 @@ class Matrix:
             accepted = int(send.get("accepted_count") or 0)
             # The hold: with the first fetch's reply withheld, the companion
             # has popped exactly one message whose frame never left the
-            # splice.  The pump parks after the fetch window (2 s) elapses
-            # with no traffic, so the queue must hold still; four samples
-            # spanning 7.5 s prove it stopped shrinking for longer than two
-            # fetch windows while that one message was outstanding.
+            # splice.  Messages may still be propagating when peer_send
+            # returns, so WAIT (bounded) for the held state - the queue
+            # holding exactly accepted - 1 of this run's markers - before
+            # the first sample; the pump parks after the fetch window (2 s)
+            # elapses with no traffic, so the queue must hold still, and
+            # four samples spanning 7.5 s prove it stopped shrinking for
+            # longer than two fetch windows while that one message was
+            # outstanding.
+            hold_wait_started = time.monotonic()
+            hold_wait_seconds = None
+            hold_deadline = time.monotonic() + 30.0
             queue_samples: list[int] = []
             sample_times: list[float] = []
+            while time.monotonic() < hold_deadline:
+                rows, _state = self.repeater_queue(REPEATER_A, prefix)
+                held, _markers = count_nonce_rows(rows, only=mine)
+                if hold_state_reached(held, accepted):
+                    hold_wait_seconds = time.monotonic() - hold_wait_started
+                    break
+                time.sleep(1.0)
+            if hold_wait_seconds is None:
+                # The held state never arrived: record what the queue held
+                # and refuse to judge - sampling a state that was never
+                # reached would say nothing about the fault.
+                rows, _state = self.repeater_queue(REPEATER_A, prefix)
+                held, _markers = count_nonce_rows(rows, only=mine)
+                self.not_run(
+                    name,
+                    f"the companion's queue never held exactly {accepted - 1} "
+                    "of this run's messages within 30 s of the last send; "
+                    "the held state cannot be sampled",
+                    {
+                        "queue_samples": [held],
+                        "hold_wait_seconds": None,
+                        "probe": send,
+                    },
+                )
+                return
             for _ in range(4):
                 rows, _state = self.repeater_queue(REPEATER_A, prefix)
                 held, _markers = count_nonce_rows(rows, only=mine)
@@ -1573,6 +1618,7 @@ class Matrix:
                         "%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(killed_at)
                     ),
                     "hold_seconds": hold_seconds,
+                    "hold_wait_seconds": hold_wait_seconds,
                     "requested_messages": count,
                     "peer_accepted_sends": accepted,
                     "queue_samples_during_hold": queue_samples,

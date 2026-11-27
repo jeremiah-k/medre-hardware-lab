@@ -138,7 +138,10 @@ def test_kill_mid_drain_judge_fails_a_shrinking_queue():
         queue_samples=[29, 27, 26, 24],
         hold_seconds=7.5,
     )
-    assert any("kept shrinking" in failure for failure in failures)
+    assert any(
+        "did not hold still while one message was outstanding" in failure
+        for failure in failures
+    )
     assert any("3 message(s) are missing" in failure for failure in failures)
 
 
@@ -474,3 +477,35 @@ def test_main_exits_zero_when_every_ran_case_passed(tmp_path, monkeypatch):
 
 def test_summary_only_exits_zero_without_running_cases(tmp_path):
     assert matrix.main(["--evidence-dir", str(tmp_path / "ev4"), "--summary-only"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# The c5 hold: samples start only once the held state is reached - the
+# queue holding exactly accepted - 1 of this run's markers - so
+# propagation cannot fail the hold.
+# ---------------------------------------------------------------------------
+
+
+def test_the_hold_state_is_the_backlog_minus_one():
+    assert matrix.hold_state_reached(29, 30) is True
+    assert matrix.hold_state_reached(30, 30) is False
+    assert matrix.hold_state_reached(28, 30) is False
+    assert matrix.hold_state_reached(0, 0) is False
+
+
+def test_shrinking_samples_still_fail_and_the_count_check_still_applies():
+    failures = matrix.kill_mid_drain_failures(
+        accepted=30,
+        delivered_distinct=29,
+        duplicate_wakes=0,
+        preserved_distinct=0,
+        missing=["p4c5ab12-0-deadbeef"],
+        delivered_before_kill=0,
+        queue_samples=[29, 28, 28, 27],
+        hold_seconds=7.5,
+    )
+    assert any(
+        "did not hold still while one message was outstanding" in failure
+        for failure in failures
+    )
+    assert not any("delivered + preserved" in failure for failure in failures)
