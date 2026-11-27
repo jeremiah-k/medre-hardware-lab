@@ -4,11 +4,43 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import tomllib
 from pathlib import Path
 
 TRANSPORTS = ("meshtastic", "meshcore", "lxmf")
+
+# lab.toml pins one host's controller name, and controller numbering is not
+# stable across hosts (the tracked default was written for a bench whose
+# controller is gone). This override lets one tracked configuration serve
+# every host; unset, the documented bench default applies.
+BLE_ADAPTER_ENV = "MEDRE_LAB_BLE_ADAPTER"
+BLE_ADAPTER_DEFAULT = "hci0"
+
+
+def resolve_ble_adapter(
+    hw: dict, error: type[ValueError] = ValueError, *, effective: bool = False
+) -> None:
+    """Resolve the effective BLE controller into ``hw["ble_adapter"]``.
+
+    Priority: the ``MEDRE_LAB_BLE_ADAPTER`` environment override, then the
+    configured value, then ``BLE_ADAPTER_DEFAULT``. The resolved name is
+    always present afterwards, so workers and diagnostics read one key.
+    An effective snapshot pins the resolved controller for the campaign.
+    """
+    configured = hw.get("ble_adapter")
+    if configured is not None and not re.fullmatch(r"hci\d+", str(configured)):
+        raise error("ble_adapter must be an HCI name such as hci1")
+    override = os.environ.get(BLE_ADAPTER_ENV, "").strip()
+    if override:
+        if not re.fullmatch(r"hci\d+", override):
+            raise error(f"{BLE_ADAPTER_ENV} must be an HCI name such as hci0")
+        if effective and override != configured:
+            raise error(f"{BLE_ADAPTER_ENV} conflicts with the effective configuration")
+        hw["ble_adapter"] = override
+    elif configured is None:
+        hw["ble_adapter"] = BLE_ADAPTER_DEFAULT
 
 
 def path_from(base: Path, value: str) -> Path:
@@ -16,7 +48,7 @@ def path_from(base: Path, value: str) -> Path:
     return (base / path).resolve() if not path.is_absolute() else path.resolve()
 
 
-def load(path: Path) -> dict:
+def load(path: Path, *, effective: bool = False) -> dict:
     path = path.resolve()
     with path.open("rb") as stream:
         config = tomllib.load(stream)
@@ -47,8 +79,7 @@ def load(path: Path) -> dict:
             or value <= 0
         ):
             raise ValueError(f"{key} must be finite and positive")
-    if "ble_adapter" in hw and not re.fullmatch(r"hci\d+", str(hw["ble_adapter"])):
-        raise ValueError("ble_adapter must be an HCI name such as hci1")
+    resolve_ble_adapter(hw, effective=effective)
     for kind in TRANSPORTS:
         if kind not in hw:
             continue
@@ -125,7 +156,7 @@ def write_effective_config(path: Path, config: dict) -> None:
     with path.open("x", encoding="utf-8") as stream:
         path.chmod(0o600)
         stream.write("\n".join(lines) + "\n")
-    if load(path) != config:
+    if load(path, effective=True) != config:
         raise ValueError(
             "effective configuration snapshot differs from validated settings"
         )

@@ -360,7 +360,11 @@ def main(argv=None):
     docker = commands.add_parser("docker").add_subparsers(dest="action", required=True)
     docker.add_parser("prepare")
     up = docker.add_parser("up")
-    up.add_argument("--profile", choices=("base", "normal", "stress"), default="normal")
+    up.add_argument(
+        "--profile",
+        choices=("base", "normal", "stress", "openhop", "openhop-radio"),
+        default="normal",
+    )
     up.add_argument("--skip-build", action="store_true")
     suite = docker.add_parser("test")
     suite.add_argument("scenarios", nargs="*", default=[])
@@ -491,7 +495,14 @@ def main(argv=None):
         if args.action == "up":
             command = ["bash", "lab/up.sh"]
             if args.profile != "base":
-                command += ["--normal" if args.profile == "normal" else "--with-medre"]
+                command += [
+                    {
+                        "normal": "--normal",
+                        "stress": "--with-medre",
+                        "openhop": "--openhop",
+                        "openhop-radio": "--openhop-radio",
+                    }[args.profile]
+                ]
             if args.skip_build:
                 command += ["--skip-build"]
         else:

@@ -1,0 +1,202 @@
+# =============================================================================
+# openHop repeater runtime — VIRTUAL RADIO profile (compose profile
+# `openhop-radio`) — contract config template.
+#
+# lab/up.sh copies this file to lab/state/config/openhop-radio-repeater-a.yaml
+# and lab/state/config/openhop-radio-repeater-b.yaml with the __RADIO_*__
+# placeholders substituted, and mounts the generated copy into the matching
+# repeater container. The committed template is the durable contract and
+# carries NO secrets.
+#
+# WHAT THIS PROFILE IS
+# --------------------
+# Two independent openHop repeaters (A and B) whose radios are wired to the
+# LAB's virtual radio relay instead of to hardware:
+#
+#     companion A client ── repeater A ──┐
+#                                       ├── openhop-radio-relay (TCP 5055)
+#     companion B client ── repeater B ──┘
+#
+# The relay speaks the openHop Modem protocol (SYNC | CMD | LEN | PAYLOAD |
+# CRC-16/CCITT-FALSE) and forwards each repeater's transmissions to the OTHER
+# repeater. It simulates the RF MEDIUM ONLY: the MeshCore packets that cross
+# it are real, encrypted and decrypted by real repeaters. See
+# docs/openhop-radio-qualification.md for the evidence boundary.
+#
+# WHAT IS DIFFERENT FROM THE PHASE 2 (openhop) PROFILE
+# ----------------------------------------------------
+#   * radio_type: modem_tcp (not null) — the radio IS a TCP client of the
+#     lab relay. No /dev mounts, no CAP_SYS_RAWIO, no GPIO/USB groups.
+#   * repeater.mode: monitor — the repeater does not REPEAT a received
+#     packet. That keeps the two-node medium loop-free: A's reception is
+#     delivered to A's companion but never re-broadcast, so nothing can echo
+#     back to B. Local (companion-originated) TX is still allowed, which is
+#     how B's channel-0 message reaches the air.
+#   * mesh.unscoped_flood_allow / global_flood_allow: true — the qualifier
+#     deliberately exercises the flood route of a channel message.
+#
+# The Phase 2 profile (compose profile `openhop`) is untouched: radio_type
+# null, mode no_tx, flooding denied.
+# =============================================================================
+
+repeater:
+  # Node name for logging and identification.
+  node_name: "openhop-lab-radio-__RADIO_INSTANCE__"
+
+  # TX mode: forward | monitor | no_tx.
+  # monitor = no repeat, tenants (companions) can TX. That is what this
+  # profile needs: B must be able to transmit, and A must NOT re-broadcast
+  # what it hears (a repeat would echo the packet back to B).
+  mode: "monitor"
+
+  latitude: 0.0
+  longitude: 0.0
+
+  # The repeater's own identity lives in the persistent data volume, so a
+  # repeater restart keeps the same node identity and the two repeaters
+  # never share one (each has its own volume).
+  identity_file: "/var/lib/openhop_repeater/identity.key"
+
+  owner_info: "medre hardware lab openhop virtual radio qualifier"
+
+  # Duplicate packet cache TTL in seconds.
+  cache_ttl: 3600
+
+  # Automatic advertisement interval in hours. 0 disables adverts (manual
+  # only): the qualifier must not emit mesh traffic on its own.
+  send_advert_interval_hours: 0
+  direct_advert_interval_hours: 0
+
+  # Do not answer discovery requests: the qualifier must stay silent.
+  allow_discovery: false
+
+  security:
+    max_clients: 1
+    admin_password: "__RADIO_ADMIN_PASSWORD__" # checkov:skip=CKV_SECRET_6:Public deterministic placeholder substituted by lab/up.sh for the isolated lab service.
+    guest_password: "__RADIO_GUEST_PASSWORD__" # checkov:skip=CKV_SECRET_6:Public deterministic placeholder substituted by lab/up.sh for the isolated lab service.
+    allow_read_only: false
+    jwt_secret: "__RADIO_JWT_SECRET__" # checkov:skip=CKV_SECRET_6:Public deterministic placeholder substituted by lab/up.sh for the isolated lab service.
+    jwt_expiry_minutes: 60
+
+# Companion identities. Each repeater serves the MeshCore frame protocol
+# over TCP to exactly ONE client at a time (a new connection evicts the
+# previous one). The lab defines exactly ONE companion per repeater so the
+# single-client rule is unambiguous.
+identities:
+  companions:
+    - name: "MedreRadioCompanion__RADIO_INSTANCE__"
+      # 32-byte Ed25519 seed in hex. Generated per installation into the
+      # gitignored lab/state/ tree; substituted into the generated config.
+      # The two repeaters MUST NOT share it: each repeater is its own node.
+      identity_key: "__RADIO_COMPANION_IDENTITY_KEY__"
+      settings:
+        node_name: "MEDRE-RADIO-__RADIO_INSTANCE__"
+        tcp_port: 5000
+        # 0.0.0.0 inside the container. The port is NOT published to the
+        # host, so this bind is only reachable on the private compose
+        # network (see compose.yaml, network `openhop-radio`).
+        bind_address: "0.0.0.0"
+        tcp_timeout: 120
+
+# THE RADIO IS THE LAB'S VIRTUAL RADIO MEDIUM.
+# radio_type: modem_tcp makes the repeater's radio a TCP client of the lab
+# relay, speaking the openHop Modem protocol. `token: ""` means the relay
+# needs no AUTH (no secret anywhere on the wire).
+# lbt_enabled: false disables listen-before-talk: the virtual medium is a
+# byte pipe with no carrier sense, so a CAD probe would be noise.
+radio_type: modem_tcp
+
+modem_tcp:
+  host: "openhop-radio-relay"
+  port: 5055
+  token: ""
+  connect_timeout: 5.0
+  lbt_enabled: false
+
+# Radio parameters. The virtual medium does not modulate anything, but the
+# repeater still records them, and the MeshCore default sync word (0x12) is
+# kept explicit so the profile reads like a deployment.
+radio:
+  frequency: 869618000
+  tx_power: 14
+  bandwidth: 62500
+  spreading_factor: 8
+  coding_rate: 8
+  preamble_length: 32
+  sync_word: 0x12
+
+# Storage: persistent SQLite (companion contacts/channels/messages) plus the
+# repeater identity file. Each repeater owns its own volume.
+storage:
+  storage_dir: "/var/lib/openhop_repeater"
+  retention:
+    sqlite_cleanup_days: 31
+    companion_events_days: 31
+
+# Mesh behaviour. Flooding is ENABLED in this profile only: the qualifier
+# deliberately exercises the flood route of a channel message between the
+# two repeaters. (The Phase 2 profile denies it.)
+mesh:
+  unscoped_flood_allow: true
+  global_flood_allow: true
+  path_hash_mode: 0
+  loop_detect: minimal
+  default_region: null
+
+# Local GPS receiver: disabled (no hardware in this profile).
+gps:
+  enabled: false
+
+# Sensors: disabled (no hardware in this profile).
+sensors:
+  enabled: false
+  poll_interval_seconds: 30.0
+  auto_install_packages: false
+  definitions: []
+
+# Metrics: RRDtool is not installed in the lab image (it needs librrd), so
+# the RRDtool archive is disabled; the API still serves live stats.
+metrics:
+  rrd_enabled: false
+
+# Plugin manager: disabled. The lab image runs the repeater under the
+# container supervisor, which would otherwise also start the plugin
+# manager process.
+plugins:
+  enabled: false
+
+# MQTT: no brokers (the qualifier must not publish anywhere).
+mqtt_brokers:
+  iata_code: "LAB"
+  status_interval: 300
+  owner: ""
+  email: ""
+  brokers: []
+
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# HTTP: the web/API surface stays bound to the container's loopback so it is
+# not reachable even on the compose network.
+http:
+  enabled: true
+  host: "127.0.0.1"
+  port: 8000
+  thread_pool: 4
+  thread_pool_max: 8
+  socket_timeout: 65
+  socket_queue_size: 100
+
+web:
+  cors_enabled: false
+  carto_api_key: ""
+  custom_web_path: null
+
+delays:
+  tx_delay_factor: 1.0
+  direct_tx_delay_factor: 0.5
+
+duty_cycle:
+  enforcement_enabled: false
+  max_airtime_per_minute: 3600

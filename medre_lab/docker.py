@@ -37,6 +37,71 @@ SOURCES = {
         "/src/lxmf",
     ),
     "mmrelay": ("MMRELAY_SRC", "src/mmrelay/main.py", "mmrelay.main", "/src"),
+    # openHop profile sources. The medre 0.1.0 pin above is incompatible with
+    # the meshcore adapter (it requires medre>=0.2.0), so the openHop profile
+    # carries its OWN medre/adapter pins in separate checkouts. The default
+    # lab rig keeps using the five original pins unchanged.
+    "medre-openhop": (
+        "MEDRE_OPENHOP_SRC",
+        "src/medre/core/rendering/text_helpers.py",
+        "medre.core.rendering.text_helpers",
+        "/src/core",
+    ),
+    "medre-adapter-meshcore": (
+        "MEDRE_MESHCORE_SRC",
+        "src/medre/adapters/meshcore/renderer.py",
+        "medre.adapters.meshcore.renderer",
+        "/src/meshcore",
+    ),
+    "medre-adapter-meshtastic-openhop": (
+        "MEDRE_MESHTASTIC_OPENHOP_SRC",
+        "src/medre/adapters/meshtastic/renderer.py",
+        "medre.adapters.meshtastic.renderer",
+        "/src/meshtastic",
+    ),
+    "openhop-core": (
+        "OPENHOP_CORE_SRC",
+        "src/openhop_core/__init__.py",
+        "openhop_core",
+        "/src/openhop-core",
+    ),
+    "openhop-repeater": (
+        "OPENHOP_REPEATER_SRC",
+        "repeater/config.py",
+        "repeater.config",
+        "/src/openhop-repeater",
+    ),
+}
+
+# Source groups are the sources each rig qualifies. The default rig keeps
+# the original five sources untouched; the openHop profile adds its own five
+# (a second medre/adapter stack plus the two openHop checkouts).
+DEFAULT_SOURCE_GROUP = (
+    "medre",
+    "medre-adapter-matrix",
+    "medre-adapter-meshtastic",
+    "medre-adapter-lxmf",
+    "mmrelay",
+)
+OPENHOP_SOURCE_GROUP = (
+    "medre-openhop",
+    "medre-adapter-meshcore",
+    "medre-adapter-meshtastic-openhop",
+    "openhop-core",
+    "openhop-repeater",
+)
+# The default rig's manifest (checked with live container inspection by
+# lab/run-scenarios.sh) and the openHop rig's manifest (checked separately
+# while the openHop profile is up) are separate files: see prepare().
+# Each names the sources MOUNTED read-only into that container: mmrelay is
+# baked into the relay images and mounted nowhere, so it is qualified by
+# the host-only source check, not by a container mount.
+DEFAULT_MANIFEST = {
+    "medre-lab-medre-normal": DEFAULT_SOURCE_GROUP[:4],
+}
+OPENHOP_MANIFEST = {
+    "medre-lab-medre-openhop": OPENHOP_SOURCE_GROUP[:3],
+    "medre-lab-openhop-repeater": OPENHOP_SOURCE_GROUP[3:],
 }
 
 
@@ -53,7 +118,7 @@ def lock(root):
         (root / "sources.lock.json").read_text(), object_pairs_hook=unique
     )
     if set(data) != set(SOURCES):
-        raise ValueError("source lock must name all five Docker dependencies")
+        raise ValueError("source lock must name the Docker dependencies for both rigs")
     for name, entry in data.items():
         if set(entry) != {"url", "ref"} or not re.fullmatch(
             r"[0-9a-f]{40}", entry["ref"]
@@ -113,19 +178,51 @@ def prepare(root):
     )
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
-    for entry in selected:
-        guard.check_source(entry)
+    for name, entry in zip(SOURCES, selected, strict=True):
+        # The openHop launchers validate their manifest before using these pins.
+        if name in DEFAULT_SOURCE_GROUP:
+            guard.check_source(entry)
     state = root / "lab/state"
     state.mkdir(parents=True, exist_ok=True)
+    by_name = {entry["source"]: entry for entry in selected}
+
+    def selection(names):
+        return [by_name[str(root / "sources" / name)] for name in names]
+
+    # TWO manifests, one per rig. The default manifest names ONLY the
+    # default rig's container: lab/run-scenarios.sh checks it with live
+    # container inspection (no --host-only), so adding the openHop
+    # containers here would demand they be running during the default
+    # scenario suite. The openHop manifest is checked separately, and only
+    # while the openHop profile is up.
     manifest = state / "sources.json"
     manifest.write_text(
-        json.dumps({"medre-lab-medre-normal": selected[:4]}, indent=2) + "\n"
+        json.dumps(
+            {
+                container: selection(names)
+                for container, names in DEFAULT_MANIFEST.items()
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    openhop_manifest = state / "sources-openhop.json"
+    openhop_manifest.write_text(
+        json.dumps(
+            {
+                container: selection(names)
+                for container, names in OPENHOP_MANIFEST.items()
+            },
+            indent=2,
+        )
+        + "\n"
     )
     env = {
         "LAB_ROOT": str(root),
         "LAB_UID": str(os.getuid()),
         "LAB_GID": str(os.getgid()),
         "LAB_SOURCE_MANIFEST": str(manifest),
+        "LAB_SOURCE_MANIFEST_OPENHOP": str(openhop_manifest),
     }
     for name, info in SOURCES.items():
         env[info[0]] = str(root / "sources" / name)
@@ -133,6 +230,15 @@ def prepare(root):
     env["MEDRE_CORE_REF"] = lock(root)["medre"]["ref"]
     env["MMRELAY_BAKE_CORE_REF"] = env["MEDRE_CORE_REF"]
     env["MEDRE_MATRIX_REF"] = lock(root)["medre-adapter-matrix"]["ref"]
+    # The openHop profile carries its own pins; the build args record the
+    # exact commits the images were baked from.
+    env["OPENHOP_CORE_REF"] = lock(root)["openhop-core"]["ref"]
+    env["OPENHOP_REPEATER_REF"] = lock(root)["openhop-repeater"]["ref"]
+    env["MEDRE_OPENHOP_REF"] = lock(root)["medre-openhop"]["ref"]
+    env["MEDRE_MESHCORE_REF"] = lock(root)["medre-adapter-meshcore"]["ref"]
+    env["MEDRE_MESHTASTIC_OPENHOP_REF"] = lock(root)[
+        "medre-adapter-meshtastic-openhop"
+    ]["ref"]
     # This generated file is authoritative; user hardware config is separate.
     target = root / ".env"
     target.write_text(

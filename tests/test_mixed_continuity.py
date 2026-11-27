@@ -668,6 +668,13 @@ def test_load_mixed_accepts_single_meshtastic_port_and_uppercases(campaign_files
     assert config["matrix"]["rooms"]["a"] == "!a:x"
 
 
+def test_load_mixed_resolves_ble_adapter_from_environment(campaign_files, monkeypatch):
+    toml, matrix = campaign_files
+    monkeypatch.setenv("MEDRE_LAB_BLE_ADAPTER", "hci1")
+    config = mixed_continuity.load_mixed(toml, matrix)
+    assert config["hardware"]["ble_adapter"] == "hci1"
+
+
 def test_load_mixed_fingerprint_binds_both_files(campaign_files):
     toml, matrix = campaign_files
     first = mixed_continuity.load_mixed(toml, matrix)["matrix"]["fingerprint"]
@@ -731,7 +738,7 @@ def test_min_sampler_coverage_is_three():
         "wrong_delivery",
     ],
 )
-def test_adversarial_transcript_boundaries(fault):
+def test_tampered_transcript_boundaries(fault):
     transcript = passing_transcript()
     a = transcript["affected"]
     u = transcript["unaffected"]

@@ -1,0 +1,92 @@
+# =============================================================================
+# MEDRE openHop runtime (interop lab, `openhop` compose profile) - contract
+# config template.
+#
+# This committed file is the canonical MEDRE configuration for the
+# hardware-free openHop qualifier. lab/up.sh copies it to
+# lab/state/config/medre-openhop.yaml with the __OPENHOP_*__ placeholders
+# substituted, and only when the `openhop` profile is active. The generated
+# copy is the one mounted read-only into the medre-openhop container; the
+# committed template is the durable contract.
+#
+# - TWO adapters, both on the private compose network:
+#     meshcore  -> the openHop repeater's companion (TCP 5000). This is the
+#                  link under qualification: MEDRE's MeshCore adapter talks
+#                  the MeshCore frame protocol to the openHop companion.
+#     meshtastic-> the existing MeshC simulation node (meshtasticd-c-medre,
+#                  TCP 4403), i.e. the same sim endpoint the `normal` profile
+#                  uses. It keeps the mixed-transport surface available for
+#                  the next phase.
+# - NO matrix adapter and NO lxmf adapter: this profile qualifies the
+#   MEDRE<->openHop protocol path, not Matrix rooms. The openHop MEDRE image
+#   therefore does not even ship those adapter distributions.
+# - ROUTES ARE DISABLED BY DEFAULT. The route block below is present so the
+#   shape is documented and the wiring is one edit away, but `enabled: false`
+#   keeps the qualifier from moving traffic. Enabling a route is an explicit
+#   operator act with the evidence boundary in mind: a MEDRE adapter
+#   connection proves the protocol handshake, NOT delivery.
+# - The companion accepts one client at a time. The medre-openhop service is
+#   therefore the ONLY client of the companion while it runs; the qualifier's
+#   dedicated probe runs only while MEDRE is stopped.
+# =============================================================================
+
+runtime:
+  name: medre-lab-medre-openhop
+  shutdown_timeout_seconds: 30
+
+logging:
+  level: DEBUG # bring-up visibility; medre log surfaces on container stdout
+  format: text
+
+storage:
+  backend: sqlite
+  path: "{state}/medre.sqlite" # MEDRE_HOME=/data -> /data/state/medre.sqlite
+
+adapters:
+  # ---------------------------------------------------------------------------
+  # The link under qualification: MEDRE's MeshCore adapter (pinned
+  # medre-adapter-meshcore 0.2.0 + upstream meshcore 2.3.15 SDK) against the
+  # openHop repeater's companion.
+  #
+  # `connection_type: tcp` with the companion's TCP port. The companion is
+  # reached by compose service name on the private `openhop` network; the
+  # port is never published to the host.
+  # ---------------------------------------------------------------------------
+  meshcore:
+    openhop-companion:
+      enabled: true
+      adapter_kind: real
+      connection_type: tcp
+      host: "openhop-repeater"
+      port: 5000
+      origin_label: "OpenHopLab"
+      default_channel: 0
+      message_delay_seconds: 0.5
+      relay_prefix: "[{sender}/{origin_label}]: "
+
+  # ---------------------------------------------------------------------------
+  # The existing MeshC simulation endpoint, unchanged from the `normal`
+  # profile's channel identity (index 0 primary, index 2 secondary).
+  # ---------------------------------------------------------------------------
+  meshtastic:
+    radio-c:
+      enabled: true
+      adapter_kind: real
+      connection_type: tcp
+      host: "meshtasticd-c-medre"
+      port: 4403
+      origin_label: "GammaLab"
+      relay_prefix: "{sender_short}: "
+      channel_mapping:
+        "0": "LabPrimC"
+        "2": "LabSecC"
+
+# Routes are DISABLED by default: this profile qualifies the protocol
+# handshake, not delivery. The shape is documented so enabling it is a
+# single explicit edit.
+routes:
+  openhop-companion:
+    source_adapters: ["openhop-companion"]
+    dest_adapters: ["radio-c"]
+    directionality: bidirectional
+    enabled: false
