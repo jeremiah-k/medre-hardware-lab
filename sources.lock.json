@@ -21,11 +21,11 @@
   },
   "medre-openhop": {
     "url": "https://github.com/jeremiah-k/medre.git",
-    "ref": "b4d833cdddb923112de53afee4c692feae1aa42c"
+    "ref": "60f79a4797b86dfbf785ca2809329ce933a1aa12"
   },
   "medre-adapter-meshcore": {
     "url": "https://github.com/jeremiah-k/medre-adapter-meshcore.git",
-    "ref": "17c6ee2e7051896bb6e5f3f795ce06d39407a86e"
+    "ref": "b09cdbb55a585be10e05e4fe7d15d8099b20f2cd"
   },
   "medre-adapter-meshtastic-openhop": {
     "url": "https://github.com/jeremiah-k/medre-adapter-meshtastic.git",
