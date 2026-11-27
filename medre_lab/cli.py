@@ -369,6 +369,20 @@ def main(argv=None):
     preset_save.add_argument(
         "--force", action="store_true", help="overwrite an existing preset of this name"
     )
+    preset_load = preset.add_parser(
+        "load", help="switch the rig to a preset's recorded configuration"
+    )
+    preset_load.add_argument("name")
+    preset_load.add_argument(
+        "--up",
+        action="store_true",
+        help="bring the preset's recorded topology up after loading",
+    )
+    preset_load.add_argument(
+        "--force",
+        action="store_true",
+        help="discard the current pin set even when no saved preset records it",
+    )
     sources = commands.add_parser("sources").add_subparsers(
         dest="action", required=True
     )
@@ -471,7 +485,11 @@ def main(argv=None):
                 return presets.list_presets(root)
             if args.action == "show":
                 return presets.show_preset(root, args.name)
-            return presets.save_preset(root, args.name, args.description, args.force)
+            if args.action == "save":
+                return presets.save_preset(
+                    root, args.name, args.description, args.force
+                )
+            return presets.load_preset(root, args.name, up=args.up, force=args.force)
         if args.command == "hardware":
             if args.action == "run":
                 return hardware(root, config, args.pair, args.role, args.run_root)
@@ -520,15 +538,10 @@ def main(argv=None):
         rig.assert_no_other_rig(root)
         if args.action == "up":
             command = ["bash", "lab/up.sh"]
-            if args.profile != "base":
-                command += [
-                    {
-                        "normal": "--normal",
-                        "stress": "--with-medre",
-                        "openhop": "--openhop",
-                        "openhop-radio": "--openhop-radio",
-                    }[args.profile]
-                ]
+            # One topology-to-flag map for docker up and preset load.
+            from .presets import UP_FLAGS
+
+            command += list(UP_FLAGS[args.profile])
             if args.skip_build:
                 command += ["--skip-build"]
         else:

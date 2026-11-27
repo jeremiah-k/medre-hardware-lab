@@ -28,7 +28,9 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
 from . import docker as rig
@@ -323,3 +325,90 @@ def show_preset(root: Path, name: str) -> int:
     """Print one preset's recorded choices, exactly as committed."""
     print(json.dumps(read_preset(root, name), indent=2))
     return 0
+
+
+def load_preset(root: Path, name: str, *, up: bool = False, force: bool = False) -> int:
+    """Switch the rig to a preset's recorded configuration.
+
+    The pins come from the preset; everything else regenerates from them.
+    If the current lock's pin set differs from the target preset AND
+    matches no saved preset's pin set, the switch is refused: the current
+    configuration is not in the library, so switching would silently
+    discard it. --force overrides that guard. The lock is rewritten from
+    the preset only when its pin mapping actually differs (identical pins
+    leave the committed bytes alone), then ``sources fetch`` clones any
+    missing checkouts at the pins, ``docker prepare`` regenerates the
+    derived files, and every checkout HEAD is verified against its pin --
+    loudly, naming every mismatch. With --up the recorded topology is
+    brought up through the existing docker-up path; running suites stays
+    the existing commands and is deliberately not part of load.
+    """
+    preset = read_preset(root, name)
+    pins = preset["sources"]
+    current = rig.lock(root)
+    if pins != current and not force:
+        if not any(saved["sources"] == current for saved in load_library(root)):
+            raise ValueError(
+                "the current sources.lock.json pin set matches no saved "
+                "preset; save it first (medre-lab preset save NAME) or "
+                "pass --force to discard it"
+            )
+    lock_changed = pins != current
+    if lock_changed:
+        (Path(root) / "sources.lock.json").write_text(
+            json.dumps(pins, indent=2) + "\n", encoding="utf-8"
+        )
+    rig.fetch(root)
+    verify_checkouts(root, pins)
+    print(
+        json.dumps(
+            {
+                "loaded": name,
+                "topology": preset["topology"],
+                "suite": preset["suite"],
+                "lock_changed": lock_changed,
+                "verified_pins": len(pins),
+            }
+        )
+    )
+    if up:
+        return bring_up(root, preset["topology"])
+    return 0
+
+
+def verify_checkouts(root: Path, pins: dict) -> None:
+    """Every seeded checkout's HEAD must equal its pin (all mismatches)."""
+    mismatches = []
+    for name, entry in pins.items():
+        checkout = Path(root) / "sources" / name
+        if not (checkout / ".git").exists():
+            mismatches.append(f"{name}: checkout missing under sources/")
+            continue
+        head = subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        if head.returncode != 0:
+            mismatches.append(
+                f"{name}: not a usable git checkout ({head.stderr.strip()})"
+            )
+        elif head.stdout.strip() != entry["ref"]:
+            mismatches.append(
+                f"{name}: HEAD {head.stdout.strip()[:12]} differs from pin "
+                f"{entry['ref']}; the lab never resets existing checkouts"
+            )
+    if mismatches:
+        raise ValueError(
+            "checkout verification failed against the preset pins:\n  "
+            + "\n  ".join(mismatches)
+        )
+
+
+def bring_up(root: Path, topology: str) -> int:
+    """Bring a topology up through the existing docker-up path."""
+    rig.assert_no_other_rig(root)
+    env = {**os.environ, **rig.prepare(root)}
+    command = ["bash", "lab/up.sh", *UP_FLAGS[topology]]
+    print(f"Bringing up the {topology} topology: {' '.join(command)}")
+    return subprocess.call(command, cwd=root, env=env)

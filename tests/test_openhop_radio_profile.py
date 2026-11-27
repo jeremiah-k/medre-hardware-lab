@@ -274,7 +274,12 @@ def test_bring_up_exposes_the_radio_profile():
     assert "openhop-radio" in up
     cli = (ROOT / "medre_lab" / "cli.py").read_text()
     assert '"openhop-radio"' in cli
-    assert '"openhop-radio": "--openhop-radio"' in cli
+    # The topology-to-flag map lives ONCE, in medre_lab.presets.UP_FLAGS,
+    # shared by docker up and preset load.
+    assert "UP_FLAGS" in cli
+    from medre_lab.presets import UP_FLAGS
+
+    assert UP_FLAGS["openhop-radio"] == ("--openhop-radio",)
 
 
 def test_radio_profile_is_mutually_exclusive_with_the_other_rigs():

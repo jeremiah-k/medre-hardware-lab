@@ -1,12 +1,15 @@
-"""Tests for the preset CLI actions: save, list, show (load has its own).
+"""Tests for the preset CLI actions: save, list, show and load.
 
 save records the LIVE configuration -- the lock's pins, the topology the
 last bring-up actually ran (from lab/state/last-bringup.json), and the
 suite that topology runs by default -- and refuses anything that would
-record a pairing that never ran. The fixtures are temporary lab roots:
-a real lock, a stub compose.yaml, a stub runner, and the real
-qualification driver copied in (its stage list is derived, never
-hardcoded).
+record a pairing that never ran. load switches the lock to a preset's
+pins and verifies every checkout HEAD against them. The fixtures are
+temporary lab roots: a real lock, a stub compose.yaml, a stub runner, and
+the real qualification driver copied in (its stage list is derived, never
+hardcoded). The load tests use fabricated local source repositories whose
+HEADs ARE the pins, with a fetch stub that mirrors rig.fetch's clone
+behavior minus the network.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from medre_lab import docker as rig
 from medre_lab import presets
 from medre_lab.cli import main
 
@@ -32,17 +36,23 @@ assert _spec and _spec.loader
 last_bringup = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(last_bringup)
 
+GIT_IDENTITY = ("-c", "user.name=Lab Test", "-c", "user.email=lab@example.invalid")
+
 
 def build_lab_root(tmp_path: Path) -> Path:
     root = tmp_path / "labroot"
     (root / "lab/state").mkdir(parents=True)
     (root / "lab/presets").mkdir(parents=True)
     (root / "lab/tools").mkdir()
+    (root / "lab/config").mkdir()
     (root / "sources.lock.json").write_bytes((ROOT / "sources.lock.json").read_bytes())
     (root / "compose.yaml").write_text("")
     (root / "lab/run-scenarios.sh").write_text("")
     for name in ("openhop_qualify.py", "openhop_config_access.py"):
         shutil.copyfile(ROOT / "lab/tools" / name, root / "lab/tools" / name)
+    shutil.copyfile(
+        ROOT / "lab/check_source_mounts.py", root / "lab/check_source_mounts.py"
+    )
     return root
 
 
@@ -179,3 +189,193 @@ def test_cli_reports_refusals_as_failures(tmp_path: Path, capsys):
     root = build_lab_root(tmp_path)
     assert main(["--root", str(root), "preset", "save", "mybase"]) == 2
     assert "no last-bringup record" in capsys.readouterr().err
+
+
+# --- load ----------------------------------------------------------------------
+
+
+def run_git(repo: Path, *args: str) -> str:
+    return subprocess.check_output(
+        ["git", "-C", str(repo), *GIT_IDENTITY, *args],
+        text=True,
+        stderr=subprocess.STDOUT,
+    ).strip()
+
+
+def make_source_repo(path: Path) -> str:
+    """A tiny checkout whose module files satisfy lab/check_source_mounts."""
+    path.mkdir(parents=True)
+    run_git(path, "init", "-q", "-b", "main")
+    for key, info in rig.SOURCES.items():
+        file = path / info[1]
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(f"# {key}\n", encoding="utf-8")
+    run_git(path, "add", "-A")
+    run_git(path, "commit", "-q", "-m", "module files")
+    return run_git(path, "rev-parse", "HEAD").strip()
+
+
+def make_fake_pins(repos: Path) -> dict:
+    """Ten pins whose SHAs are real commits of local repositories."""
+    pins = {}
+    for key in rig.SOURCES:
+        head = make_source_repo(repos / key)
+        pins[key] = {"url": f"https://github.com/fake/{key}.git", "ref": head}
+    return pins
+
+
+def write_preset(root: Path, name: str, topology: str, pins: dict, suite: list) -> None:
+    data = {
+        "name": name,
+        "description": f"the {name} test preset",
+        "topology": topology,
+        "sources": pins,
+        "suite": suite,
+    }
+    (root / "lab/presets" / f"{name}.json").write_text(
+        json.dumps(data, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def stub_fetch(root: Path, repos: Path):
+    """rig.fetch minus the network: clone the pinned commits locally."""
+
+    def fetch(target_root):
+        pins = json.loads((Path(target_root) / "sources.lock.json").read_text())
+        for name, entry in pins.items():
+            checkout = Path(target_root) / "sources" / name
+            if checkout.exists():
+                continue  # existing checkouts are never reset
+            subprocess.check_call(
+                ["git", "clone", "-q", str(repos / name), str(checkout)]
+            )
+            subprocess.check_call(
+                ["git", "-C", str(checkout), "checkout", "-q", "--detach", entry["ref"]]
+            )
+        rig.prepare(target_root)
+
+    return fetch
+
+
+def test_verify_checkouts_accepts_pins_and_names_every_mismatch(tmp_path: Path):
+    repos = tmp_path / "repos"
+    pins = make_fake_pins(repos)
+    checkout = tmp_path / "sources" / "medre"
+    subprocess.check_call(["git", "clone", "-q", str(repos / "medre"), str(checkout)])
+    good = dict(pins)
+    good["medre"] = {
+        "url": pins["medre"]["url"],
+        "ref": run_git(checkout, "rev-parse", "HEAD"),
+    }
+    presets.verify_checkouts(tmp_path, {"medre": good["medre"]})  # no raise
+    bad = dict(pins)
+    bad["medre"] = {"url": pins["medre"]["url"], "ref": "a" * 40}
+    bad["mmrelay"] = {"url": pins["mmrelay"]["url"], "ref": "b" * 40}
+    with pytest.raises(ValueError, match="differs from pin") as excinfo:
+        presets.verify_checkouts(tmp_path, bad)
+    assert "medre" in str(excinfo.value) and "mmrelay" in str(excinfo.value)
+    with pytest.raises(ValueError, match="missing"):
+        presets.verify_checkouts(tmp_path, {k: pins[k] for k in ("openhop-core",)})
+
+
+def test_load_refuses_unrecorded_pins_and_proceeds_through_membership(
+    tmp_path, monkeypatch, capsys
+):
+    repos = tmp_path / "repos"
+    fake_pins = make_fake_pins(repos)
+    root = build_lab_root(tmp_path)
+    write_preset(root, "fake", "base", fake_pins, ["scenarios"])
+    # The live lock (the real pins) matches no saved preset -> refused.
+    with pytest.raises(ValueError, match="matches no saved preset"):
+        presets.load_preset(root, "fake")
+    assert json.loads((root / "sources.lock.json").read_text())["medre"]["ref"] == (
+        json.loads((ROOT / "sources.lock.json").read_text())["medre"]["ref"]
+    )
+    # Recording the live configuration makes the switch legitimate.
+    record_bringup(root, "base", [])
+    assert presets.save_preset(root, "live-state", None, False) == 0
+    monkeypatch.setattr(presets.rig, "fetch", stub_fetch(root, repos))
+    assert presets.load_preset(root, "fake") == 0
+    assert json.loads((root / "sources.lock.json").read_text()) == fake_pins
+    for key in rig.SOURCES:
+        head = subprocess.check_output(
+            ["git", "-C", str(root / "sources" / key), "rev-parse", "HEAD"], text=True
+        ).strip()
+        assert head == fake_pins[key]["ref"]
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["lock_changed"] is True and summary["verified_pins"] == 10
+
+
+def test_load_is_idempotent_when_pins_already_match(tmp_path, monkeypatch, capsys):
+    repos = tmp_path / "repos"
+    fake_pins = make_fake_pins(repos)
+    root = build_lab_root(tmp_path)
+    write_preset(root, "fake", "base", fake_pins, ["scenarios"])
+    (root / "sources.lock.json").write_text(json.dumps(fake_pins, indent=2) + "\n")
+    record_bringup(root, "base", [])
+    presets.save_preset(root, "same-pins", None, False)
+    monkeypatch.setattr(presets.rig, "fetch", stub_fetch(root, repos))
+    assert presets.load_preset(root, "fake") == 0
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["lock_changed"] is False
+    assert (root / "sources.lock.json").read_text() == json.dumps(
+        fake_pins, indent=2
+    ) + "\n"
+
+
+def test_load_force_discards_unrecorded_pins(tmp_path, monkeypatch):
+    repos = tmp_path / "repos"
+    fake_pins = make_fake_pins(repos)
+    root = build_lab_root(tmp_path)
+    write_preset(root, "fake", "base", fake_pins, ["scenarios"])
+    monkeypatch.setattr(presets.rig, "fetch", stub_fetch(root, repos))
+    assert presets.load_preset(root, "fake", force=True) == 0
+    assert json.loads((root / "sources.lock.json").read_text()) == fake_pins
+
+
+def test_bring_up_runs_the_existing_docker_up_path(tmp_path, monkeypatch):
+    root = build_lab_root(tmp_path)
+    commands = []
+    monkeypatch.setattr(presets.rig, "assert_no_other_rig", lambda target: None)
+    monkeypatch.setattr(
+        presets.rig, "prepare", lambda target: {"LAB_ROOT": str(target)}
+    )
+    monkeypatch.setattr(
+        presets.subprocess, "call", lambda argv, **kw: commands.append(argv) or 0
+    )
+    assert presets.bring_up(root, "base") == 0
+    assert presets.bring_up(root, "openhop") == 0
+    assert presets.bring_up(root, "openhop-radio") == 0
+    assert commands == [
+        ["bash", "lab/up.sh"],
+        ["bash", "lab/up.sh", "--openhop"],
+        ["bash", "lab/up.sh", "--openhop-radio"],
+    ]
+
+
+def test_cli_docker_up_uses_the_same_topology_map(tmp_path, monkeypatch):
+    root = build_lab_root(tmp_path)
+    commands = []
+    monkeypatch.setattr(rig, "assert_no_other_rig", lambda target: None)
+    monkeypatch.setattr(rig, "prepare", lambda target: {"LAB_ROOT": str(target)})
+    monkeypatch.setattr(
+        "medre_lab.cli.subprocess.call", lambda argv, **kw: commands.append(argv) or 0
+    )
+    assert main(["--root", str(root), "docker", "up", "--profile", "base"]) == 0
+    assert main(["--root", str(root), "docker", "up", "--profile", "stress"]) == 0
+    assert commands == [["bash", "lab/up.sh"], ["bash", "lab/up.sh", "--with-medre"]]
+
+
+def test_cli_load_wiring_refuses_and_loads(tmp_path, monkeypatch, capsys):
+    repos = tmp_path / "repos"
+    fake_pins = make_fake_pins(repos)
+    root = build_lab_root(tmp_path)
+    write_preset(root, "fake", "base", fake_pins, ["scenarios"])
+    assert main(["--root", str(root), "preset", "load", "fake"]) == 2
+    assert "matches no saved preset" in capsys.readouterr().err
+    record_bringup(root, "base", [])
+    assert presets.save_preset(root, "live-state", None, False) == 0
+    monkeypatch.setattr(presets.rig, "fetch", stub_fetch(root, repos))
+    assert main(["--root", str(root), "preset", "load", "fake"]) == 0
+    capsys.readouterr()
+    assert json.loads((root / "sources.lock.json").read_text()) == fake_pins
