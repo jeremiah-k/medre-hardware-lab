@@ -65,11 +65,14 @@ The matrix
                    duplicates.
   selective_drop   the PER-CONNECTION worst case the spec bounds: a link
                    that answers the probes and swallows the message
-                   frames.  Its verdict asserts the documented bound - at
-                   most one consumed message per answered liveness probe
-                   beyond the unproven first fetch, every other accepted
-                   message delivered or preserved, zero duplicates - and
-                   reports the consumed count.
+                   frames.  Its verdict asserts the documented bound per
+                   connection - at most one consumed message per answered
+                   liveness probe on that connection beyond the unproven
+                   first fetch, every other accepted message delivered or
+                   preserved, zero duplicates - and PROVES the shape: the
+                   splice's own connection identity must attribute an
+                   answered probe and a lost frame to the SAME connection,
+                   not merely report aggregate counts.
   idle_blackhole   BOTH directions of an up, idle link are blackholed
                    (no close, armed by writing the splice's fault file):
                    the idle-link probe must retire the connection within
@@ -206,6 +209,63 @@ def wall_timestamp(value: object) -> float | None:
 def nonce_index(text: str) -> int | None:
     match = NONCE_INDEX.search(str(text or ""))
     return int(match.group("index")) if match else None
+
+
+def splice_stall_events(proxy_log: str) -> list[tuple[float, int]]:
+    """Return (timestamp, connection) for every stall the splice logged.
+
+    The splice logs one JSON line per per-connection budget exhaustion
+    (``{"event": "stalled", "connection": N}``), and ``docker logs -t``
+    prefixes each line with the host's UTC time.  These events are the
+    splice's own connection identity: the boundaries that attribute
+    MEDRE's answered probes and the lost frames to the connection they
+    belonged to, instead of counting aggregates over the whole run.
+    """
+    events: list[tuple[float, int]] = []
+    for line in proxy_log.splitlines():
+        start = line.find("{")
+        if start < 0:
+            continue
+        stamp = line_time(line)
+        if stamp is None:
+            continue
+        try:
+            payload = json.loads(line[start:])
+        except ValueError:
+            continue
+        if payload.get("event") == "stalled" and isinstance(
+            payload.get("connection"), int
+        ):
+            events.append((stamp, payload["connection"]))
+    return sorted(events)
+
+
+def connection_of(stamp: float, stalls: list[tuple[float, int]]) -> int | None:
+    """Return the splice connection a timestamp belongs to, or None.
+
+    Connection N forwards its first chunks - so probes are ANSWERED on it -
+    until its own budget exhausts at its stall event; only then does the
+    client retire and hand over to the next connection.  A stamp is
+    therefore attributed to the connection of the FIRST stall event at or
+    after it.  A stamp after the last stall belongs to a connection the
+    splice never recorded stalling and cannot be attributed.
+    """
+    for stall_stamp, connection in stalls:
+        if stamp <= stall_stamp:
+            return connection
+    return None
+
+
+def per_connection_counts(
+    stamps: list[float], stalls: list[tuple[float, int]]
+) -> dict[int, int]:
+    """Count the timestamps per attributed splice connection."""
+    counts: dict[int, int] = {}
+    for stamp in stamps:
+        connection = connection_of(stamp, stalls)
+        if connection is not None:
+            counts[connection] = counts.get(connection, 0) + 1
+    return counts
 
 
 def nonce_marker(text: str) -> str | None:
@@ -489,7 +549,10 @@ def selective_drop_failures(
     delivered_distinct: int,
     preserved_distinct: int,
     duplicate_wakes: int,
-    answered_probes: int,
+    consumed_per_connection: dict[int, int],
+    answered_per_connection: dict[int, int],
+    unattributed_consumed: int,
+    same_connection_proven: bool,
 ) -> list[str]:
     """Judge the per-connection worst case by the spec's documented bound.
 
@@ -501,32 +564,53 @@ def selective_drop_failures(
     exactly one more fetch - the spec bounds the damage at one queued
     message per probe interval, plus the one unproven fetch a fresh
     connection may spend before its first probe - and this verdict
-    asserts that bound instead of zero loss:
+    asserts that bound PER CONNECTION, attributed by the splice's own
+    connection identity, instead of zero loss:
 
     * zero duplicates anywhere in the run;
-    * the consumed count (accepted, less what is delivered or still
-      preserved at the companion) must stay within one message per
-      answered liveness probe beyond the unproven first fetch, and is
-      reported per run;
+    * the proof requires ONE connection with both an answered liveness
+      probe and a lost message frame attributed to it - aggregate counts
+      alone do not prove the selective drop, and without that
+      attribution the case is not a pass;
+    * every connection that lost frames stays within its own bound of
+      one consumed message per answered probe on that same connection
+      beyond the unproven first fetch, and the counts are reported per
+      connection;
+    * a lost frame that cannot be attributed to a connection the splice
+      recorded is a refusal, not a pass;
     * every other accepted message is delivered or still preserved.
     """
-    consumed = accepted - delivered_distinct - preserved_distinct
-    bound = 1 + max(0, answered_probes)
+    consumed = sum(consumed_per_connection.values()) + unattributed_consumed
     failures: list[str] = []
     if duplicate_wakes:
         failures.append(f"{duplicate_wakes} duplicate wake(s) reached MEDRE's store")
-    if consumed < 0:
+    if consumed < 0 or delivered_distinct + preserved_distinct > accepted:
         failures.append(
             f"{delivered_distinct} delivered + {preserved_distinct} preserved "
             f"exceeds the {accepted} accepted messages"
         )
-    elif consumed > bound:
+    if unattributed_consumed:
         failures.append(
-            f"{consumed} message(s) were consumed into the selective drop, "
-            f"more than the documented bound of one per answered probe "
-            f"beyond the unproven first fetch "
-            f"({answered_probes} answered probe(s), bound {bound})"
+            f"{unattributed_consumed} lost message(s) could not be attributed "
+            "to any connection the splice recorded stalling"
         )
+    if not same_connection_proven:
+        failures.append(
+            "no connection had both an answered liveness probe and a lost "
+            "message frame attributed to it: the per-connection attribution "
+            "does not prove the selective drop"
+        )
+    for connection, consumed_on_connection in sorted(consumed_per_connection.items()):
+        answered_on_connection = answered_per_connection.get(connection, 0)
+        bound = 1 + max(0, answered_on_connection)
+        if consumed_on_connection > bound:
+            failures.append(
+                f"connection {connection} lost {consumed_on_connection} "
+                f"message(s), more than the documented bound of one per "
+                f"answered probe beyond the unproven first fetch on that "
+                f"same connection ({answered_on_connection} answered "
+                f"probe(s), bound {bound})"
+            )
     return failures
 
 
@@ -847,23 +931,82 @@ class FaultMatrix:
                 if marker is not None and marker in mine
             ]
             preserved = len(set(persisted_indices))
+            connection_evidence: dict = {}
             if verdict == "bounded":
-                answered_probes = len(ANSWERED_PROBE.findall(log))
+                # Per-connection attribution: the splice's own stall events
+                # carry the connection identity, so the answered probes and
+                # the lost frames are attributed to the connection they
+                # belonged to instead of being counted as run totals.
+                stalls = splice_stall_events(timestamped_logs(PROXY))
+                stamped_medre_log = timestamped_logs(MEDRE_FAULT)
+                probe_stamps = [
+                    stamp
+                    for line in stamped_medre_log.splitlines()
+                    if ANSWERED_PROBE.search(line)
+                    and (stamp := line_time(line)) is not None
+                ]
+                answered_per_connection = per_connection_counts(probe_stamps, stalls)
+                send_stamps: dict[str, float] = {}
+                for entry in send.get("sends") or []:
+                    marker = nonce_marker(entry.get("nonce") or "")
+                    stamp = wall_timestamp(entry.get("finished_at"))
+                    if marker is not None and stamp is not None:
+                        send_stamps[marker] = stamp
+                consumed_per_connection: dict[int, int] = {}
+                unattributed_consumed = 0
+                for marker in mine - set(indices) - set(persisted_indices):
+                    stamp = send_stamps.get(marker)
+                    connection = (
+                        connection_of(stamp, stalls) if stamp is not None else None
+                    )
+                    if connection is None:
+                        unattributed_consumed += 1
+                    else:
+                        consumed_per_connection[connection] = (
+                            consumed_per_connection.get(connection, 0) + 1
+                        )
+                same_connection_proven = any(
+                    consumed_on_connection > 0
+                    and answered_per_connection.get(connection, 0) > 0
+                    for connection, consumed_on_connection in (
+                        consumed_per_connection.items()
+                    )
+                )
                 failures = selective_drop_failures(
                     accepted=int(send.get("accepted_count") or 0),
                     delivered_distinct=distinct,
                     preserved_distinct=preserved,
                     duplicate_wakes=duplicates,
-                    answered_probes=answered_probes,
+                    consumed_per_connection=consumed_per_connection,
+                    answered_per_connection=answered_per_connection,
+                    unattributed_consumed=unattributed_consumed,
+                    same_connection_proven=same_connection_proven,
                 )
+                connection_evidence = {
+                    "splice_stall_events": [
+                        {
+                            "connection": connection,
+                            "stalled_at": time.strftime(
+                                "%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(stall_stamp)
+                            ),
+                        }
+                        for stall_stamp, connection in stalls
+                    ],
+                    "answered_probes_per_connection": answered_per_connection,
+                    "consumed_per_connection": consumed_per_connection,
+                    "unattributed_consumed": unattributed_consumed,
+                    "same_connection_proof": same_connection_proven,
+                }
                 verdict_rule = (
                     "selective-drop verdict (the documented worst case): a link "
                     "that answers the probes and swallows the message frames "
                     "consumes at most one queued message per answered liveness "
-                    "probe beyond the unproven first fetch; the consumed count "
-                    "is reported per run; every other accepted message is "
-                    "delivered or still preserved at the companion; zero "
-                    "duplicates"
+                    "probe beyond the unproven first fetch, PER CONNECTION - "
+                    "the splice's own connection identity attributes each "
+                    "answered probe and each lost frame to the connection it "
+                    "belonged to, and the proof requires one connection with "
+                    "both; every other accepted message is delivered or still "
+                    "preserved at the companion; zero duplicates"
                 )
             else:
                 failures = fault_case_failures(
@@ -900,6 +1043,7 @@ class FaultMatrix:
                         if verdict == "bounded"
                         else None
                     ),
+                    **connection_evidence,
                     "arrivals_at_medre": len(indices),
                     "distinct_at_medre": distinct,
                     "duplicate_wakes": duplicates,

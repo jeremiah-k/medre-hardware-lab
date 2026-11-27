@@ -133,13 +133,20 @@ def test_a_missing_post_window_reconnect_fails():
 
 
 def judge_bounded(**overrides):
-    """Run the selective-drop verdict with the documented bound met."""
+    """Run the selective-drop verdict with the documented bound met.
+
+    The synthetic run: connection 3 answered one probe and lost one
+    frame - the same-connection proof the verdict now requires.
+    """
     kwargs = {
         "accepted": 6,
         "delivered_distinct": 1,
         "preserved_distinct": 3,
         "duplicate_wakes": 0,
-        "answered_probes": 1,
+        "consumed_per_connection": {3: 2},
+        "answered_per_connection": {3: 1},
+        "unattributed_consumed": 0,
+        "same_connection_proven": True,
     }
     kwargs.update(overrides)
     return fault_matrix.selective_drop_failures(**kwargs)
@@ -147,27 +154,38 @@ def judge_bounded(**overrides):
 
 def test_consumption_within_the_documented_bound_passes():
     """One consumed message per answered probe is the spec's bound."""
-    # consumed = 6 - 1 - 3 = 2 <= 1 + 1 answered probe.
+    # consumed on connection 3 = 2 <= 1 + 1 answered probe on it.
     assert judge_bounded() == []
     assert judge_bounded(delivered_distinct=2, preserved_distinct=4) == []
 
 
 def test_the_consumed_count_is_reported_not_hidden():
     """A passing run still reports what the link ate; the evidence does."""
-    # The verdict passes at the bound; the consumed count is computed by
-    # the case as accepted - delivered - preserved and written to evidence.
+    # The verdict passes at the bound; the per-connection consumed counts
+    # are written to evidence by the case.
     assert judge_bounded() == []
 
 
 def test_consumption_beyond_the_bound_fails():
     failures = judge_bounded(
-        delivered_distinct=0, preserved_distinct=0, answered_probes=1
+        delivered_distinct=0,
+        preserved_distinct=0,
+        consumed_per_connection={3: 2},
+        answered_per_connection={3: 0},
     )
     assert any("more than the documented bound" in failure for failure in failures)
 
 
-def test_zero_consumption_passes_the_bounded_case():
-    assert judge_bounded(delivered_distinct=6, preserved_distinct=0) == []
+def test_zero_consumption_fails_the_bounded_case_without_the_proof():
+    """Nothing lost means the selective drop was not exercised."""
+    failures = judge_bounded(
+        delivered_distinct=6,
+        preserved_distinct=0,
+        consumed_per_connection={},
+        answered_per_connection={3: 1},
+        same_connection_proven=False,
+    )
+    assert any("does not prove the selective drop" in failure for failure in failures)
 
 
 def test_a_duplicate_wake_fails_the_bounded_case():
@@ -178,6 +196,84 @@ def test_a_duplicate_wake_fails_the_bounded_case():
 def test_an_impossible_accounting_fails_the_bounded_case():
     failures = judge_bounded(delivered_distinct=6, preserved_distinct=2)
     assert any("exceeds the 6 accepted" in failure for failure in failures)
+
+
+def test_aggregate_counts_without_attribution_fail_the_bounded_case():
+    """Answered probes and lost frames must share a connection."""
+    failures = judge_bounded(
+        consumed_per_connection={3: 1, 5: 1},
+        answered_per_connection={3: 0, 5: 1},
+        same_connection_proven=False,
+    )
+    assert any("does not prove the selective drop" in failure for failure in failures)
+
+
+def test_a_connection_both_probe_answered_and_frame_lost_proves_the_drop():
+    assert (
+        judge_bounded(
+            consumed_per_connection={3: 1, 5: 1},
+            answered_per_connection={3: 0, 5: 1},
+            same_connection_proven=True,
+        )
+        == []
+    )
+
+
+def test_an_unattributable_lost_frame_fails_the_bounded_case():
+    failures = judge_bounded(unattributed_consumed=1)
+    assert any("could not be attributed" in failure for failure in failures)
+
+
+def test_the_per_connection_bound_uses_that_connections_probes():
+    """Connection 5's answered probes cannot cover connection 3's loss."""
+    failures = judge_bounded(
+        consumed_per_connection={3: 2, 5: 1},
+        answered_per_connection={3: 0, 5: 2},
+    )
+    assert any("connection 3 lost 2" in failure for failure in failures)
+    assert not any("connection 5" in failure for failure in failures)
+
+
+def test_splice_stall_events_carry_the_connection_identity():
+    log = "\n".join(
+        [
+            "2026-11-26T18:00:00.000000000Z other log line",
+            '2026-11-26T18:00:01.000000000Z {"event": "listening"}',
+            '2026-11-26T18:00:02.000000000Z {"event": "stalled", "connection": 1}',
+            '2026-11-26T18:00:40.000000000Z {"event": "stalled", "connection": 2}',
+        ]
+    )
+    events = fault_matrix.splice_stall_events(log)
+    assert len(events) == 2
+    assert events[0][1] == 1 and events[1][1] == 2
+    assert events[0][0] < events[1][0]
+
+
+def test_connection_attribution_follows_the_stall_boundaries():
+    events = fault_matrix.splice_stall_events(
+        "\n".join(
+            [
+                '2026-11-26T18:00:02.000000Z {"event": "stalled", "connection": 1}',
+                '2026-11-26T18:00:40.000000Z {"event": "stalled", "connection": 2}',
+            ]
+        )
+    )
+    of = lambda stamp: fault_matrix.connection_of(stamp, events)  # noqa: E731
+    assert of(0.0) == 1  # before the first stall: connection 1's live phase
+    assert of(events[0][0]) == 1
+    assert of(events[0][0] + 1) == 2  # after connection 1 stalled, client is on 2
+    assert of(events[1][0] + 1) is None  # after the last stall: unattributable
+
+
+def test_per_connection_counts_ignore_unattributable_stamps():
+    events = fault_matrix.splice_stall_events(
+        '2026-11-26T18:00:40.000000Z {"event": "stalled", "connection": 2}'
+    )
+    stall_stamp = events[0][0]
+    counts = fault_matrix.per_connection_counts(
+        [stall_stamp - 1, stall_stamp, stall_stamp + 1], events
+    )
+    assert counts == {2: 2}
 
 
 def judge_drain_stall(**overrides):
