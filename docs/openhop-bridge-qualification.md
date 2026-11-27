@@ -93,6 +93,21 @@ byte-exact: what MEDRE forwards is exactly the canonical body.
 
 ## 2. Run it
 
+Once the pinned checkouts and the workspace are prepared, run the complete
+sequential campaign from the lab checkout:
+
+```bash
+python lab/tools/openhop_qualify.py --evidence-dir lab/logs/openhop-campaign
+```
+
+Add `--skip-build` when the selected images already exist. Supply a fresh
+evidence directory. The command requires the shared lab rig to be down,
+then runs the lifecycle, packet, bridge, backlog, ordering and fault
+stages. It checks each matrix's recorded source selection after all three
+matrices pass and always attempts teardown when it started a rig. Each
+stage has a log and an exit status with elapsed seconds in
+`timeline.jsonl`. A failed stage prevents later qualification stages.
+
 The cold start from a fully-down rig is exactly:
 
 ```bash

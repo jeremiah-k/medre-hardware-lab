@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Run the sequential openHop Docker qualification and record each stage."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+DOWN = ["bash", "lab/down.sh"]
+
+
+def stages(evidence: Path, skip_build: bool):
+    build = ["--skip-build"] if skip_build else []
+    yield "lifecycle-up", ["bash", "lab/up.sh", "--openhop", *build]
+    yield "lifecycle", [
+        "bash",
+        "lab/openhop/lifecycle_check.sh",
+        "--evidence-dir",
+        str(evidence / "phase2-lifecycle"),
+    ]
+    yield "lifecycle-down", DOWN
+    yield "radio-up", ["bash", "lab/up.sh", "--openhop-radio", *build]
+    yield "packet-path", [
+        "bash",
+        "lab/openhop-radio/packet_proof.sh",
+        "--evidence-dir",
+        str(evidence / "radio-packet"),
+    ]
+    yield "radio-down", DOWN
+    yield "bridge-up", ["bash", "lab/openhop-bridge/bridge_up.sh", *build]
+    yield "bridge-proof", [
+        "bash",
+        "lab/openhop-bridge/bridge_proof.sh",
+        "--evidence-dir",
+        str(evidence / "bridge-proof"),
+    ]
+    for matrix in ("backlog", "ordering", "fault"):
+        yield matrix, [
+            sys.executable,
+            f"lab/tools/openhop_{matrix}_matrix.py",
+            "--evidence-dir",
+            str(evidence / matrix),
+        ]
+    for matrix in ("backlog", "ordering", "fault"):
+        yield f"verify-{matrix}", [
+            sys.executable,
+            "lab/tools/openhop_case_summary.py",
+            "--verify-selection",
+            str(evidence / matrix),
+        ]
+    yield "bridge-down", DOWN
+
+
+def assert_rig_down() -> None:
+    if os.environ.get("COMPOSE_PROJECT_NAME", "medre-lab") != "medre-lab":
+        raise ValueError("qualification requires the medre-lab Compose project")
+    for command in (["ps", "-a"], ["network", "ls"]):
+        result = subprocess.run(
+            [
+                "docker",
+                *command,
+                "--format",
+                "{{.Names}}" if command[0] == "ps" else "{{.Name}}",
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if any(name.startswith("medre-lab") for name in result.stdout.splitlines()):
+            raise ValueError("a MEDRE lab rig already exists")
+
+
+def run_command(command: list[str], log) -> int:
+    with subprocess.Popen(
+        command,
+        cwd=ROOT,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    ) as process:
+        try:
+            result = process.wait()
+        except KeyboardInterrupt:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=5)
+            except ProcessLookupError:
+                pass
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            return 130
+    return result if result >= 0 else 128 - result
+
+
+def run_stage(evidence: Path, name: str, command: list[str]) -> int:
+    started = datetime.now(timezone.utc)
+    clock = time.monotonic()
+    print(f"{started.isoformat()} {name}", flush=True)
+    log_path = evidence / f"{name}.log"
+    with log_path.open("x", encoding="utf-8") as log:
+        try:
+            status = run_command(command, log)
+        except OSError as exc:
+            print(exc, file=log)
+            status = 1
+    record = {
+        "stage": name,
+        "started_at": started.isoformat(),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": round(time.monotonic() - clock, 3),
+        "exit_code": status,
+        "log": log_path.name,
+    }
+    with (evidence / "timeline.jsonl").open("a", encoding="utf-8") as timeline:
+        print(json.dumps(record), file=timeline)
+    print(f"{name} exit={status} ({record['elapsed_seconds']:.3f}s)", flush=True)
+    return status
+
+
+def qualify(evidence: Path, *, skip_build: bool) -> int:
+    assert_rig_down()
+    evidence.mkdir(mode=0o700, parents=True)
+    needs_down = False
+    try:
+        for name, command in stages(evidence, skip_build):
+            if name.endswith("-up"):
+                needs_down = True
+            status = run_stage(evidence, name, command)
+            if status:
+                return status
+            if command is DOWN:
+                needs_down = False
+    finally:
+        if needs_down:
+            run_stage(evidence, "cleanup", DOWN)
+    return 0
+
+
+def _interrupt(_signum, _frame) -> None:
+    raise KeyboardInterrupt
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--evidence-dir", required=True, type=Path)
+    parser.add_argument(
+        "--skip-build", action="store_true", help="reuse the selected images"
+    )
+    args = parser.parse_args()
+    previous = signal.signal(signal.SIGTERM, _interrupt)
+    try:
+        return qualify(args.evidence_dir.resolve(), skip_build=args.skip_build)
+    except KeyboardInterrupt:
+        return 130
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"qualification refused: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
