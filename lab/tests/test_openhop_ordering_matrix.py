@@ -325,3 +325,55 @@ def test_case_o1_is_not_run_when_a_newer_row_was_persisted_before_the_drain(
     # The drain still ran, so no rows are left behind.
     assert state["drained"] is True
     assert lock.seconds == 100
+
+
+# ---------------------------------------------------------------------------
+# The o2 flow, offline: the corrected claim holds whichever store the
+# live message is in when the drain begins, so the case neither locks
+# the store nor consults the merge premise - the pre-drain count is
+# recorded as information only.
+# ---------------------------------------------------------------------------
+
+
+def test_case_o2_records_the_live_count_without_a_lock_or_a_premise(
+    tmp_path, monkeypatch
+):
+    backlog_markers = [marker("o2a", i, f"{i:02x}") for i in range(5)]
+    live_marker = marker("o2b", 0, "00")
+    store_order = backlog_markers + [live_marker]
+
+    def queue_rows(needle, drained):
+        if needle == "p4o2a":
+            return backlog_markers
+        if needle == "p4o2b":
+            # The live message sits in the store before the drain, as
+            # the repeater persists it within about a second.
+            return [live_marker]
+        return []
+
+    lock, _ = _stub_rig(monkeypatch, store_order=store_order, queue_rows=queue_rows)
+
+    def forbidden_lock(seconds):
+        raise AssertionError("case_o2 must not lock the repeater's store")
+
+    def forbidden_premise(*args):
+        raise AssertionError("case_o2 must not consult the merge premise")
+
+    monkeypatch.setattr(ordering.backlog, "hold_exclusive_lock", forbidden_lock)
+    monkeypatch.setattr(ordering, "merge_premise_reason", forbidden_premise)
+    matrix = ordering.OrderingMatrix(tmp_path / "ev-o2", "openhop-bridge")
+    matrix.case_o2()
+    path = tmp_path / "ev-o2" / "o2-restart-backlog-then-live.json"
+    record = json.loads(path.read_text())
+    assert record["pass"] is True
+    assert record["failures"] == []
+    assert record["live_persisted_before_drain"] == 1
+    assert "live_persisted_while_store_locked" not in record
+    assert record["block_verdict"]["distinct"] == 6
+    assert record["block_verdict"]["duplicate_arrivals"] == 0
+    arrivals = record["block_verdict"]["arrival_sequence"]
+    assert arrivals[-1]["block"] == "o2b"
+    assert [row["block"] for row in arrivals[:5]] == ["o2a"] * 5
+    assert (
+        "whichever store it is in when the drain begins" in record["ordering_promise"]
+    )
