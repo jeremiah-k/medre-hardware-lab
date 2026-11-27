@@ -57,13 +57,18 @@ The matrix
                    for the rest of the window.  The window then ends and
                    the queued messages must be delivered.
   saturation       a deep backlog waits behind a reply-stall window
-                   sized to the batch (batch x measured peer pacing x
-                   1.5 + 10 s, fallback pacing 2 s/send), so the whole
-                   batch is accepted inside the window by construction:
-                   the designed probe retirements of a link that
-                   answers nothing are expected, nothing may be
-                   consumed, and the whole backlog must be delivered
-                   once the window ends.
+                   CONSTRUCTED to cover the batch: the stall is armed
+                   with a far guard deadline (hang protection only),
+                   the batch is sent, and the stall holds one headroom
+                   interval past the last accepted send before the
+                   window ends, so the whole batch is accepted inside
+                   the window by construction: the designed probe
+                   retirements of a link that answers nothing are
+                   expected, nothing may be consumed, and the whole
+                   backlog must be delivered once the window ends.  The
+                   predicted figure (batch x measured peer pacing x
+                   1.5 + 10 s, fallback pacing 2 s/send) is recorded
+                   for information; the measured window governs.
   reply_stall_drain a TIME WINDOW armed while a backlog drain is in
                    flight: the frame the drain had on the wire when the
                    window opened is swallowed.  At most that one message
@@ -809,27 +814,38 @@ def window_stall_failures(
     return failures
 
 
-# The saturation case's batch and the window it is sized against.  The
-# precondition the window verdict asserts - the whole batch accepted
-# inside the window - holds BY CONSTRUCTION here: the window is the
-# batch's duration at the peer's measured send pacing, times a 1.5
-# safety factor, plus 10 s of headroom.  The fallback pacing covers a
-# standalone saturation run with no preceding measurement on this rig.
+# The saturation case's batch and the window around it.  The window is
+# CONSTRUCTED to cover the batch: the stall is armed with a far guard
+# deadline, and the real window ends one headroom interval past the last
+# accepted send, so the whole batch is accepted inside the window by
+# construction whatever pacing the peer measures.  saturation_window_for
+# keeps deriving the PREDICTED figure (batch x measured pacing x 1.5
+# safety factor + headroom) that the record carries for information; the
+# fallback pacing covers a standalone saturation run with no preceding
+# measurement on this rig.
 SATURATION_BATCH = 60
 SATURATION_PACING_FALLBACK_S = 2.0
 SATURATION_PACING_FACTOR = 1.5
 SATURATION_WINDOW_HEADROOM_S = 10.0
+# The saturation case's stall is armed with this FAR deadline, which only
+# guards against a hang: the real window end is constructed after the
+# batch (one headroom interval past the last accepted send), so the stall
+# covers the batch whatever its measured duration.
+SATURATION_WINDOW_GUARD_S = 3600.0
 
 
 def saturation_window_for(batch: int, measured_pacing_s: float | None) -> float:
-    """Derive the saturation window from the peer's measured send pacing.
+    """Predict the saturation window from the peer's measured send pacing.
 
     The claim is unchanged: a deep backlog builds behind the stalled
     link, the designed probe retirements happen, nothing is consumed
     while the window holds, and the whole backlog is delivered exactly
-    once afterwards.  Only the window's length is derived: the batch's
-    duration at the measured (or fallback 2 s/send) pacing, times a 1.5
-    safety factor, plus 10 s of headroom.
+    once afterwards.  The stall itself is CONSTRUCTED to cover the batch
+    (armed with a far guard deadline, ended one headroom interval past
+    the last accepted send); this function derives the PREDICTED figure
+    the record carries for information: the batch's duration at the
+    measured (or fallback 2 s/send) pacing, times a 1.5 safety factor,
+    plus 10 s of headroom.
     """
     pacing = (
         measured_pacing_s
@@ -1845,6 +1861,7 @@ class FaultMatrix:
         count: int,
         prefix: str,
         window_note: str,
+        constructed_window: bool = False,
     ) -> None:
         """Run one time-window stall case end to end.
 
@@ -1857,6 +1874,17 @@ class FaultMatrix:
         probe of any reconnect inside the window are faulted like any
         other frame.  Phase 3 (T1): the deadline passes and the case
         waits for the reconnect and the delivery of what was queued.
+
+        With ``constructed_window`` the window is CONSTRUCTED to cover
+        the batch instead of predicted from it: the stall is armed with a
+        far deadline that only guards against a hang, the batch is sent,
+        and the stall holds one headroom interval past the last accepted
+        send before the window ends.  ``window_seconds`` then carries the
+        predicted figure (recorded as ``predicted_window_s``), while the
+        record's ``window_seconds`` is the measured arm-to-end span.  The
+        fixed-window cases keep the abort - their window is the subject -
+        but a NOT RUN record then carries the send result, so the pacing
+        facts survive.
         """
         fault_path = None
         try:
@@ -1889,8 +1917,16 @@ class FaultMatrix:
             armed_at = time.time()
             # The window keys carry unix deadlines: the fault is armed now
             # and persists until the deadline passes, across every
-            # connection established inside the window.
-            fault = {key: armed_at + window_seconds for key in window_fault}
+            # connection established inside the window.  A constructed
+            # window arms the far guard deadline instead - the batch is
+            # still in flight when the arm happens, so the real end is
+            # derived from the batch below.
+            arm_deadline = (
+                armed_at + SATURATION_WINDOW_GUARD_S
+                if constructed_window
+                else armed_at + window_seconds
+            )
+            fault = {key: arm_deadline for key in window_fault}
             fault_path = state_dir / "fault.json"
             write_fault(fault_path, fault)
             send = self.peer_send(count, prefix)
@@ -1900,17 +1936,39 @@ class FaultMatrix:
             # The splice itself stops faulting the moment the deadline
             # passes (it re-reads the file per chunk), so the deadline is
             # the authoritative window end even if queueing overran it.
-            window_end = armed_at + window_seconds
-            if any(
-                (stamp := wall_timestamp(entry.get("finished_at"))) is None
-                or stamp >= window_end
-                for entry in send["sends"]
-            ):
-                self.not_run(
-                    name,
-                    "the peer traffic batch did not finish inside the fault window",
-                )
-                return
+            if constructed_window:
+                batch_stamps = [
+                    stamp
+                    for entry in send["sends"]
+                    if (stamp := wall_timestamp(entry.get("finished_at"))) is not None
+                ]
+                if not batch_stamps:
+                    self.not_run(
+                        name,
+                        "no accepted send carried a finished_at stamp; the "
+                        "constructed window has no end to derive",
+                        {"probe": send},
+                    )
+                    return
+                batch_end = max(batch_stamps)
+                batch_seconds = batch_end - armed_at
+                window_end = batch_end + SATURATION_WINDOW_HEADROOM_S
+                measured_window_s = window_end - armed_at
+            else:
+                window_end = armed_at + window_seconds
+                if any(
+                    (stamp := wall_timestamp(entry.get("finished_at"))) is None
+                    or stamp >= window_end
+                    for entry in send["sends"]
+                ):
+                    self.not_run(
+                        name,
+                        "the peer traffic batch did not finish inside the fault "
+                        "window",
+                        {"probe": send},
+                    )
+                    return
+                measured_window_s = window_seconds
             if time.time() < window_end:
                 time.sleep(window_end - time.time())
             write_fault(state_dir / "fault.json", {})
@@ -1993,7 +2051,14 @@ class FaultMatrix:
                     "failures": failures,
                     "fault": {
                         "keys": sorted(window_fault),
-                        "window_seconds": window_seconds,
+                        "window_seconds": measured_window_s,
+                        "constructed_window": constructed_window,
+                        "batch_seconds": (
+                            batch_seconds if constructed_window else None
+                        ),
+                        "predicted_window_s": (
+                            window_seconds if constructed_window else None
+                        ),
                         "persistent_across_connections": True,
                         "note": window_note,
                     },
@@ -2016,7 +2081,11 @@ class FaultMatrix:
                     ),
                     "requested_messages": count,
                     "peer_accepted_sends": accepted,
-                    "window_seconds": window_seconds,
+                    "window_seconds": measured_window_s,
+                    "batch_seconds": batch_seconds if constructed_window else None,
+                    "predicted_window_s": (
+                        window_seconds if constructed_window else None
+                    ),
                     "reconnect_churn": churn,
                     "probe_retirements": len(PROBE_RETIREMENT.findall(log)),
                     "reconnect_attempts_while_armed": attempts_while_armed,
@@ -2063,9 +2132,11 @@ class FaultMatrix:
         )
 
     def case_saturation(self) -> None:
-        """A deep backlog waits behind a reply-stall window sized to the
-        peer's measured send pacing; the whole backlog must come across
-        once the window ends."""
+        """A deep backlog waits behind a reply-stall window CONSTRUCTED to
+        cover the batch: the stall is armed with a far guard deadline, the
+        batch is sent, and the stall holds one headroom interval past the
+        last accepted send before the window ends - the whole backlog must
+        come across once the window ends."""
         window = saturation_window_for(SATURATION_BATCH, self.peer_pacing_s)
         self.run_window_case(
             "fault-saturation",
@@ -2073,11 +2144,15 @@ class FaultMatrix:
             window,
             SATURATION_BATCH,
             "p4qs",
-            f"reply-stall window sized to the batch ({SATURATION_BATCH} "
+            f"reply-stall window CONSTRUCTED to cover the batch: armed with "
+            f"a far guard deadline ({SATURATION_WINDOW_GUARD_S:.0f} s, hang "
+            "protection only), held until one headroom interval past the "
+            f"last accepted send; the predicted figure ({SATURATION_BATCH} "
             f"messages x peer pacing x 1.5 + 10 s = {window:.0f} s; pacing "
             f"fallback {SATURATION_PACING_FALLBACK_S:.1f} s/send, measured "
-            f"{self.peer_pacing_s if self.peer_pacing_s else 'n/a'}), so the "
-            "whole batch is accepted inside the window by construction",
+            f"{self.peer_pacing_s if self.peer_pacing_s else 'n/a'}) is "
+            "recorded for information, the measured window governs",
+            constructed_window=True,
         )
 
     def case_reply_stall_during_drain(self) -> None:

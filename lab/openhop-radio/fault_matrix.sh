@@ -36,10 +36,14 @@
 #                    one) and the close re-arms with every connection for
 #                    the rest of the window; afterwards the backlog is
 #                    delivered
-#   saturation       a deep backlog waits behind a reply-stall window:
-#                    probe retirements of the silent link are designed,
-#                    nothing may be consumed, and the backlog is
-#                    delivered once the window ends
+#   saturation       a deep backlog waits behind a reply-stall window
+#                    CONSTRUCTED to cover the batch: the stall is armed
+#                    with a far guard deadline and held until one
+#                    headroom interval past the last accepted send, so
+#                    the batch is accepted inside the window by
+#                    construction; probe retirements of the silent link
+#                    are designed, nothing may be consumed, and the
+#                    backlog is delivered once the window ends
 #   reply_stall_drain TIME WINDOW armed while a backlog drain is in
 #                    flight: the frame the drain had on the wire is
 #                    swallowed, at most that one message may be consumed,

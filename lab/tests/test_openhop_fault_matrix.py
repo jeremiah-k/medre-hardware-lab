@@ -1158,3 +1158,157 @@ def test_inert_rows_are_grouped_by_identity_with_hash_and_ids():
         {"companion_hash": "0x01", "ids": [7]},
         {"companion_hash": "0x80", "ids": [1369, 1374]},
     ]
+
+
+# ---------------------------------------------------------------------------
+# The constructed saturation window: the stall is armed with a far guard
+# deadline, the batch is sent, and the stall holds one headroom interval
+# past the last accepted send - the window covers the batch by
+# construction instead of by prediction.
+# ---------------------------------------------------------------------------
+
+
+def iso_stamp(epoch: float) -> str:
+    import time as time_module
+
+    return time_module.strftime("%Y-%m-%dT%H:%M:%S+00:00", time_module.gmtime(epoch))
+
+
+def log_line(epoch: float, text: str) -> str:
+    import time as time_module
+
+    return (
+        time_module.strftime("%Y-%m-%dT%H:%M:%S", time_module.gmtime(epoch))
+        + ".000000000Z "
+        + text
+        + "\n"
+    )
+
+
+def make_window_fakes(monkeypatch, tmp_path, count, prefix, send_offsets):
+    """Fake the rig behind run_window_case.
+
+    ``send_offsets`` are seconds after the peer_send call when each send
+    finishes; the fake MEDRE log carries one reconnect attempt inside the
+    window and one reconnect success just after the derived window end,
+    and MEDRE's store holds every sent marker exactly once.
+    """
+    import time as time_module
+
+    nonces = [f"{prefix}-{index}-{index:06d}abc" for index in range(count)]
+    fault_writes: list[dict] = []
+    medre_log = {"text": ""}
+    arm = {"epoch": None}
+
+    def fake_peer_send(self, batch_count, batch_prefix):
+        now = time_module.time()
+        arm["epoch"] = now
+        window_end = now + max(send_offsets) + fault_matrix.SATURATION_WINDOW_HEADROOM_S
+        medre_log["text"] = (
+            log_line(now + 1, "reconnect attempt 1 after RuntimeError")
+            + log_line(now + 2, "receive pump failed; retiring connection")
+            + log_line(
+                window_end + 2,
+                "reconnected successfully to openhop-fault-proxy:5050",
+            )
+        )
+        return {
+            "pass": True,
+            "accepted_count": count,
+            "nonces": nonces,
+            "sends": [
+                {"finished_at": iso_stamp(now + offset)} for offset in send_offsets
+            ],
+        }
+
+    def fake_write_fault(path, fault):
+        fault_writes.append(dict(fault))
+
+    def fake_state_in(container, mode, needle=""):
+        if container == fault_matrix.REPEATER_A:
+            return {"companion_messages": []}
+        return {"canonical_events": [{"text": nonce} for nonce in nonces]}
+
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix, "stop_bridge_medre", lambda self: None
+    )
+    monkeypatch.setattr(fault_matrix.FaultMatrix, "stop_fault_medre", lambda self: None)
+    monkeypatch.setattr(fault_matrix.FaultMatrix, "start_proxy", lambda self, f: None)
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix, "start_fault_medre", lambda self: True
+    )
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix,
+        "wait_for",
+        lambda self, predicate, timeout, interval=1.0: True,
+    )
+    monkeypatch.setattr(fault_matrix.FaultMatrix, "peer_send", fake_peer_send)
+    monkeypatch.setattr(fault_matrix, "write_fault", fake_write_fault)
+    monkeypatch.setattr(fault_matrix, "state_in", fake_state_in)
+    monkeypatch.setattr(fault_matrix, "container_logs", lambda name: medre_log["text"])
+    monkeypatch.setattr(
+        fault_matrix, "timestamped_logs", lambda name: medre_log["text"]
+    )
+    monkeypatch.setattr(fault_matrix.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix,
+        "capture_case_logs",
+        lambda self, name, captured=None: None,
+    )
+    return fault_writes
+
+
+def read_case_record(tmp_path, name):
+    for directory in tmp_path.iterdir():
+        if directory.is_dir():
+            path = directory / f"{name}.json"
+            if path.exists():
+                return json.loads(path.read_text())
+    return None
+
+
+def test_the_saturation_window_is_constructed_from_the_batch(tmp_path, monkeypatch):
+    """Sends finishing far past the PREDICTED window must not abort the
+    case: the stall is armed with the far guard and ends one headroom
+    interval past the last accepted send."""
+    fault_writes = make_window_fakes(
+        monkeypatch, tmp_path, fault_matrix.SATURATION_BATCH, "p4qs", [10, 200, 480]
+    )
+    matrix = fault_matrix.FaultMatrix(tmp_path / "evidence")
+    matrix.peer_pacing_s = None  # fallback pacing: the prediction is 190 s
+    matrix.case_saturation()
+    record = read_case_record(tmp_path, "fault-saturation")
+    assert record is not None
+    assert record["pass"] is True, record["failures"]
+    assert record["predicted_window_s"] == 190.0
+    assert 479 <= record["batch_seconds"] <= 481.5
+    assert 489 <= record["window_seconds"] <= 491.5
+    assert record["fault"]["constructed_window"] is True
+    # The arm wrote the far guard deadline, the end cleared the fault.
+    armed = fault_writes[0]["stall_server_to_client_until"]
+    import time as time_module
+
+    assert armed >= time_module.time() + 3000  # the far guard deadline
+    assert len(fault_writes) >= 2
+    assert fault_writes[-1] == {}
+
+
+def test_a_fixed_window_keeps_the_abort_and_records_the_send(tmp_path, monkeypatch):
+    """The fixed-window cases keep the NOT RUN when a send outlasts the
+    window, and the record then carries the send result so the pacing
+    facts survive."""
+    make_window_fakes(monkeypatch, tmp_path, 6, "p4qsr", [10, 40, 100])
+    matrix = fault_matrix.FaultMatrix(tmp_path / "evidence")
+    matrix.run_window_case(
+        "fault-reply-stall",
+        {"stall_server_to_client_until": True},
+        45.0,
+        6,
+        "p4qsr",
+        "45 s reply-stall window: server->client swallowed",
+    )
+    record = read_case_record(tmp_path, "fault-reply-stall")
+    assert record is not None
+    assert record["status"] == "NOT RUN"
+    assert "did not finish inside the fault window" in record["reason"]
+    assert record["probe"]["sends"], "the send result must survive the NOT RUN"
