@@ -303,10 +303,8 @@ def test_case_o1_locks_past_the_retry_budget_and_passes_with_clean_counts(
     assert record["newer_persisted_before_drain"] == 0
     assert record["newer_persisted_after_drain"] == 0
     assert record["block_verdict"]["distinct"] == 10
-    # 100 s lock (60 s retry deadline + 1 s interval + send margin), and
-    # the wait must be bounded past the lock, not past the old 30 s.
-    assert lock.seconds == 100
-    assert lock.wait_timeout == 130
+    assert lock.seconds == 84
+    assert lock.wait_timeout == 89
 
 
 def test_case_o1_fails_when_a_newer_row_lands_on_disk_during_the_drain(
@@ -361,7 +359,7 @@ def test_case_o1_is_not_run_when_a_newer_row_was_persisted_before_the_drain(
     assert "persist-retry budget" in record["reason"]
     # The drain still ran, so no rows are left behind.
     assert state["drained"] is True
-    assert lock.seconds == 100
+    assert lock.seconds == 84
 
 
 # ---------------------------------------------------------------------------
@@ -419,10 +417,8 @@ def test_case_o4_locks_past_the_retry_budget_and_passes_with_clean_counts(
     assert record["older_persisted_after_drain"] == 0
     assert record["block_verdict"]["distinct"] == 10
     assert record["remaining_persisted"] == []
-    # 100 s lock (60 s retry deadline + 1 s interval + send margin), and
-    # the wait must be bounded past the lock, not past the old 30 s.
-    assert lock.seconds == 100
-    assert lock.wait_timeout == 130
+    assert lock.seconds == 84
+    assert lock.wait_timeout == 89
     assert (
         "the OLDER in-memory block must arrive entirely" in record["ordering_promise"]
     )
@@ -481,7 +477,7 @@ def test_case_o4_is_not_run_when_the_newer_block_is_not_fully_persisted(
     assert "NEWER" in record["reason"]
     # The drain still ran, so no rows are left behind.
     assert state["drained"] is True
-    assert lock.seconds == 100
+    assert lock.seconds == 84
 
 
 def test_case_o4_sends_the_newer_batch_only_after_the_lock_has_lifted(

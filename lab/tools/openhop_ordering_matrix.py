@@ -91,6 +91,12 @@ MEDRE_BRIDGE = backlog.MEDRE_BRIDGE
 # be read (repeater/companion/frame_server.py, _sync_message_locked).
 FALLBACK_WARNING = "persisted queue unreadable"
 
+# Each five-message batch can queue failed 250 ms writes. A retry
+# can wake one interval beyond its 60 s deadline and wait for those writes.
+MEMORY_RETRY_COVERAGE_S = 65.0
+MEMORY_SEND_BUDGET_S = 19.0
+MEMORY_LOCK_SECONDS = int(MEMORY_RETRY_COVERAGE_S + MEMORY_SEND_BUDGET_S)
+
 
 def utcnow() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
@@ -380,11 +386,9 @@ class OrderingMatrix:
             # retried every _PERSIST_RETRY_INTERVAL_S (1 s) until
             # _PERSIST_RETRY_DEADLINE_S (60 s) after its first failure,
             # and after that deadline nothing persists the message again.
-            # 100 s = 60 s deadline + 1 s interval + margin for the NEWER
-            # batch's send time, so every retry lands while the lock
-            # holds and the NEWER block stays in memory by construction.
+            # Verify the send left enough lock time for every retry.
             lock_started = time.monotonic()
-            lock_proc = backlog.hold_exclusive_lock(100)
+            lock_proc = backlog.hold_exclusive_lock(MEMORY_LOCK_SECONDS)
             if lock_proc is None:
                 self.not_run(
                     name,
@@ -394,17 +398,24 @@ class OrderingMatrix:
                 return
             new_send = self.peer_send(newer, new_prefix, settle=3.0)
             new_markers_sent = backlog.sent_markers(new_send)
+            send_elapsed_s = time.monotonic() - lock_started
             rows_while_locked, _ = self.repeater_queue(new_prefix)
             persisted_while_locked, _ = backlog.count_nonce_rows(
                 rows_while_locked, only=new_markers_sent
             )
             try:
-                lock_proc.wait(timeout=130)
+                lock_proc.wait(timeout=MEMORY_LOCK_SECONDS + 5)
             except subprocess.TimeoutExpired:
                 lock_proc.kill()
                 lock_proc.wait()
                 raise
             lock_hold_seconds = round(time.monotonic() - lock_started, 3)
+            if send_elapsed_s > MEMORY_SEND_BUDGET_S:
+                self.not_run(
+                    name,
+                    "the send left insufficient lock time to exhaust persist retries",
+                )
+                return
             # The strict merge premise, read BEFORE the drain: with the
             # lock outlasting the retry budget, BOTH counts must be 0 -
             # a row here means some of the NEWER block reached the disk.
@@ -497,6 +508,7 @@ class OrderingMatrix:
                     "newer_persisted_before_drain": newer_persisted_before_drain,
                     "newer_persisted_after_drain": newer_persisted_after_drain,
                     "lock_hold_seconds": lock_hold_seconds,
+                    "locked_send_seconds": send_elapsed_s,
                     "drain_seconds": drain_seconds,
                     "block_verdict": verdict,
                     "remaining_persisted": remaining_markers,
@@ -566,12 +578,9 @@ class OrderingMatrix:
             # retried every _PERSIST_RETRY_INTERVAL_S (1 s) until
             # _PERSIST_RETRY_DEADLINE_S (60 s) after its first failure,
             # and after that deadline nothing persists the message again.
-            # 100 s = 60 s deadline + 1 s interval + margin for the OLDER
-            # batch's send time, so every retry lands while the lock
-            # holds and the OLDER block stays in memory by construction.
-            # The lock MUST start before the OLDER batch is sent.
+            # Verify the send left enough lock time for every retry.
             lock_started = time.monotonic()
-            lock_proc = backlog.hold_exclusive_lock(100)
+            lock_proc = backlog.hold_exclusive_lock(MEMORY_LOCK_SECONDS)
             if lock_proc is None:
                 self.not_run(
                     name,
@@ -581,17 +590,24 @@ class OrderingMatrix:
                 return
             old_send = self.peer_send(older, old_prefix, settle=5.0)
             old_markers_sent = backlog.sent_markers(old_send)
+            send_elapsed_s = time.monotonic() - lock_started
             rows_while_locked, _ = self.repeater_queue(old_prefix)
             older_persisted_while_store_locked, _ = backlog.count_nonce_rows(
                 rows_while_locked, only=old_markers_sent
             )
             try:
-                lock_proc.wait(timeout=130)
+                lock_proc.wait(timeout=MEMORY_LOCK_SECONDS + 5)
             except subprocess.TimeoutExpired:
                 lock_proc.kill()
                 lock_proc.wait()
                 raise
             lock_hold_seconds = round(time.monotonic() - lock_started, 3)
+            if send_elapsed_s > MEMORY_SEND_BUDGET_S:
+                self.not_run(
+                    name,
+                    "the send left insufficient lock time to exhaust persist retries",
+                )
+                return
             # A retry that somehow outlived the budget would land and be
             # counted within these seconds: after the lift, nothing may
             # persist any part of the OLDER block.
@@ -711,6 +727,7 @@ class OrderingMatrix:
                     "newer_persisted_before_drain": newer_persisted_before_drain,
                     "older_persisted_after_drain": older_persisted_after_drain,
                     "lock_hold_seconds": lock_hold_seconds,
+                    "locked_send_seconds": send_elapsed_s,
                     "drain_seconds": drain_seconds,
                     "block_verdict": verdict,
                     "remaining_persisted": remaining_markers,
