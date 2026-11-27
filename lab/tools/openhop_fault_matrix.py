@@ -995,6 +995,78 @@ class FaultMatrix:
         self.record_peer_pacing(data)
         return data
 
+    def drain_companion_a(
+        self, rounds: int = 3, wake_batch: int = 8, seconds: float = 90.0
+    ) -> int:
+        """Drain companion A's leftover queue rows into their owner.
+
+        The bounded selective-drop case leaves messages preserved at the
+        companion by design, and the fork's queue-ownership rule binds
+        those rows to the client identity that was attached when they
+        were persisted - a generic SDK probe cannot pop another client's
+        rows.  The drain therefore re-attaches the case's OWN MEDRE
+        through an empty splice (no fault) and lets its receive pump pop
+        the queue into MEDRE's own store, polling the repeater's queue
+        total until it reads zero or the deadline passes.  Returns the
+        rows still held when the drain gave up; the caller logs the
+        remainder.  Hygiene, not measurement: every case's preserved
+        counts are already recorded in its evidence.
+        """
+        first_connect = re.compile(
+            r"started \(mode=tcp, connected=True\)|reconnected successfully",
+            re.IGNORECASE,
+        )
+        try:
+            if container_running(MEDRE_BRIDGE):
+                # The companion serves one client at a time: the drain's
+                # MEDRE is the client while this runs.
+                run(["docker", "stop", MEDRE_BRIDGE], timeout=180)
+            self.start_proxy({})
+            if not self.wait_for(lambda: container_running(PROXY), 60, interval=1.0):
+                return (
+                    state_in(REPEATER_A, "repeater").get("companion_message_total") or 0
+                )
+            self.stop_fault_medre()
+            if not self.start_fault_medre():
+                return (
+                    state_in(REPEATER_A, "repeater").get("companion_message_total") or 0
+                )
+            self.wait_for(
+                lambda: first_connect.search(container_logs(MEDRE_FAULT)) is not None,
+                120,
+                interval=2.0,
+            )
+            deadline = time.monotonic() + seconds
+            for _ in range(rounds):
+                remaining = (
+                    state_in(REPEATER_A, "repeater").get("companion_message_total") or 0
+                )
+                if remaining == 0:
+                    return 0
+                # A fresh arrival is announced (a real MESSAGES_WAITING
+                # push), and the wake-driven drain serves oldest-first:
+                # the batch empties the companion's queue, stale rows
+                # included.
+                self.peer_send(wake_batch, "p4drainw")
+                batch_deadline = time.monotonic() + 60.0
+                while time.monotonic() < batch_deadline:
+                    remaining = (
+                        state_in(REPEATER_A, "repeater").get("companion_message_total")
+                        or 0
+                    )
+                    if remaining == 0:
+                        return 0
+                    time.sleep(3)
+                if time.monotonic() >= deadline:
+                    break
+            remaining = (
+                state_in(REPEATER_A, "repeater").get("companion_message_total") or 0
+            )
+            return remaining
+        finally:
+            self.stop_fault_medre()
+            run(["docker", "rm", "-f", PROXY], timeout=120)
+
     def record_peer_pacing(self, probe_result: dict) -> None:
         """Refresh the peer's measured per-send pacing from a batch.
 
@@ -2178,6 +2250,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     case_summary.write_summary(matrix.dir, summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
+    # Hygiene: the bounded selective-drop case can leave messages
+    # preserved at companion A BY DESIGN (that is its documented
+    # outcome).  A later rig whose listener attaches to companion A
+    # would receive those stale rows and count them against its own
+    # one-packet assertions, so the invocation ends by stopping the
+    # case's MEDRE and splice (the companion serves one client at a
+    # time) and draining the leftover queue rows through the documented
+    # client path.  Hygiene, not measurement: the preserved counts are
+    # already recorded in each case's evidence.
+    matrix.stop_fault_medre()
+    remaining = matrix.drain_companion_a()
+    if remaining:
+        print(
+            f"companion A still holds {remaining} leftover row(s) after the "
+            "drain; a later listener at companion A will receive them"
+        )
     return (
         0
         if matrix.results and all(row["status"] == "PASS" for row in matrix.results)
