@@ -14,6 +14,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 MODULE_PATH = (
     Path(__file__).resolve().parents[1] / "tools" / "openhop_backlog_matrix.py"
 )
@@ -228,9 +230,21 @@ def test_kill_mid_drain_judge_fails_no_accepted_messages():
 BACKLOG_MARKERS = {f"p4c2b-{i}-aa" for i in range(4)}
 LIVE_MARKERS = {f"p4c2l-{i}-bb" for i in range(2)}
 
+# The REAL recorded shape of the failed wave17 run, kept as the regression
+# fixture: all 40 backlog positions first (0-39), then all 20 live (40-59),
+# and the live batch's first accepted send 9.7 s AFTER the drain had ended.
+FAILED_RUN_LAST_BACKLOG_ARRIVAL = 1764491594.894445  # 2026-11-27T01:53:14.894445Z
+FAILED_RUN_FIRST_LIVE_ACCEPTED = 1764491597.454345  # 2026-11-27T01:53:17.454345Z
+FAILED_RUN_FIRST_BACKLOG_ARRIVAL = FAILED_RUN_LAST_BACKLOG_ARRIVAL - 6.4
+
 
 def judge_c2(**overrides):
-    """Run the backlog-with-live judge with an interleaved measured run."""
+    """Run the backlog-with-live judge with a FIFO-shaped measured run.
+
+    The default shape is the DESIGNED run: overlap in time (two live sends
+    accepted before the last backlog delivery) with the recorded arrival
+    order still backlog-first, exactly as the FIFO queue must behave.
+    """
     kwargs = {
         "delivered_distinct": 6,
         "expected_distinct": 6,
@@ -238,25 +252,129 @@ def judge_c2(**overrides):
         "arrival_order": [
             "p4c2b-0-aa",
             "p4c2b-1-aa",
-            "p4c2l-0-bb",
             "p4c2b-2-aa",
             "p4c2b-3-aa",
+            "p4c2l-0-bb",
             "p4c2l-1-bb",
         ],
         "backlog_markers": BACKLOG_MARKERS,
         "live_markers": LIVE_MARKERS,
+        # The drain's recorded span (~6.4 s for the wave17 backlog); the
+        # live batch is accepted inside it with the required 5 s margin
+        # (first live acceptance 5.9 s before the last backlog arrival).
+        "backlog_arrival_stamps": [
+            FAILED_RUN_FIRST_BACKLOG_ARRIVAL + i * 2.0 for i in range(4)
+        ],
+        "live_accepted_stamps": [
+            FAILED_RUN_FIRST_BACKLOG_ARRIVAL + 0.5,
+            FAILED_RUN_FIRST_BACKLOG_ARRIVAL + 1.0,
+        ],
     }
     kwargs.update(overrides)
     return matrix.backlog_with_live_failures(**kwargs)
 
 
-def test_backlog_with_live_judge_passes_an_interleaved_run():
-    """A live arrival recorded before the last backlog arrival proves it."""
+def test_backlog_with_live_judge_passes_overlap_in_time_with_fifo_order():
+    """Live accepted during the drain, arrivals still backlog-first: PASS."""
     assert judge_c2() == []
 
 
-def test_backlog_with_live_judge_reports_the_interleaving_positions():
-    report = matrix.interleaving_report(
+def test_backlog_with_live_judge_passes_with_overlap_and_backlog_first_order():
+    """The whole live batch accepted before the last backlog delivery."""
+    failures = judge_c2(
+        live_accepted_stamps=[
+            FAILED_RUN_FIRST_BACKLOG_ARRIVAL + 1.0,
+            FAILED_RUN_FIRST_BACKLOG_ARRIVAL + 2.0,
+        ],
+    )
+    assert failures == []
+
+
+def test_the_failed_runs_real_shape_fails_for_lack_of_overlap():
+    """The wave17 shape: every live send accepted after the drain ended."""
+    failures = judge_c2(
+        live_accepted_stamps=[
+            FAILED_RUN_FIRST_LIVE_ACCEPTED,
+            FAILED_RUN_FIRST_LIVE_ACCEPTED + 29.0,
+        ],
+    )
+    assert failures != []
+    assert any(
+        "not prove live traffic overlapped the drain in time" in f for f in failures
+    )
+    assert any("less than the required 5 s margin" in f for f in failures)
+    assert not any("out-of-order delivery" in f for f in failures)
+
+
+def test_an_overlap_shorter_than_the_margin_fails():
+    """Overlapping by less than the required 5 s margin is not a pass."""
+    failures = judge_c2(
+        live_accepted_stamps=[
+            FAILED_RUN_LAST_BACKLOG_ARRIVAL - 1.0,
+            FAILED_RUN_LAST_BACKLOG_ARRIVAL - 0.5,
+        ],
+    )
+    assert any("less than the required 5 s margin" in f for f in failures)
+    assert not any("out-of-order delivery" in f for f in failures)
+
+
+def test_the_overlap_report_carries_the_margin_values():
+    report = matrix.backlog_live_overlap_report(
+        [FAILED_RUN_FIRST_BACKLOG_ARRIVAL, FAILED_RUN_LAST_BACKLOG_ARRIVAL],
+        [FAILED_RUN_FIRST_BACKLOG_ARRIVAL + 0.5],
+    )
+    assert report["overlap_seconds"] == pytest.approx(
+        FAILED_RUN_LAST_BACKLOG_ARRIVAL - FAILED_RUN_FIRST_BACKLOG_ARRIVAL - 0.5
+    )
+    assert report["required_margin_s"] == 5.0
+    assert report["overlap_margin_ok"] is True
+
+
+def test_the_overlap_report_carries_a_negative_overlap_when_too_late():
+    report = matrix.backlog_live_overlap_report(
+        [FAILED_RUN_FIRST_BACKLOG_ARRIVAL, FAILED_RUN_LAST_BACKLOG_ARRIVAL],
+        [FAILED_RUN_FIRST_LIVE_ACCEPTED],
+    )
+    assert report["overlap_in_time"] is False
+    assert report["overlap_seconds"] == pytest.approx(-2.5599)
+    assert report["overlap_margin_ok"] is False
+
+
+def test_the_overlap_report_names_the_recorded_facts():
+    report = matrix.backlog_live_overlap_report(
+        [FAILED_RUN_FIRST_BACKLOG_ARRIVAL, FAILED_RUN_LAST_BACKLOG_ARRIVAL],
+        [FAILED_RUN_FIRST_LIVE_ACCEPTED, FAILED_RUN_FIRST_LIVE_ACCEPTED + 1.0],
+    )
+    assert report["overlap_in_time"] is False
+    assert report["live_sends_before_last_backlog"] == 0
+    assert report["backlog_arrivals"] == 2
+    assert report["live_sends"] == 2
+    assert report["first_backlog_arrival_at"] == matrix.stamp_to_iso(
+        FAILED_RUN_FIRST_BACKLOG_ARRIVAL
+    )
+    assert report["last_backlog_arrival_at"] == matrix.stamp_to_iso(
+        FAILED_RUN_LAST_BACKLOG_ARRIVAL
+    )
+
+
+def test_a_live_marker_ahead_of_an_older_backlog_marker_is_out_of_order():
+    """A live arrival recorded before the last backlog marker is a defect."""
+    failures = judge_c2(
+        arrival_order=[
+            "p4c2b-0-aa",
+            "p4c2b-1-aa",
+            "p4c2l-0-bb",
+            "p4c2b-2-aa",
+            "p4c2b-3-aa",
+            "p4c2l-1-bb",
+        ],
+    )
+    assert any("ahead of an older backlog message" in failure for failure in failures)
+    assert any("p4c2l-0-bb" in failure for failure in failures)
+
+
+def test_the_order_report_flags_live_markers_ahead_of_the_backlog():
+    report = matrix.backlog_live_order_report(
         [
             "p4c2b-0-aa",
             "p4c2l-0-bb",
@@ -268,41 +386,18 @@ def test_backlog_with_live_judge_reports_the_interleaving_positions():
         BACKLOG_MARKERS,
         LIVE_MARKERS,
     )
-    assert report["first_live_position"] == 1
+    assert report["order_preserved"] is False
+    assert report["live_markers_ahead_of_backlog"] == ["p4c2l-0-bb"]
     assert report["last_backlog_position"] == 4
-    assert report["live_arrived_before_last_backlog"] is True
 
 
-def test_backlog_with_live_judge_fails_when_live_only_follows_the_backlog():
-    """Both kinds present is not enough: live strictly after the backlog."""
-    failures = judge_c2(
-        arrival_order=[
-            "p4c2b-0-aa",
-            "p4c2b-1-aa",
-            "p4c2b-2-aa",
-            "p4c2b-3-aa",
-            "p4c2l-0-bb",
-            "p4c2l-1-bb",
-        ]
-    )
+def test_backlog_with_live_judge_fails_without_recorded_stamps():
+    """No timestamps, no overlap proof: the case is not a pass."""
+    failures = judge_c2(backlog_arrival_stamps=[], live_accepted_stamps=[])
     assert any(
-        "does not prove a live message was handled" in failure for failure in failures
+        "not prove live traffic overlapped the drain in time" in f for f in failures
     )
-
-
-def test_backlog_with_live_judge_fails_without_a_live_arrival():
-    failures = judge_c2(
-        delivered_distinct=4,
-        expected_distinct=6,
-        arrival_order=["p4c2b-0-aa", "p4c2b-1-aa", "p4c2b-2-aa", "p4c2b-3-aa"],
-    )
-    assert any("does not prove a live message was handled" in f for f in failures)
-
-
-def test_backlog_with_live_judge_fails_without_an_ordered_record():
-    """No arrival record at all is a refusal, not a pass."""
-    failures = judge_c2(delivered_distinct=0, expected_distinct=6, arrival_order=[])
-    assert any("does not prove a live message was handled" in f for f in failures)
+    assert any("less than the required 5 s margin" in f for f in failures)
 
 
 def test_backlog_with_live_judge_fails_a_shortfall():

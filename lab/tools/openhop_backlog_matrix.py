@@ -13,11 +13,21 @@ the counts it measured and the evidence path it wrote.
       drain them: no loss, no duplicate, order kept.
 
   c2-backlog-with-live
-      A backlog is queued while MEDRE is stopped; MEDRE is started and the
-      peer keeps sending live notifications while the drain is in flight.
-      The recorded arrival order must prove the interleaving: at least one
-      live message observed at MEDRE before the last backlog message was
-      delivered, not merely both kinds present after the fact.
+      An 80-message backlog is queued while MEDRE is stopped; the bridge
+      MEDRE's client link then runs through the fault splice with a mild
+      250 ms per-chunk delay (far below the 2 s fetch timeout; the
+      latency-under case passes at 900 ms), stretching the pre-queued
+      backlog's fetch-bound drain to tens of seconds, and at the FIRST
+      observed backlog delivery the peer starts sending 20 live
+      notifications on the radio side, undelayed.  Three fail-closed
+      conditions: every backlog and live message delivered exactly once
+      with zero duplicates; OVERLAP IN TIME - at least one live message
+      accepted by the companion before the last backlog delivery was
+      recorded at MEDRE, with a margin of at least 5 s (the FIFO queue
+      makes live traffic overlap the drain in time, never in the
+      recorded order); ARRIVAL ORDER PRESERVED - no live marker recorded
+      at MEDRE ahead of an older backlog marker, which would be
+      out-of-order delivery.
 
   c3-client-sync-during-persist
       The repeater's SQLite store is LOCKED (held from inside the repeater
@@ -68,8 +78,10 @@ import re
 import select
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 # The summary aggregator is a SIBLING module: it is imported by path so
@@ -272,34 +284,128 @@ def missing_indices(markers: list[str], expected: set[str]) -> list[str]:
     return sorted(expected - seen)
 
 
-def interleaving_report(
+BRIDGE_CONFIG_HOST_LINE = '      host: "openhop-repeater-a"'
+BRIDGE_CONFIG_SPLICE_HOST_LINE = '      host: "openhop-fault-proxy"'
+BRIDGE_CONFIG_PORT_LINE = "      port: 5000"
+BRIDGE_CONFIG_SPLICE_PORT_LINE = "      port: 5050"
+
+
+def point_bridge_config_at_splice(config_text: str) -> str:
+    """Point the bridge config's meshcore adapter at the fault splice.
+
+    The generated bridge config carries exactly one meshcore adapter
+    (``openhop-a``, the companion client) and one meshtastic adapter; only
+    the meshcore block's host and port lines are rewritten, so the bridge
+    MEDRE's client link runs through the splice while its meshtastic side
+    and its route are untouched.  Returns the text unchanged when the
+    block does not match exactly once - the caller refuses rather than
+    patching blind.
+    """
+    if (
+        config_text.count(BRIDGE_CONFIG_HOST_LINE) != 1
+        or config_text.count(BRIDGE_CONFIG_PORT_LINE) != 1
+    ):
+        return config_text
+    return config_text.replace(
+        BRIDGE_CONFIG_HOST_LINE, BRIDGE_CONFIG_SPLICE_HOST_LINE
+    ).replace(BRIDGE_CONFIG_PORT_LINE, BRIDGE_CONFIG_SPLICE_PORT_LINE)
+
+
+def wall_timestamp(value: object) -> float | None:
+    """Return the epoch seconds of an ISO timestamp, or None.
+
+    The peer probe's send stamps and MEDRE's event ``created_at`` are both
+    timezone-aware ISO strings read from the host clock, so they compare
+    directly.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return stamp.timestamp() if stamp.tzinfo is not None else None
+
+
+def stamp_to_iso(stamp: float | None) -> str | None:
+    """Render an epoch stamp as the evidence ISO form, or None."""
+    if stamp is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(stamp))
+
+
+def backlog_live_overlap_report(
+    backlog_arrival_stamps: list[float],
+    live_accepted_stamps: list[float],
+) -> dict:
+    """The OVERLAP-IN-TIME proof: live accepted while the drain delivered.
+
+    The companion queue is first-in, first-out and the repeater serves the
+    lowest outstanding arrival first, so live traffic that overlaps a
+    backlog drain overlaps it IN TIME, not in the recorded order: a live
+    message accepted while the drain is still delivering is delivered
+    AFTER the backlog, in arrival order.  The proof is therefore a
+    timestamp fact - at least one live send was accepted by the companion
+    (the peer's ``finished_at``) before the last backlog delivery was
+    recorded at MEDRE.
+    """
+    last_backlog = max(backlog_arrival_stamps) if backlog_arrival_stamps else None
+    first_live = min(live_accepted_stamps) if live_accepted_stamps else None
+    before = (
+        [stamp for stamp in live_accepted_stamps if stamp < last_backlog]
+        if last_backlog is not None
+        else []
+    )
+    overlap_seconds = (
+        last_backlog - first_live if last_backlog is not None and first_live else None
+    )
+    return {
+        "backlog_arrivals": len(backlog_arrival_stamps),
+        "live_sends": len(live_accepted_stamps),
+        "first_backlog_arrival_at": stamp_to_iso(
+            min(backlog_arrival_stamps) if backlog_arrival_stamps else None
+        ),
+        "last_backlog_arrival_at": stamp_to_iso(last_backlog),
+        "first_live_accepted_at": stamp_to_iso(first_live),
+        "live_sends_before_last_backlog": len(before),
+        "overlap_in_time": bool(before),
+        "overlap_seconds": overlap_seconds,
+        "required_margin_s": 5.0,
+        "overlap_margin_ok": overlap_seconds is not None and overlap_seconds >= 5.0,
+    }
+
+
+def backlog_live_order_report(
     arrival_order: list[str],
     backlog_markers: set[str],
     live_markers: set[str],
 ) -> dict:
-    """Locate the live arrivals inside the backlog's delivery span.
+    """The queue's ARRIVAL ORDER contract over the recorded arrivals.
 
-    MEDRE's store returns the events in recorded arrival order, so the
-    positions decide the interleaving: the case proves a live message was
-    handled while the backlog was still being delivered when at least one
-    live marker was recorded BEFORE the last backlog marker.
+    A live marker recorded at MEDRE before the last backlog marker would
+    be out-of-order delivery - the queue serves the lowest outstanding
+    arrival first - and is a defect, never a proof of overlap.
     """
     backlog_positions = [
         index for index, marker in enumerate(arrival_order) if marker in backlog_markers
     ]
-    live_positions = [
-        index for index, marker in enumerate(arrival_order) if marker in live_markers
-    ]
+    live_positions = {
+        marker: index
+        for index, marker in enumerate(arrival_order)
+        if marker in live_markers
+    }
+    last_backlog = max(backlog_positions) if backlog_positions else None
+    ahead = sorted(
+        marker
+        for marker, index in live_positions.items()
+        if last_backlog is not None and index < last_backlog
+    )
     return {
+        "last_backlog_position": last_backlog,
         "backlog_arrivals": len(backlog_positions),
         "live_arrivals": len(live_positions),
-        "first_live_position": min(live_positions) if live_positions else None,
-        "last_backlog_position": max(backlog_positions) if backlog_positions else None,
-        "live_arrived_before_last_backlog": bool(
-            live_positions
-            and backlog_positions
-            and min(live_positions) < max(backlog_positions)
-        ),
+        "live_markers_ahead_of_backlog": ahead,
+        "order_preserved": bool(backlog_positions) and not ahead,
     }
 
 
@@ -311,17 +417,29 @@ def backlog_with_live_failures(
     arrival_order: list[str],
     backlog_markers: set[str],
     live_markers: set[str],
+    backlog_arrival_stamps: list[float],
+    live_accepted_stamps: list[float],
 ) -> list[str]:
-    """Judge the backlog-with-live case by its interleaving claim.
+    """Judge the backlog-with-live case by the FIFO queue's contract.
 
-    Both kinds arriving eventually is not what the case is named for: it
-    measures a backlog drain that competes with live traffic.  On top of
-    the accounting (every backlog and live message delivered, zero
-    duplicates) the recorded arrival order must therefore prove the
-    interleaving itself - at least one live message observed at MEDRE
-    before the last backlog message was delivered.  Fail closed: an
-    arrival order that shows no live arrival inside the backlog's
-    delivery span, or no ordered record at all, is not a pass.
+    Three fail-closed conditions:
+
+    * accounting - every backlog and live message delivered exactly once,
+      zero duplicates;
+    * OVERLAP IN TIME - at least one live message was accepted by the
+      companion (the peer's ``finished_at``) BEFORE the last backlog
+      message was delivered at MEDRE, with a MARGIN of at least 5 s
+      (``overlap_seconds = last_backlog_arrival - first_live_accepted``).
+      "Live traffic overlapping the drain" means overlap in time, not in
+      the recorded order;
+    * ARRIVAL ORDER PRESERVED - no live marker is recorded at MEDRE
+      before the last backlog marker: a live message delivered ahead of
+      an older backlog message is out-of-order delivery, a defect, not a
+      proof.
+
+    Without the timestamps the overlap cannot be proven and the case is
+    not a pass; without both kinds in the recorded order the queue
+    contract cannot be judged and the case is not a pass either.
     """
     failures: list[str] = []
     if delivered_distinct != expected_distinct:
@@ -334,12 +452,31 @@ def backlog_with_live_failures(
             f"{duplicate_arrivals} duplicate arrivals while the backlog "
             "competed with live notifications"
         )
-    interleaving = interleaving_report(arrival_order, backlog_markers, live_markers)
-    if not interleaving["live_arrived_before_last_backlog"]:
+    overlap = backlog_live_overlap_report(backlog_arrival_stamps, live_accepted_stamps)
+    if not overlap["overlap_in_time"]:
         failures.append(
-            "no live message was observed at MEDRE before the last backlog "
-            "delivery: the recorded arrival order does not prove a live "
-            "message was handled while the backlog drain was in flight"
+            "no live message was accepted by the companion before the last "
+            "backlog delivery: the recorded timestamps do not prove live "
+            "traffic overlapped the drain in time"
+        )
+    margin = overlap["overlap_seconds"]
+    if margin is None or margin < 5.0:
+        margin_text = "no overlap" if margin is None else f"{margin:.1f} s"
+        failures.append(
+            f"the recorded overlap (last backlog arrival minus first live "
+            f"acceptance) was {margin_text}, less than the required "
+            f"{overlap['required_margin_s']:.0f} s margin"
+        )
+    order = backlog_live_order_report(arrival_order, backlog_markers, live_markers)
+    if order["live_markers_ahead_of_backlog"]:
+        failures.append(
+            "a live message was delivered ahead of an older backlog message "
+            f"(out-of-order delivery): {order['live_markers_ahead_of_backlog']}"
+        )
+    elif not order["order_preserved"]:
+        failures.append(
+            "the recorded arrival order does not cover the backlog and the "
+            "live batch, so the queue's order contract cannot be judged"
         )
     return failures
 
@@ -831,11 +968,23 @@ class Matrix:
                 except (RuntimeError, subprocess.SubprocessError) as exc:
                     self.not_run(name, f"could not restore the MEDRE bridge: {exc}")
 
-    def case_c2(self, backlog: int = 40, live: int = 20) -> None:
+    def case_c2(self, backlog: int = 80, live: int = 20) -> None:
         name = "c2-backlog-with-live"
         back_prefix = "p4c2b"
         live_prefix = "p4c2l"
+        # The DRAIN-SLOWING MECHANISM, this case only: the bridge MEDRE's
+        # client link runs through the fault splice with a mild per-chunk
+        # delay (250 ms - far below the 2 s fetch timeout; the latency-under
+        # case passes at 900 ms), so the pre-queued backlog's fetch-bound
+        # drain (~2 s undelayed for 80 messages) lasts tens of seconds while
+        # the live traffic, sent on the radio side through companion B, is
+        # not delayed.  The bridge MEDRE's config is pointed at the splice
+        # for this case only and restored afterwards; the splice is removed.
+        delay_ms = 250
+        bridge_config = LAB_ROOT / "lab/state/config/medre-openhop-bridge.yaml"
         restore_bridge = False
+        splice_up = False
+        config_backup = None
         try:
             if not container_running(MEDRE_BRIDGE):
                 self.not_run(name, "the MEDRE bridge container is not running")
@@ -860,13 +1009,70 @@ class Matrix:
                 )
                 return
             back_send = peer_send(self.profile, backlog, back_prefix, settle=3.0)
+            back_markers = sent_markers(back_send)
             rows, _ = self.repeater_queue(REPEATER_A, back_prefix)
-            persisted_count, _ = count_nonce_rows(rows, only=sent_markers(back_send))
+            persisted_count, _ = count_nonce_rows(rows, only=back_markers)
+            # Wire the client link through the splice BEFORE MEDRE starts:
+            # the client resolves the peer's name once, at connect time.
+            self.start_splice({"delay_ms": delay_ms})
+            if not self.wait_for(lambda: container_running(PROXY), 60, interval=1.0):
+                self.not_run(name, "the fault splice did not start")
+                return
+            splice_up = True
+            config_backup = bridge_config.read_text(encoding="utf-8")
+            patched = point_bridge_config_at_splice(config_backup)
+            if patched == config_backup:
+                self.not_run(
+                    name,
+                    "the bridge config's meshcore block did not match; the "
+                    "splice link could not be wired",
+                )
+                return
+            bridge_config.write_text(patched, encoding="utf-8")
             checked_docker("start", MEDRE_BRIDGE)
             self.wait_for(lambda: container_running(MEDRE_BRIDGE), 90)
-            time.sleep(4)
-            live_send = peer_send(self.profile, live, live_prefix, settle=8.0)
-            back_markers = sent_markers(back_send)
+            # The live batch must OVERLAP the drain in time: it starts at the
+            # FIRST observed backlog delivery, while the delayed drain is
+            # still pulling the backlog across.  The FIFO companion queue
+            # then delivers the live messages after the backlog, in arrival
+            # order - which is exactly the order contract the verdict
+            # asserts.
+            live_send: dict = {}
+            live_armed = threading.Event()
+
+            def queue_live() -> None:
+                live_armed.set()
+                live_send.update(peer_send(self.profile, live, live_prefix, settle=8.0))
+
+            live_armed_at = None
+            live_sender = None
+            deadline = time.monotonic() + 600
+            while time.monotonic() < deadline:
+                if len(self.medre_events(back_prefix, only=back_markers)) > 0:
+                    live_armed_at = time.time()
+                    live_sender = threading.Thread(target=queue_live, daemon=True)
+                    live_sender.start()
+                    break
+                time.sleep(0.5)
+            if live_armed_at is None:
+                self.not_run(
+                    name,
+                    "no backlog delivery was observed at MEDRE; no live "
+                    "traffic to overlap the drain with",
+                )
+                return
+            live_armed.wait(timeout=10)
+            # The backlog keeps draining while the live batch sends.
+            self.wait_for(
+                lambda: len(self.medre_events(back_prefix, only=back_markers))
+                >= persisted_count,
+                timeout=300,
+                interval=2.0,
+            )
+            # The live batch must be COMPLETE before the markers are read,
+            # or the delivery waits and the recorded order would miss the
+            # batch's late messages.
+            live_sender.join(timeout=600)
             live_markers_sent = sent_markers(live_send)
             self.wait_for(
                 lambda: len(self.medre_events(back_prefix, only=back_markers))
@@ -875,9 +1081,12 @@ class Matrix:
                 timeout=180,
                 interval=3.0,
             )
+            if live_send.get("pass") is not True or len(live_markers_sent) != live:
+                self.not_run(name, "the peer did not accept the complete live batch")
+                return
             # One combined snapshot keeps the recorded arrival order across
-            # both kinds: the interleaving proof reads this order (the
-            # store returns canonical_events ORDER BY created_at), so two
+            # both kinds: the order contract reads this order (the store
+            # returns canonical_events ORDER BY created_at), so two
             # separately-ordered reads would not do.
             mine = back_markers | live_markers_sent
             events = self.medre_events("p4c2", only=mine)
@@ -898,16 +1107,26 @@ class Matrix:
                 if marker is not None and marker in live_markers_sent
             ]
             live_report = ordering_report(live_markers)
-            interleaving = interleaving_report(markers, back_markers, live_markers_sent)
+            backlog_arrival_stamps = [
+                stamp
+                for event in events
+                if nonce_marker(json.dumps(event, sort_keys=True)) in back_markers
+                and (stamp := wall_timestamp(event.get("created_at"))) is not None
+            ]
+            live_accepted_stamps = [
+                stamp
+                for entry in live_send.get("sends") or []
+                if entry.get("accepted") is True
+                and (stamp := wall_timestamp(entry.get("finished_at"))) is not None
+            ]
+            overlap = backlog_live_overlap_report(
+                backlog_arrival_stamps, live_accepted_stamps
+            )
+            order = backlog_live_order_report(markers, back_markers, live_markers_sent)
             failures: list[str] = []
-            if (
-                back_send.get("pass") is not True
-                or live_send.get("pass") is not True
-                or persisted_count != backlog
-                or len(live_markers_sent) != live
-            ):
+            if back_send.get("pass") is not True or persisted_count != backlog:
                 failures.append(
-                    "the case needs both a full persisted backlog and an accepted live batch"
+                    "the case needs a full persisted backlog before MEDRE starts"
                 )
             failures += backlog_with_live_failures(
                 delivered_distinct=report["distinct"],
@@ -917,6 +1136,8 @@ class Matrix:
                 arrival_order=markers,
                 backlog_markers=back_markers,
                 live_markers=live_markers_sent,
+                backlog_arrival_stamps=backlog_arrival_stamps,
+                live_accepted_stamps=live_accepted_stamps,
             )
             self.write(
                 name,
@@ -926,19 +1147,45 @@ class Matrix:
                     "failures": failures,
                     "preconditions": pre,
                     "verdict_rule": (
-                        "backlog-with-live verdict: the full persisted backlog "
-                        "and the accepted live batch are all delivered with "
-                        "zero duplicates, AND the recorded arrival order proves "
-                        "the interleaving - at least one live message observed "
-                        "at MEDRE before the last backlog message was delivered"
+                        "backlog-with-live verdict, three fail-closed "
+                        "conditions: every backlog and live message delivered "
+                        "exactly once with zero duplicates; OVERLAP IN TIME - "
+                        "at least one live message accepted by the companion "
+                        "(the peer's finished_at) before the last backlog "
+                        "message was delivered at MEDRE, with a margin of at "
+                        "least 5 s (overlap_seconds = last backlog arrival "
+                        "minus first live acceptance), because the FIFO "
+                        "companion queue makes live traffic overlap the drain "
+                        "in time, never in the recorded order; ARRIVAL ORDER "
+                        "PRESERVED - no live marker recorded at MEDRE before "
+                        "the last backlog marker, since a live message "
+                        "delivered ahead of an older backlog message is "
+                        "out-of-order delivery, a defect, not a proof. The "
+                        "overlap is made deterministic by this case's own "
+                        "mechanism: the bridge MEDRE's client link runs "
+                        "through the fault splice with a 250 ms per-chunk "
+                        "delay (far below the 2 s fetch timeout; latency-under "
+                        "passes at 900 ms), stretching the pre-queued "
+                        "backlog's fetch-bound drain to tens of seconds while "
+                        "the radio-side live traffic is not delayed; the live "
+                        "batch is armed at the FIRST observed backlog delivery"
                     ),
                     "backlog_requested": backlog,
                     "backlog_persisted": persisted_count,
                     "live_requested": live,
                     "live_accepted": live_send.get("accepted_count"),
+                    "live_armed_at": stamp_to_iso(live_armed_at),
+                    "drain_delay_ms": delay_ms,
                     "combined_report": report,
                     "live_only_report": live_report,
-                    "interleaving_report": interleaving,
+                    "overlap_report": {
+                        **overlap,
+                        "live_accepted_send_stamps": [
+                            stamp_to_iso(stamp)
+                            for stamp in sorted(live_accepted_stamps)
+                        ],
+                    },
+                    "order_report": order,
                     "backlog_send": back_send,
                     "live_send": live_send,
                 },
@@ -946,9 +1193,21 @@ class Matrix:
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
         finally:
+            if config_backup is not None:
+                bridge_config.write_text(config_backup, encoding="utf-8")
+            if splice_up:
+                self.remove_splice()
             if restore_bridge and not container_running(MEDRE_BRIDGE):
                 try:
                     checked_docker("start", MEDRE_BRIDGE)
+                except (RuntimeError, subprocess.SubprocessError) as exc:
+                    self.not_run(name, f"could not restore the MEDRE bridge: {exc}")
+            elif restore_bridge and config_backup is not None:
+                # The running session still points at the splice's config:
+                # restart it once so the direct companion link is the one
+                # the rig was found with.
+                try:
+                    checked_docker("restart", MEDRE_BRIDGE, timeout=300)
                 except (RuntimeError, subprocess.SubprocessError) as exc:
                     self.not_run(name, f"could not restore the MEDRE bridge: {exc}")
 
