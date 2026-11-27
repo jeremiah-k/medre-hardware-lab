@@ -649,3 +649,85 @@ def test_the_proof_report_is_empty_without_events():
     assert report["same_connection_proven"] is False
     assert report["probe_replies_forwarded_per_connection"] == {}
     assert report["message_frames_dropped_per_connection"] == {}
+
+
+# ---------------------------------------------------------------------------
+# The merged log pipe: the rig containers log to both streams (the
+# repeater's logging output is stderr, the splice's events are stdout),
+# so the readers that need the lines in the order the container wrote
+# them read ONE merged pipe instead of concatenating two captures.
+# ---------------------------------------------------------------------------
+
+
+def test_run_merged_redirects_stderr_into_stdout(monkeypatch):
+    """The merge happens in the subprocess pipe, never by concatenation."""
+    from types import SimpleNamespace
+
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["stderr"] = kwargs.get("stderr")
+        return SimpleNamespace(returncode=0, stdout="out-1\nerr-1\nout-2\n", stderr="")
+
+    monkeypatch.setattr(fault_matrix.subprocess, "run", fake_run)
+    rc, merged = fault_matrix.run_merged(["docker", "logs", "c"])
+    assert rc == 0
+    import subprocess as real_subprocess
+
+    assert seen["stderr"] == real_subprocess.STDOUT
+    assert merged == "out-1\nerr-1\nout-2\n"
+
+
+def test_run_merged_interleaves_a_real_subprocess_in_time_order():
+    rc, merged = fault_matrix.run_merged(
+        ["/bin/sh", "-c", "echo out-1; echo err-1 >&2; echo out-2"]
+    )
+    assert rc == 0
+    assert merged == "out-1\nerr-1\nout-2\n"
+
+
+def test_container_logs_read_one_merged_pipe(monkeypatch):
+    seen: dict = {}
+
+    def fake_merged(cmd, timeout=600):
+        seen["cmd"] = cmd
+        return 0, "line-1\nline-2\n"
+
+    monkeypatch.setattr(fault_matrix, "run_merged", fake_merged)
+    assert fault_matrix.container_logs("c") == "line-1\nline-2\n"
+    assert seen["cmd"] == ["docker", "logs", "c"]
+
+
+def test_timestamped_logs_read_one_merged_pipe(monkeypatch):
+    seen: dict = {}
+
+    def fake_merged(cmd, timeout=600):
+        seen["cmd"] = cmd
+        return 0, "2026-11-27T00:00:00+00:00 line-1\n"
+
+    monkeypatch.setattr(fault_matrix, "run_merged", fake_merged)
+    assert fault_matrix.timestamped_logs("c") == "2026-11-27T00:00:00+00:00 line-1\n"
+    assert seen["cmd"] == ["docker", "logs", "-t", "c"]
+
+
+def test_capture_case_logs_save_the_merged_streams_in_order(tmp_path, monkeypatch):
+    """A container that logs to stderr is saved whole: the saved file is
+    the merged pipe's text, not a stdout-only capture."""
+    saved: dict = {}
+
+    def fake_timestamped(container):
+        saved[container] = f"merged text of {container}\n"
+        return saved[container]
+
+    monkeypatch.setattr(fault_matrix, "timestamped_logs", fake_timestamped)
+    matrix = fault_matrix.FaultMatrix(tmp_path)
+    matrix.capture_case_logs("case-x")
+    for suffix, container in (
+        ("proxy", fault_matrix.PROXY),
+        ("medre", fault_matrix.MEDRE_FAULT),
+        ("repeater-a", fault_matrix.REPEATER_A),
+    ):
+        path = tmp_path / f"case-x.{suffix}.log"
+        assert path.exists()
+        assert path.read_text(encoding="utf-8") == saved[container]

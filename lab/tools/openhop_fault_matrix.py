@@ -174,14 +174,33 @@ def run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def run_merged(cmd: list[str], timeout: int = 600) -> tuple[int, str]:
+    """Run a command with stderr merged into stdout, in true write order.
+
+    The rig containers log to both streams (the repeater's ``logging``
+    output is stderr, the splice's JSON events are stdout), and docker
+    relays each stream separately - so two separately captured strings
+    cannot be interleaved afterwards.  The consumers that need the lines
+    in the order the container wrote them read ONE merged pipe.
+    """
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+    )
+    return proc.returncode, proc.stdout
+
+
 def container_running(name: str) -> bool:
     rc, out, _ = run(["docker", "inspect", "-f", "{{.State.Running}}", name])
     return rc == 0 and out.strip() == "true"
 
 
 def container_logs(name: str) -> str:
-    _, out, err = run(["docker", "logs", name], timeout=120)
-    return out + err
+    _, merged = run_merged(["docker", "logs", name], timeout=120)
+    return merged
 
 
 def timestamped_logs(name: str) -> str:
@@ -189,10 +208,12 @@ def timestamped_logs(name: str) -> str:
 
     The idle-blackhole verdict measures WHEN the pump retired relative to
     the moment the fault was armed, so its lines need timestamps; docker's
-    -t flag prefixes each line with the host's UTC time.
+    -t flag prefixes each line with the host's UTC time.  Both streams are
+    read through one merged pipe, so the timestamps order the lines as
+    the container wrote them.
     """
-    _, out, err = run(["docker", "logs", "-t", name], timeout=120)
-    return out + err
+    _, merged = run_merged(["docker", "logs", "-t", name], timeout=120)
+    return merged
 
 
 LOG_TIME = re.compile(r"^(\d{4}-\d{2}-\d{2}T[^ ]+) ")
@@ -935,15 +956,17 @@ class FaultMatrix:
         """Save each fault-rig container's timestamped log into the evidence.
 
         Called at the end of every case, BEFORE the end-of-run drain or any
-        teardown removes the containers.
+        teardown removes the containers.  The logs are read through the
+        merged pipe, so a container that logs to stderr (the repeater's
+        ``logging`` output) is saved whole, in true time order.
         """
         for container, suffix in (
             (PROXY, "proxy"),
             (MEDRE_FAULT, "medre"),
             (REPEATER_A, "repeater-a"),
         ):
-            _rc, out, _err = run(["docker", "logs", "-t", container], timeout=120)
-            (self.dir / f"{name}.{suffix}.log").write_text(out, encoding="utf-8")
+            merged = timestamped_logs(container)
+            (self.dir / f"{name}.{suffix}.log").write_text(merged, encoding="utf-8")
 
     def companion_queue_snapshot(self, label: str) -> dict:
         """WAL-aware snapshot of companion A's queue: one entry per row.
