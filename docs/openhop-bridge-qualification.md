@@ -131,7 +131,7 @@ fault splice and the fault MEDRE the fault matrix starts):
 python3 lab/tools/openhop_backlog_matrix.py                 # all six cases
 python3 lab/tools/openhop_backlog_matrix.py --case c5       # one case
 
-# Ordering cases o1-o3.
+# Ordering cases o1-o4.
 python3 lab/tools/openhop_ordering_matrix.py                # all cases
 python3 lab/tools/openhop_ordering_matrix.py --case o1      # one case
 

@@ -174,7 +174,7 @@ def verify_selection(
     elif recorded["profile"] == "openhop-bridge":
         prefixes = {name.partition("-")[0] for name in names}
         recognized = False
-        for family, size in (("c", 6), ("o", 3)):
+        for family, size in (("c", 6), ("o", 4)):
             planned = {f"{family}{index}" for index in range(1, size + 1)}
             if planned & prefixes:
                 recognized = True

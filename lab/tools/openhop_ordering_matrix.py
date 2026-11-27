@@ -3,7 +3,7 @@
 
 WHAT THIS DRIVES
 ----------------
-Three questions about the companion's arrival-order contract - deliver
+Four questions about the companion's arrival-order contract - deliver
 oldest first across the in-memory and persisted queues - each run on the
 REAL rig: a real repeater process, its real SQLite store, a real MEDRE
 client:
@@ -43,6 +43,17 @@ or NOT RUN makes it 1 (--summary-only writes no case and exits 0).
       nothing lost, nothing duplicated, nothing left behind.  The case
       counts what was served during the lock, arrivals, duplicates,
       order, and what remains persisted after it.
+
+  o4-older-memory-newer-persisted
+      The roles of o1's two blocks are swapped: the OLDER messages
+      arrive under the 100 s store lock with NO client attached and
+      stay in memory BY CONSTRUCTION (the lock outlasts the repeater's
+      whole persist-retry budget - a failed persist is retried every
+      1 s until 60 s after its first failure, then never again - so
+      every retry lands while the lock holds); the lock lifts, the
+      NEWER messages arrive and are persisted with no client attached.
+      The client then syncs and must get the OLDER in-memory block
+      entirely before the NEWER persisted block.
 
 WHAT A PASS MEANS
 -----------------
@@ -180,6 +191,58 @@ def merge_premise_reason(
             "lifted but before the drain: the lock did not outlast the "
             "persist-retry budget, so the newer block was not in memory "
             "only and the merge premise cannot be verified"
+        )
+    return None
+
+
+def memory_block_premise_reason(
+    older_persisted_while_store_locked: int,
+    older_persisted_after_unlock: int,
+    older_persisted_before_drain: int,
+    newer_persisted_before_drain: int,
+    newer_accepted: int | None,
+) -> str | None:
+    """Return why the o4 premise failed, or None.
+
+    The o4 claim (the OLDER in-memory block arrives entirely before the
+    NEWER persisted block) is only provable when the OLDER block is IN
+    MEMORY ONLY and the NEWER block is FULLY PERSISTED when the client
+    drains.  The OLDER block arrives under a store lock held longer than
+    the repeater's whole persist-retry budget, so the premise is strict:
+    an OLDER row persisted WHILE THE LOCK WAS HELD means the lock did not
+    hold during the arrivals, and an OLDER row persisted AFTER THE LIFT
+    means a retry outlived the budget - either way part of the OLDER
+    block is on disk.  All three OLDER persisted counts must be 0, and
+    the NEWER persisted count must equal the NEWER accepted send (which
+    must be positive).  The case is NOT RUN - but only AFTER the drain,
+    so no rows are left behind.
+    """
+    if older_persisted_while_store_locked > 0:
+        return (
+            f"{older_persisted_while_store_locked} OLDER row(s) were "
+            "persisted while the store was locked: the lock did not hold "
+            "during the OLDER batch's arrivals, so the OLDER block was "
+            "not in memory only and the premise cannot be verified"
+        )
+    if older_persisted_after_unlock > 0:
+        return (
+            f"{older_persisted_after_unlock} OLDER row(s) were persisted "
+            "after the lock lifted: a persist retry outlived the budget, "
+            "so the OLDER block was not in memory only and the premise "
+            "cannot be verified"
+        )
+    if older_persisted_before_drain > 0:
+        return (
+            f"{older_persisted_before_drain} OLDER row(s) were persisted "
+            "before the drain: the OLDER block was not in memory only and "
+            "the premise cannot be verified"
+        )
+    if not newer_accepted or newer_persisted_before_drain != newer_accepted:
+        return (
+            f"{newer_persisted_before_drain} of {newer_accepted} accepted "
+            "NEWER message(s) were persisted before the drain: the NEWER "
+            "block was not fully on disk, so the cross-store order cannot "
+            "be verified"
         )
     return None
 
@@ -444,6 +507,220 @@ class OrderingMatrix:
                         "lock outlasts the whole persist-retry budget), so "
                         "the OLDER persisted block must arrive entirely "
                         "before the NEWER in-memory block"
+                    ),
+                    "older_send": old_send,
+                    "newer_send": new_send,
+                },
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self.not_run(name, f"{type(exc).__name__}: {exc}")
+        finally:
+            if restore_bridge and not backlog.container_running(MEDRE_BRIDGE):
+                try:
+                    self.start_medre()
+                except (RuntimeError, subprocess.SubprocessError) as exc:
+                    self.not_run(name, f"could not restore the MEDRE bridge: {exc}")
+
+    def case_o4(self, older: int = 5, newer: int = 5) -> None:
+        """OLDER in-memory block first, NEWER persisted block second.
+
+        The mirror of o1: the OLDER block is held in memory BY
+        CONSTRUCTION - it arrives while the store is locked for 100 s,
+        past the repeater's whole persist-retry budget (a failed persist
+        is retried every 1 s until 60 s after its first failure, then
+        never again), so every retry lands while the lock holds and
+        nothing persists the block afterwards.  The NEWER block then
+        arrives with the store writable and is fully persisted before
+        the drain.  The premise is strict - all three OLDER persisted
+        counts must be 0 and the NEWER persisted count must equal the
+        accepted send - and an OLDER row on disk after the drain is a
+        FAIL: the OLDER block would not have been memory-only, so the
+        case would have proved single-store order, not the merge.
+        """
+        name = "o4-older-memory-newer-persisted"
+        old_prefix, new_prefix = "p4o4a", "p4o4b"
+        restore_bridge = False
+        try:
+            if not backlog.container_running(MEDRE_BRIDGE):
+                self.not_run(name, "the MEDRE bridge container is not running")
+                return
+            restore_bridge = True
+            self.stop_medre()
+            pre = self.preconditions(
+                "MEDRE stopped; the OLDER batch arrives under the store "
+                "lock with no client attached and stays in memory; the "
+                "NEWER batch is persisted with no client attached before "
+                "the drain"
+            )
+            if not pre["medre_stopped"] or not pre["companion_a_client_free"]:
+                self.not_run(
+                    name,
+                    "MEDRE did not stop cleanly, so no in-memory block could form",
+                    {"preconditions": pre},
+                )
+                return
+            # Lock the store so the OLDER batch cannot be persisted and
+            # stays in the in-memory queue.  The duration is derived from
+            # the repeater's persist-retry budget
+            # (repeater/companion/frame_server.py): a failed persist is
+            # retried every _PERSIST_RETRY_INTERVAL_S (1 s) until
+            # _PERSIST_RETRY_DEADLINE_S (60 s) after its first failure,
+            # and after that deadline nothing persists the message again.
+            # 100 s = 60 s deadline + 1 s interval + margin for the OLDER
+            # batch's send time, so every retry lands while the lock
+            # holds and the OLDER block stays in memory by construction.
+            # The lock MUST start before the OLDER batch is sent.
+            lock_started = time.monotonic()
+            lock_proc = backlog.hold_exclusive_lock(100)
+            if lock_proc is None:
+                self.not_run(
+                    name,
+                    "the repeater's SQLite store could not be locked",
+                    {"preconditions": pre},
+                )
+                return
+            old_send = self.peer_send(older, old_prefix, settle=5.0)
+            old_markers_sent = backlog.sent_markers(old_send)
+            rows_while_locked, _ = self.repeater_queue(old_prefix)
+            older_persisted_while_store_locked, _ = backlog.count_nonce_rows(
+                rows_while_locked, only=old_markers_sent
+            )
+            try:
+                lock_proc.wait(timeout=130)
+            except subprocess.TimeoutExpired:
+                lock_proc.kill()
+                lock_proc.wait()
+                raise
+            lock_hold_seconds = round(time.monotonic() - lock_started, 3)
+            # A retry that somehow outlived the budget would land and be
+            # counted within these seconds: after the lift, nothing may
+            # persist any part of the OLDER block.
+            time.sleep(3)
+            rows_after_unlock, _ = self.repeater_queue(old_prefix)
+            older_persisted_after_unlock, _ = backlog.count_nonce_rows(
+                rows_after_unlock, only=old_markers_sent
+            )
+            # No client is attached and the store is writable, so the
+            # NEWER block is normally on disk within about a second of
+            # its arrival; both counts are read from the store BEFORE
+            # the drain.
+            new_send = self.peer_send(newer, new_prefix, settle=5.0)
+            new_markers_sent = backlog.sent_markers(new_send)
+            rows_older_before_drain, _ = self.repeater_queue(old_prefix)
+            older_persisted_before_drain, _ = backlog.count_nonce_rows(
+                rows_older_before_drain, only=old_markers_sent
+            )
+            rows_newer_before_drain, _ = self.repeater_queue(new_prefix)
+            newer_persisted_before_drain, _ = backlog.count_nonce_rows(
+                rows_newer_before_drain, only=new_markers_sent
+            )
+            premise_failure = memory_block_premise_reason(
+                older_persisted_while_store_locked,
+                older_persisted_after_unlock,
+                older_persisted_before_drain,
+                newer_persisted_before_drain,
+                new_send.get("accepted_count"),
+            )
+            mine = old_markers_sent | new_markers_sent
+            drain_started = time.monotonic()
+            self.start_medre()
+            self.wait_for(
+                lambda: len(self.markers_from_store("p4o4", mine)) >= older + newer,
+                timeout=180,
+                interval=3.0,
+            )
+            drain_seconds = round(time.monotonic() - drain_started, 3)
+            markers = self.markers_from_store("p4o4", mine)
+            verdict = merged_block_verdict(markers, ["o4a", "o4b"])
+            remaining_rows, _ = self.repeater_queue("")
+            remaining_count, remaining_markers = backlog.count_nonce_rows(
+                remaining_rows, only=mine
+            )
+            # Read AFTER the drain has completed, BEFORE the record is
+            # written: the OLDER block was in memory before the drain and
+            # was delivered, so a row on disk here means part of the
+            # OLDER block reached the store at some point - single-store
+            # order, not the merge the case proves.
+            rows_after_drain, _ = self.repeater_queue(old_prefix)
+            older_persisted_after_drain, _ = backlog.count_nonce_rows(
+                rows_after_drain, only=old_markers_sent
+            )
+            failures: list[str] = []
+            if not old_send.get("accepted_count") or not new_send.get("accepted_count"):
+                failures.append("the peer did not accept both batches")
+            if verdict["distinct"] != older + newer:
+                failures.append(
+                    f"MEDRE recorded {verdict['distinct']} distinct markers, "
+                    f"expected {older + newer}"
+                )
+            if verdict["duplicate_arrivals"]:
+                failures.append(f"{verdict['duplicate_arrivals']} duplicate arrivals")
+            if verdict["cross_block_violations"]:
+                failures.append(
+                    f"{verdict['cross_block_violations']} NEWER persisted message(s) "
+                    "overtook an OLDER in-memory message"
+                )
+            if verdict["within_block_violations"]:
+                failures.append(
+                    f"within-block order broken: {verdict['within_block_violations']}"
+                )
+            if remaining_count:
+                failures.append(
+                    f"{remaining_count} marker(s) remained persisted after the drain"
+                )
+            if older_persisted_after_drain:
+                failures.append(
+                    f"{older_persisted_after_drain} OLDER row(s) were on disk "
+                    "after the drain: the OLDER block was not in memory only, "
+                    "so the case proved single-store order, not the merge"
+                )
+            if premise_failure:
+                # The premise failed AFTER the drain ran, so no rows are
+                # left behind; the case is NOT RUN with the counts in the
+                # record.
+                self.not_run(
+                    name,
+                    premise_failure,
+                    {
+                        "older_persisted_while_store_locked": (
+                            older_persisted_while_store_locked
+                        ),
+                        "older_persisted_after_unlock": older_persisted_after_unlock,
+                        "older_persisted_before_drain": older_persisted_before_drain,
+                        "newer_persisted_before_drain": newer_persisted_before_drain,
+                        "preconditions": pre,
+                    },
+                )
+                return
+            self.write(
+                name,
+                {
+                    "case": name,
+                    "pass": not failures,
+                    "failures": failures,
+                    "preconditions": pre,
+                    "older_requested": older,
+                    "older_accepted": old_send.get("accepted_count"),
+                    "newer_requested": newer,
+                    "newer_accepted": new_send.get("accepted_count"),
+                    "older_persisted_while_store_locked": (
+                        older_persisted_while_store_locked
+                    ),
+                    "older_persisted_after_unlock": older_persisted_after_unlock,
+                    "older_persisted_before_drain": older_persisted_before_drain,
+                    "newer_persisted_before_drain": newer_persisted_before_drain,
+                    "older_persisted_after_drain": older_persisted_after_drain,
+                    "lock_hold_seconds": lock_hold_seconds,
+                    "drain_seconds": drain_seconds,
+                    "block_verdict": verdict,
+                    "remaining_persisted": remaining_markers,
+                    "ordering_promise": (
+                        "sync serves the lowest outstanding arrival number "
+                        "across the in-memory and the SQLite queue; the OLDER "
+                        "block is held in memory by construction (the store "
+                        "lock outlasts the whole persist-retry budget), so "
+                        "the OLDER in-memory block must arrive entirely "
+                        "before the NEWER persisted block"
                     ),
                     "older_send": old_send,
                     "newer_send": new_send,
@@ -726,6 +1003,7 @@ CASES = {
     "o1": "case_o1",
     "o2": "case_o2",
     "o3": "case_o3",
+    "o4": "case_o4",
 }
 
 
