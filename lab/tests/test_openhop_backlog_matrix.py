@@ -223,3 +223,93 @@ def test_kill_mid_drain_judge_fails_no_accepted_messages():
         hold_seconds=None,
     )
     assert failures == ["the peer sent no accepted message"]
+
+
+BACKLOG_MARKERS = {f"p4c2b-{i}-aa" for i in range(4)}
+LIVE_MARKERS = {f"p4c2l-{i}-bb" for i in range(2)}
+
+
+def judge_c2(**overrides):
+    """Run the backlog-with-live judge with an interleaved measured run."""
+    kwargs = {
+        "delivered_distinct": 6,
+        "expected_distinct": 6,
+        "duplicate_arrivals": 0,
+        "arrival_order": [
+            "p4c2b-0-aa",
+            "p4c2b-1-aa",
+            "p4c2l-0-bb",
+            "p4c2b-2-aa",
+            "p4c2b-3-aa",
+            "p4c2l-1-bb",
+        ],
+        "backlog_markers": BACKLOG_MARKERS,
+        "live_markers": LIVE_MARKERS,
+    }
+    kwargs.update(overrides)
+    return matrix.backlog_with_live_failures(**kwargs)
+
+
+def test_backlog_with_live_judge_passes_an_interleaved_run():
+    """A live arrival recorded before the last backlog arrival proves it."""
+    assert judge_c2() == []
+
+
+def test_backlog_with_live_judge_reports_the_interleaving_positions():
+    report = matrix.interleaving_report(
+        [
+            "p4c2b-0-aa",
+            "p4c2l-0-bb",
+            "p4c2b-1-aa",
+            "p4c2b-2-aa",
+            "p4c2b-3-aa",
+            "p4c2l-1-bb",
+        ],
+        BACKLOG_MARKERS,
+        LIVE_MARKERS,
+    )
+    assert report["first_live_position"] == 1
+    assert report["last_backlog_position"] == 4
+    assert report["live_arrived_before_last_backlog"] is True
+
+
+def test_backlog_with_live_judge_fails_when_live_only_follows_the_backlog():
+    """Both kinds present is not enough: live strictly after the backlog."""
+    failures = judge_c2(
+        arrival_order=[
+            "p4c2b-0-aa",
+            "p4c2b-1-aa",
+            "p4c2b-2-aa",
+            "p4c2b-3-aa",
+            "p4c2l-0-bb",
+            "p4c2l-1-bb",
+        ]
+    )
+    assert any(
+        "does not prove a live message was handled" in failure for failure in failures
+    )
+
+
+def test_backlog_with_live_judge_fails_without_a_live_arrival():
+    failures = judge_c2(
+        delivered_distinct=4,
+        expected_distinct=6,
+        arrival_order=["p4c2b-0-aa", "p4c2b-1-aa", "p4c2b-2-aa", "p4c2b-3-aa"],
+    )
+    assert any("does not prove a live message was handled" in f for f in failures)
+
+
+def test_backlog_with_live_judge_fails_without_an_ordered_record():
+    """No arrival record at all is a refusal, not a pass."""
+    failures = judge_c2(delivered_distinct=0, expected_distinct=6, arrival_order=[])
+    assert any("does not prove a live message was handled" in f for f in failures)
+
+
+def test_backlog_with_live_judge_fails_a_shortfall():
+    failures = judge_c2(delivered_distinct=5, expected_distinct=6)
+    assert any("recorded 5 distinct nonces, expected 6" in f for f in failures)
+
+
+def test_backlog_with_live_judge_fails_duplicates():
+    failures = judge_c2(duplicate_arrivals=1)
+    assert any("duplicate arrivals" in failure for failure in failures)

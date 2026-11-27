@@ -15,6 +15,9 @@ the counts it measured and the evidence path it wrote.
   c2-backlog-with-live
       A backlog is queued while MEDRE is stopped; MEDRE is started and the
       peer keeps sending live notifications while the drain is in flight.
+      The recorded arrival order must prove the interleaving: at least one
+      live message observed at MEDRE before the last backlog message was
+      delivered, not merely both kinds present after the fact.
 
   c3-client-sync-during-persist
       The repeater's SQLite store is LOCKED (held from inside the repeater
@@ -267,6 +270,78 @@ def missing_indices(markers: list[str], expected: set[str]) -> list[str]:
     """Return the markers of this run that never arrived."""
     seen = set(markers)
     return sorted(expected - seen)
+
+
+def interleaving_report(
+    arrival_order: list[str],
+    backlog_markers: set[str],
+    live_markers: set[str],
+) -> dict:
+    """Locate the live arrivals inside the backlog's delivery span.
+
+    MEDRE's store returns the events in recorded arrival order, so the
+    positions decide the interleaving: the case proves a live message was
+    handled while the backlog was still being delivered when at least one
+    live marker was recorded BEFORE the last backlog marker.
+    """
+    backlog_positions = [
+        index for index, marker in enumerate(arrival_order) if marker in backlog_markers
+    ]
+    live_positions = [
+        index for index, marker in enumerate(arrival_order) if marker in live_markers
+    ]
+    return {
+        "backlog_arrivals": len(backlog_positions),
+        "live_arrivals": len(live_positions),
+        "first_live_position": min(live_positions) if live_positions else None,
+        "last_backlog_position": max(backlog_positions) if backlog_positions else None,
+        "live_arrived_before_last_backlog": bool(
+            live_positions
+            and backlog_positions
+            and min(live_positions) < max(backlog_positions)
+        ),
+    }
+
+
+def backlog_with_live_failures(
+    *,
+    delivered_distinct: int,
+    expected_distinct: int,
+    duplicate_arrivals: int,
+    arrival_order: list[str],
+    backlog_markers: set[str],
+    live_markers: set[str],
+) -> list[str]:
+    """Judge the backlog-with-live case by its interleaving claim.
+
+    Both kinds arriving eventually is not what the case is named for: it
+    measures a backlog drain that competes with live traffic.  On top of
+    the accounting (every backlog and live message delivered, zero
+    duplicates) the recorded arrival order must therefore prove the
+    interleaving itself - at least one live message observed at MEDRE
+    before the last backlog message was delivered.  Fail closed: an
+    arrival order that shows no live arrival inside the backlog's
+    delivery span, or no ordered record at all, is not a pass.
+    """
+    failures: list[str] = []
+    if delivered_distinct != expected_distinct:
+        failures.append(
+            f"MEDRE recorded {delivered_distinct} distinct nonces, expected "
+            f"{expected_distinct}"
+        )
+    if duplicate_arrivals:
+        failures.append(
+            f"{duplicate_arrivals} duplicate arrivals while the backlog "
+            "competed with live notifications"
+        )
+    interleaving = interleaving_report(arrival_order, backlog_markers, live_markers)
+    if not interleaving["live_arrived_before_last_backlog"]:
+        failures.append(
+            "no live message was observed at MEDRE before the last backlog "
+            "delivery: the recorded arrival order does not prove a live "
+            "message was handled while the backlog drain was in flight"
+        )
+    return failures
 
 
 def kill_mid_drain_failures(
@@ -800,10 +875,12 @@ class Matrix:
                 timeout=180,
                 interval=3.0,
             )
-            events = self.medre_events(
-                back_prefix, only=back_markers
-            ) + self.medre_events(live_prefix, only=live_markers_sent)
+            # One combined snapshot keeps the recorded arrival order across
+            # both kinds: the interleaving proof reads this order (the
+            # store returns canonical_events ORDER BY created_at), so two
+            # separately-ordered reads would not do.
             mine = back_markers | live_markers_sent
+            events = self.medre_events("p4c2", only=mine)
             markers = [
                 marker
                 for marker in (
@@ -821,6 +898,7 @@ class Matrix:
                 if marker is not None and marker in live_markers_sent
             ]
             live_report = ordering_report(live_markers)
+            interleaving = interleaving_report(markers, back_markers, live_markers_sent)
             failures: list[str] = []
             if (
                 back_send.get("pass") is not True
@@ -831,18 +909,15 @@ class Matrix:
                 failures.append(
                     "the case needs both a full persisted backlog and an accepted live batch"
                 )
-            if report["distinct"] != persisted_count + int(
-                live_send.get("accepted_count") or 0
-            ):
-                failures.append(
-                    f"MEDRE recorded {report['distinct']} distinct nonces, expected "
-                    f"{persisted_count + int(live_send.get('accepted_count') or 0)}"
-                )
-            if report["duplicate_arrivals"]:
-                failures.append(
-                    f"{report['duplicate_arrivals']} duplicate arrivals while the backlog "
-                    "competed with live notifications"
-                )
+            failures += backlog_with_live_failures(
+                delivered_distinct=report["distinct"],
+                expected_distinct=persisted_count
+                + int(live_send.get("accepted_count") or 0),
+                duplicate_arrivals=report["duplicate_arrivals"],
+                arrival_order=markers,
+                backlog_markers=back_markers,
+                live_markers=live_markers_sent,
+            )
             self.write(
                 name,
                 {
@@ -850,12 +925,20 @@ class Matrix:
                     "pass": not failures,
                     "failures": failures,
                     "preconditions": pre,
+                    "verdict_rule": (
+                        "backlog-with-live verdict: the full persisted backlog "
+                        "and the accepted live batch are all delivered with "
+                        "zero duplicates, AND the recorded arrival order proves "
+                        "the interleaving - at least one live message observed "
+                        "at MEDRE before the last backlog message was delivered"
+                    ),
                     "backlog_requested": backlog,
                     "backlog_persisted": persisted_count,
                     "live_requested": live,
                     "live_accepted": live_send.get("accepted_count"),
                     "combined_report": report,
                     "live_only_report": live_report,
+                    "interleaving_report": interleaving,
                     "backlog_send": back_send,
                     "live_send": live_send,
                 },
