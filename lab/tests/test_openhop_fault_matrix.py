@@ -572,3 +572,79 @@ def test_the_recorded_wave19_overrun_is_impossible_by_construction():
     window = fault_matrix.saturation_window_for(fault_matrix.SATURATION_BATCH, 1.6)
     assert window >= 60 * 1.6 + 10
     assert window - 60 * 1.6 >= fault_matrix.SATURATION_WINDOW_HEADROOM_S
+
+
+# ---------------------------------------------------------------------------
+# The selective-drop link's proof: the splice records forwarded probe
+# replies and dropped message frames per connection; the proof holds when
+# ONE connection carries both.
+# ---------------------------------------------------------------------------
+
+
+def link_event(stamp: float, event: str, connection: int, packet_type=None):
+    return {
+        "at": stamp,
+        "event": event,
+        "connection": connection,
+        "packet_type": packet_type,
+    }
+
+
+def test_splice_link_events_carry_packet_types():
+    log = "\n".join(
+        [
+            '2026-11-26T18:00:02.000000Z {"event": "message_frame_dropped", '
+            '"connection": 1, "packet_type": 7}',
+            '2026-11-26T18:00:05.000000Z {"event": "probe_reply_forwarded", '
+            '"connection": 1, "packet_type": 13}',
+        ]
+    )
+    events = fault_matrix.splice_link_events(log)
+    assert [e["event"] for e in events] == [
+        "message_frame_dropped",
+        "probe_reply_forwarded",
+    ]
+    assert events[0]["packet_type"] == 7
+    assert events[1]["packet_type"] == 13
+    assert all(e["connection"] == 1 for e in events)
+
+
+def test_the_proof_report_proves_one_connection_with_both():
+    events = [
+        link_event(1.0, "probe_reply_forwarded", 1, 13),
+        link_event(2.0, "message_frame_dropped", 1, 7),
+        link_event(3.0, "message_frame_dropped", 1, 8),
+    ]
+    report = fault_matrix.selective_drop_proof_report(events)
+    assert report["same_connection_proven"] is True
+    assert report["message_frames_dropped_per_connection"] == {1: 2}
+    assert report["probe_replies_forwarded_per_connection"] == {1: 1}
+
+
+def test_the_proof_report_ignores_pushes_and_no_more_replies():
+    """Swallowed notifications and empty drains carry no message: they are
+    part of the link's definition, never proof of a lost frame."""
+    events = [
+        link_event(1.0, "message_frame_dropped", 1, 0x83),
+        link_event(2.0, "message_frame_dropped", 1, 0x0A),
+        link_event(3.0, "probe_reply_forwarded", 1, 13),
+    ]
+    report = fault_matrix.selective_drop_proof_report(events)
+    assert report["same_connection_proven"] is False
+    assert report["message_frames_dropped_per_connection"] == {}
+
+
+def test_the_proof_report_fails_when_the_kinds_split_across_connections():
+    events = [
+        link_event(1.0, "probe_reply_forwarded", 1, 13),
+        link_event(2.0, "message_frame_dropped", 2, 7),
+    ]
+    report = fault_matrix.selective_drop_proof_report(events)
+    assert report["same_connection_proven"] is False
+
+
+def test_the_proof_report_is_empty_without_events():
+    report = fault_matrix.selective_drop_proof_report([])
+    assert report["same_connection_proven"] is False
+    assert report["probe_replies_forwarded_per_connection"] == {}
+    assert report["message_frames_dropped_per_connection"] == {}

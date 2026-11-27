@@ -242,6 +242,23 @@ def test_dropper_resyncs_past_bytes_that_cannot_start_a_frame(tmp_path):
     assert proxy.STATS["frame_resyncs"] == before + 2
 
 
+def test_dropper_logs_forwarded_probe_replies_per_connection(tmp_path, capsys):
+    """The link's proof evidence: forwarded probe replies are recorded."""
+    dropper, _ = make_dropper(tmp_path)
+    before = proxy.STATS["probe_replies_forwarded"]
+    out = dropper.feed(PROBE_REPLY + MESSAGE_FRAMES[:12], connection=3)
+    assert out == PROBE_REPLY  # the probe reply is forwarded, the frame dropped
+    assert proxy.STATS["probe_replies_forwarded"] == before + 1
+    events = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("{")
+    ]
+    forwarded = [e for e in events if e["event"] == "probe_reply_forwarded"]
+    assert forwarded and forwarded[0]["connection"] == 3
+    assert forwarded[0]["packet_type"] == proxy.PROBE_REPLY_TYPE
+
+
 def test_dropper_keeps_dropping_across_chunks(tmp_path):
     dropper, _ = make_dropper(tmp_path)
     assert dropper.feed(MESSAGE_FRAMES[:12] + PROBE_REPLY, connection=1) == (

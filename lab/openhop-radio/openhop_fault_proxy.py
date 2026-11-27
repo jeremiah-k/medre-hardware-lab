@@ -48,23 +48,23 @@ the configured duration across every connection inside the window):
 
   drop_message_frames (boolean, content-triggered): parse the companion
   frames on the server -> client side (">" 0x3E + 2-byte LE length +
-  data, data[0] = packet type) and swallow exactly the message path -
-  the replies to the client's 0x0a sync command (CONTACT/CHANNEL_MSG_
-  RECV 0x07/0x08 and their V3 forms 0x10/0x11, plus the empty drain's
-  NO_MORE_MSGS 0x0a) AND the MESSAGES_WAITING 0x83 pushes that
-  announce them - forwarding the handshake reply and the
-  liveness-probe replies unchanged.  This constructs the documented
-  per-connection worst case - a link that ANSWERS THE PROBES AND
-  SWALLOWS THE MESSAGE FRAMES and therefore consumes at most one
-  queued message per answered probe - deterministically: no
-  chunk-count budget whose phasing could race the pump's fetch cycles,
-  and no delivered notification to arm extra drains.  Every dropped
-  frame logs one JSON line with the connection identity (so the
-  verdict can attribute the lost frames per connection).  The splice
-  still never SPEAKS the protocol: it reads frame boundaries and one
-  packet-type byte from the wire, forwards all payload bytes of every
-  forwarded frame unchanged, and logs counters and drop events, never
-  payload bytes.
+  data, data[0] = packet type) and construct THE LINK THE SPEC'S
+  ELAPSED-WINDOW RULE DESCRIBES: the handshake reply and the
+  liveness-probe (device-query) replies are FORWARDED, and the message
+  frames (the replies to the client's 0x0a sync command:
+  CONTACT/CHANNEL_MSG_RECV 0x07/0x08 and their V3 forms 0x10/0x11,
+  plus the empty drain's NO_MORE_MSGS 0x0a) AND the MESSAGES_WAITING
+  0x83 notifications that announce them are SWALLOWED.  On this link
+  nothing but an answered probe can re-arm a fetch, so it consumes at
+  most one queued message per probe interval - deterministically: no
+  chunk-count budget whose phasing could race the pump's fetch cycles.
+  A dropped message frame or notification logs one JSON line with the
+  connection identity, and a forwarded probe reply logs one too, so
+  the verdict can prove per connection that the same link both
+  answered a probe and lost a message frame.  The splice still never
+  SPEAKS the protocol: it reads frame boundaries and one packet-type
+  byte from the wire, forwards all payload bytes of every forwarded
+  frame unchanged, and logs counters and events, never payload bytes.
 
   stall_server_to_client_on_request (boolean) opens the reply stall at
                                  the FIRST client->server chunk observed
@@ -132,6 +132,7 @@ STATS = {
     "request_stall_chunks_withheld": 0,
     "message_frames_dropped": 0,
     "frame_resyncs": 0,
+    "probe_replies_forwarded": 0,
 }
 
 # The dynamic flags live in the fault file; re-read with this pace while a
@@ -315,6 +316,7 @@ class RequestStall:
 FRAME_OUT_START = 0x3E
 MESSAGE_FRAME_TYPES = frozenset({0x07, 0x08, 0x0A, 0x10, 0x11})
 MESSAGES_WAITING_PUSH = 0x83
+PROBE_REPLY_TYPE = 0x0D
 DROP_MESSAGE_FRAMES_KEY = "drop_message_frames"
 
 
@@ -378,6 +380,21 @@ class MessageFrameDropper:
                     flush=True,
                 )
                 continue
+            if len(frame) > 3 and frame[3] == PROBE_REPLY_TYPE:
+                # The link's proof evidence: a liveness-probe reply this
+                # connection FORWARDED, recorded right next to the message
+                # frames it swallows.
+                STATS["probe_replies_forwarded"] += 1
+                print(
+                    json.dumps(
+                        {
+                            "event": "probe_reply_forwarded",
+                            "connection": connection,
+                            "packet_type": frame[3],
+                        }
+                    ),
+                    flush=True,
+                )
             out += frame
         return bytes(out)
 

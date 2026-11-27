@@ -74,24 +74,24 @@ The matrix
                    reconnect backoff plus one gated probe budget - and
                    every other accepted message is delivered once; zero
                    duplicates.
-  selective_drop   the PER-CONNECTION worst case the spec bounds: a link
-                   that answers the probes and swallows the message
-                   frames - CONSTRUCTED, not phased: the splice parses
-                   the companion frames and swallows exactly the
-                   message frames (the replies to the sync command and
-                   the empty drain; content-triggered,
-                   drop_message_frames), forwarding the handshake and
-                   the probe replies, so the answered probes and the
-                   swallowed message frames belong to the same
-                   connection every time.  Its
-                   verdict asserts the documented bound per connection -
-                   at most one consumed message per answered liveness
-                   probe on that connection beyond the unproven first
-                   fetch, every other accepted message delivered or
+  selective_drop   the PER-CONNECTION worst case the spec bounds: THE
+                   LINK, constructed content-triggered (drop_message_
+                   frames): the splice forwards the handshake and the
+                   liveness-probe (device-query) replies and swallows
+                   the message frames AND the MESSAGES_WAITING
+                   notifications, so only an answered probe can re-arm
+                   a fetch and the link consumes at most one queued
+                   message per probe interval.  Its verdict asserts
+                   the documented bound per connection - at most one
+                   consumed message per answered liveness probe on
+                   that connection beyond the unproven first fetch,
+                   every other accepted message delivered or
                    preserved, zero duplicates - and PROVES the shape:
                    the splice's own connection identity must attribute
                    an answered probe and a lost frame to the SAME
-                   connection, not merely report aggregate counts.
+                   connection, observed within a window bounded by
+                   at least two probe intervals after the batch is
+                   confirmed queued.
   idle_blackhole   BOTH directions of an up, idle link are blackholed
                    (no close, armed by writing the splice's fault file):
                    the idle-link probe must retire the connection within
@@ -146,6 +146,16 @@ PROXY = "medre-lab-openhop-fault-proxy"
 REPEATER_A = "medre-lab-openhop-repeater-a"
 MEDRE_BRIDGE = "medre-lab-medre-openhop-bridge"
 MEDRE_FAULT = "medre-lab-medre-openhop-fault"
+
+# The selective-drop link's proof parameters.  The pinned adapter probes
+# the idle link every 15 s (_PROBE_IDLE_INTERVAL in the adapter's
+# session.py); the deterministic observation bound is at least two of
+# those intervals.  The message-carrying frame types are the replies to
+# the client's sync command (a swallowed one is a consumed message); the
+# probe reply type is DEVICE_INFO, which the link forwards.
+PROBE_INTERVAL_S = 15.0
+MESSAGE_CARRYING_TYPES = frozenset({0x07, 0x08, 0x10, 0x11})
+PROBE_REPLY_TYPE = 0x0D
 
 RECONNECT = re.compile(r"reconnect attempt (\d+)", re.IGNORECASE)
 # The full marker is p4<case>-<index>-<unique>: the unique tail is what
@@ -262,6 +272,83 @@ def splice_stall_events(proxy_log: str) -> list[tuple[float, str, int]]:
         ):
             events.append((stamp, payload["event"], payload["connection"]))
     return sorted(events)
+
+
+def splice_link_events(proxy_log: str) -> list[dict]:
+    """Return the splice's link events with their packet types.
+
+    Every ``{"event": ..., "connection": N, "packet_type": T}`` line the
+    splice logged for the link the selective-drop case constructs:
+    ``message_frame_dropped`` (a swallowed message frame or notification),
+    ``probe_reply_forwarded`` (a liveness-probe reply the link let
+    through), and the legacy budget ``stalled`` boundaries.  Timestamps
+    come from ``docker logs -t``.
+    """
+    events: list[dict] = []
+    for line in proxy_log.splitlines():
+        start = line.find("{")
+        if start < 0:
+            continue
+        stamp = line_time(line)
+        if stamp is None:
+            continue
+        try:
+            payload = json.loads(line[start:])
+        except ValueError:
+            continue
+        if payload.get("event") in (
+            "stalled",
+            "message_frame_dropped",
+            "probe_reply_forwarded",
+        ) and isinstance(payload.get("connection"), int):
+            events.append(
+                {
+                    "at": stamp,
+                    "event": payload["event"],
+                    "connection": payload["connection"],
+                    "packet_type": payload.get("packet_type"),
+                }
+            )
+    return sorted(events, key=lambda e: e["at"])
+
+
+def selective_drop_proof_report(link_events: list[dict]) -> dict:
+    """Prove, per connection, the link both answered a probe and lost a frame.
+
+    The selective-drop claim is about ONE connection: the same link
+    forwarded a liveness-probe reply and swallowed a message-carrying
+    frame (packet types 0x07/0x08/0x10/0x11 - a swallowed message frame
+    is a consumed message).  Swallowed NO_MORE_MSGS replies (0x0a) and
+    MESSAGES_WAITING notifications (0x83) are part of the link's
+    definition but do not count as lost message frames: they carry no
+    message.  The proof holds when one connection has at least one of
+    each.
+    """
+    probe_replies_forwarded: dict[int, int] = {}
+    message_frames_dropped: dict[int, int] = {}
+    for event in link_events:
+        connection = event["connection"]
+        if event["event"] == "probe_reply_forwarded":
+            probe_replies_forwarded[connection] = (
+                probe_replies_forwarded.get(connection, 0) + 1
+            )
+        elif (
+            event["event"] == "message_frame_dropped"
+            and event.get("packet_type") in MESSAGE_CARRYING_TYPES
+        ):
+            message_frames_dropped[connection] = (
+                message_frames_dropped.get(connection, 0) + 1
+            )
+    proven = any(
+        message_frames_dropped.get(connection, 0) > 0
+        and probe_replies_forwarded.get(connection, 0) > 0
+        for connection in set(probe_replies_forwarded) | set(message_frames_dropped)
+    )
+    return {
+        "probe_replies_forwarded_per_connection": probe_replies_forwarded,
+        "message_frames_dropped_per_connection": message_frames_dropped,
+        "same_connection_proven": proven,
+    }
 
 
 def connection_of(stamp: float, stalls: list[tuple[float, int]]) -> int | None:
@@ -1115,18 +1202,59 @@ class FaultMatrix:
             if not self.wait_for(lambda: container_running(PROXY), 60, interval=1.0):
                 self.not_run(name, "the fault proxy did not start")
                 return
-            if not self.start_fault_medre():
-                self.not_run(name, "the fault MEDRE container did not start")
-                return
-            time.sleep(settle)
-            send = self.peer_send(count, prefix)
-            if send.get("pass") is not True or len(sent_markers(send)) != count:
-                self.not_run(name, "the peer did not accept the complete traffic batch")
-                return
-            time.sleep(settle)
+            if verdict != "bounded":
+                if not self.start_fault_medre():
+                    self.not_run(name, "the fault MEDRE container did not start")
+                    return
+                time.sleep(settle)
+                send = self.peer_send(count, prefix)
+                if send.get("pass") is not True or len(sent_markers(send)) != count:
+                    self.not_run(
+                        name, "the peer did not accept the complete traffic batch"
+                    )
+                    return
+                accepted = int(send.get("accepted_count") or 0)
+                time.sleep(settle)
+            else:
+                # (a) ORDER, bounded only: the link is armed but NO client
+                # is attached, so the peer queues the whole batch at
+                # companion A and the rows ACCUMULATE (nothing drains
+                # them); the case confirms the batch queued BEFORE the
+                # fault MEDRE attaches - the attach is the observation
+                # window's start.
+                time.sleep(settle)
+                send = self.peer_send(count, prefix)
+                if send.get("pass") is not True or len(sent_markers(send)) != count:
+                    self.not_run(
+                        name, "the peer did not accept the complete traffic batch"
+                    )
+                    return
+                accepted = int(send.get("accepted_count") or 0)
+                batch_queued = self.wait_for(
+                    lambda: len(
+                        state_in(REPEATER_A, "repeater", prefix).get(
+                            "companion_messages"
+                        )
+                        or []
+                    )
+                    >= accepted,
+                    180,
+                    interval=2.0,
+                )
+                if not batch_queued:
+                    self.not_run(
+                        name,
+                        "the companion never reported the whole batch queued; "
+                        "the observation window cannot start",
+                    )
+                    return
+                if not self.start_fault_medre():
+                    self.not_run(name, "the fault MEDRE container did not start")
+                    return
             log = container_logs(MEDRE_FAULT)
             churn = count_reconnects(log)
             mine = sent_markers(send)
+            queue_snapshots: list[dict] = []
             events = (
                 state_in(MEDRE_FAULT, "medre", prefix).get("canonical_events") or []
             )
@@ -1150,20 +1278,29 @@ class FaultMatrix:
             preserved = len(set(persisted_indices))
             connection_evidence: dict = {}
             if verdict == "bounded":
-                # The construction drops a message frame at the first
-                # probe-armed fetch after the batch is queued (the pump
-                # pops the oldest queued message and the splice swallows
-                # its reply).  The accounting window OBSERVES the splice's
-                # own drop event - content-triggered, never a fixed sleep -
-                # plus one probe interval of margin, so the reads span the
-                # deterministic drop; a run whose queue never yields a drop
-                # fails closed below (no proof, no pass).
-                drops_observed = self.wait_for(
-                    lambda: "message_frame_dropped" in container_logs(PROXY),
-                    120,
-                    interval=2.0,
-                )
-                time.sleep(16)
+                # (b) CONTENT-TRIGGERED WAIT: the batch is already confirmed
+                # queued and the fault MEDRE has just attached, so the
+                # window observes until the splice has recorded, on ONE
+                # connection, both a forwarded probe reply and a dropped
+                # message-carrying frame.  The bound is at least two probe
+                # intervals (three, for margin) derived from the configured
+                # probe interval.
+                observation_bound_s = 3 * PROBE_INTERVAL_S
+                observation_deadline = time.monotonic() + observation_bound_s
+                proof_report: dict = {}
+                while True:
+                    proof_report = selective_drop_proof_report(
+                        splice_link_events(timestamped_logs(PROXY))
+                    )
+                    if proof_report["same_connection_proven"]:
+                        break
+                    if time.monotonic() >= observation_deadline:
+                        break
+                    time.sleep(2.0)
+                # One probe interval of margin before the accounting reads,
+                # so a second consumed message (the next probe's fetch) is
+                # spanned too.
+                time.sleep(PROBE_INTERVAL_S)
                 # Per-connection attribution: the splice's own frame-boundary
                 # events carry the connection identity, so the answered
                 # probes and the lost frames are attributed to the
@@ -1214,7 +1351,21 @@ class FaultMatrix:
                     unattributed_consumed=unattributed_consumed,
                     same_connection_proven=same_connection_proven,
                 )
+                proof_report = selective_drop_proof_report(
+                    splice_link_events(timestamped_logs(PROXY))
+                )
                 connection_evidence = {
+                    "link_definition": (
+                        "the splice forwards the handshake and the "
+                        "liveness-probe (device-query) replies and swallows "
+                        "the message frames AND the MESSAGES_WAITING "
+                        "notifications, so only an answered probe can re-arm "
+                        "a fetch"
+                    ),
+                    "probe_interval_s": PROBE_INTERVAL_S,
+                    "observation_bound_s": 3 * PROBE_INTERVAL_S,
+                    "batch_confirmed_queued": batch_queued,
+                    **proof_report,
                     "splice_frame_events": [
                         {
                             "event": event,
@@ -1225,27 +1376,26 @@ class FaultMatrix:
                         }
                         for s, event, c in stalls
                     ],
-                    "drop_event_observed": drops_observed,
                     "answered_probes_per_connection": answered_per_connection,
                     "consumed_per_connection": consumed_per_connection,
                     "unattributed_consumed": unattributed_consumed,
                     "same_connection_proof": same_connection_proven,
                 }
                 verdict_rule = (
-                    "selective-drop verdict (the documented worst case): a link "
-                    "that answers the probes and swallows the message frames "
-                    "consumes at most one queued message per answered liveness "
-                    "probe beyond the unproven first fetch, PER CONNECTION - "
-                    "the injection is content-triggered (the splice parses the "
-                    "companion frames and swallows exactly the message frames - "
-                    "the replies to the sync command and the empty drain - "
-                    "forwarding the handshake and the probe replies), "
-                    "so the answered probes and the swallowed frames are the "
-                    "same connection's by construction; the splice's own "
-                    "connection identity attributes each answered probe and "
-                    "each lost frame to the connection it belonged to, and "
-                    "the proof requires one connection with both; every other "
-                    "accepted message is delivered or still preserved at the "
+                    "selective-drop verdict (the documented worst case): the "
+                    "link forwards the handshake and the liveness-probe "
+                    "(device-query) replies and swallows the message frames "
+                    "AND the MESSAGES_WAITING notifications, so only an "
+                    "answered probe can re-arm a fetch, and it consumes at "
+                    "most one queued message per answered liveness probe "
+                    "beyond the unproven first fetch, PER CONNECTION - the "
+                    "injection is content-triggered (the splice parses the "
+                    "companion frames), so the answered probes and the "
+                    "swallowed message frames are the same connection's by "
+                    "construction; the proof requires one connection with "
+                    "both, observed within an observation window bounded by "
+                    "at least two probe intervals; every other accepted "
+                    "message is delivered or still preserved at the "
                     "companion; zero duplicates"
                 )
             else:
