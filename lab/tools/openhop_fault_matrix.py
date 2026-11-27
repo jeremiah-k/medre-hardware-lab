@@ -529,6 +529,36 @@ def sent_markers(probe_result: dict) -> set[str]:
     return markers
 
 
+def wake_batch_arrived_whole(batch: dict, delivered_markers: set[str]) -> bool:
+    """The queue drain's success test: its own wake batch arrived whole.
+
+    ``batch`` is one peer_send result and ``delivered_markers`` the
+    markers the fault MEDRE's store holds for the wake prefix.  Each
+    batch's unique tails make one message one message, so an earlier
+    wake batch's rows cannot stand in for this one: every marker THIS
+    batch sent must be among the delivered ones.
+    """
+    markers = sent_markers(batch)
+    return bool(markers) and markers <= delivered_markers
+
+
+def inert_rows_by_identity(rows: list[dict]) -> list[dict]:
+    """Group the rows that remain after the drain by companion identity.
+
+    The queue-ownership rule binds a row to the client identity that was
+    attached when it was persisted, so rows of ANOTHER identity can never
+    be popped by this client: they are inert, reported (hash and ids)
+    rather than chased as leftovers.
+    """
+    grouped: dict[str, list] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get("companion_hash")), []).append(row.get("id"))
+    return [
+        {"companion_hash": companion_hash, "ids": sorted(ids, key=str)}
+        for companion_hash, ids in sorted(grouped.items())
+    ]
+
+
 def state_in(container: str, mode: str, needle: str = "") -> dict:
     rc, _, _ = run(
         [
@@ -1272,9 +1302,9 @@ class FaultMatrix:
         return data
 
     def drain_companion_a(
-        self, rounds: int = 3, wake_batch: int = 8, seconds: float = 90.0
-    ) -> int:
-        """Drain companion A's leftover queue rows into their owner.
+        self, rounds: int = 2, wake_batch: int = 8, seconds: float = 90.0
+    ) -> dict:
+        """Drain companion A's leftover queue rows through their owner.
 
         The bounded selective-drop case leaves messages preserved at the
         companion by design, and the fork's queue-ownership rule binds
@@ -1282,16 +1312,30 @@ class FaultMatrix:
         were persisted - a generic SDK probe cannot pop another client's
         rows.  The drain therefore re-attaches the case's OWN MEDRE
         through an empty splice (no fault) and lets its receive pump pop
-        the queue into MEDRE's own store, polling the repeater's queue
-        total until it reads zero or the deadline passes.  Returns the
-        rows still held when the drain gave up; the caller logs the
-        remainder.  Hygiene, not measurement: every case's preserved
-        counts are already recorded in its evidence.
+        the queue into MEDRE's own store.
+
+        The success criterion is CONSTRUCTIVE: the drain's own wake batch
+        (prefix p4drainw, sent through the pass-through splice) arrives
+        whole at the fault MEDRE.  The queue serves oldest-first, so when
+        the wake batch has arrived, every row queued ahead of it for this
+        client has been popped.  One retry with a second wake batch is
+        allowed before the drain reports failure.  Rows that remain after
+        the criterion is met belong to another lab identity and are inert
+        for this client: they are reported as ``inert_rows`` (hash and
+        ids), not chased.  Hygiene, not measurement: every case's
+        preserved counts are already recorded in its evidence.
         """
         first_connect = re.compile(
             r"started \(mode=tcp, connected=True\)|reconnected successfully",
             re.IGNORECASE,
         )
+        report: dict = {
+            "wake_batch_arrived_whole": False,
+            "rounds_used": 0,
+            "remaining_rows": None,
+            "inert_rows": [],
+            "wake_batches": [],
+        }
         try:
             if container_running(MEDRE_BRIDGE):
                 # The companion serves one client at a time: the drain's
@@ -1299,46 +1343,70 @@ class FaultMatrix:
                 run(["docker", "stop", MEDRE_BRIDGE], timeout=180)
             self.start_proxy({})
             if not self.wait_for(lambda: container_running(PROXY), 60, interval=1.0):
-                return (
+                report["error"] = "the fault splice did not start"
+                report["remaining_rows"] = (
                     state_in(REPEATER_A, "repeater").get("companion_message_total") or 0
                 )
+                return report
             self.stop_fault_medre()
             if not self.start_fault_medre():
-                return (
+                report["error"] = "the fault MEDRE container did not start"
+                report["remaining_rows"] = (
                     state_in(REPEATER_A, "repeater").get("companion_message_total") or 0
                 )
+                return report
             self.wait_for(
                 lambda: first_connect.search(container_logs(MEDRE_FAULT)) is not None,
                 120,
                 interval=2.0,
             )
             deadline = time.monotonic() + seconds
-            for _ in range(rounds):
-                remaining = (
-                    state_in(REPEATER_A, "repeater").get("companion_message_total") or 0
-                )
-                if remaining == 0:
-                    return 0
+            for round_index in range(rounds):
+                report["rounds_used"] = round_index + 1
                 # A fresh arrival is announced (a real MESSAGES_WAITING
                 # push), and the wake-driven drain serves oldest-first:
-                # the batch empties the companion's queue, stale rows
-                # included.
-                self.peer_send(wake_batch, "p4drainw")
+                # the batch empties the companion's queue for this client,
+                # stale rows included.
+                batch = self.peer_send(wake_batch, "p4drainw")
+                report["wake_batches"].append(
+                    {
+                        "pass": batch.get("pass"),
+                        "accepted_count": batch.get("accepted_count"),
+                        "nonces": batch.get("nonces") or [],
+                    }
+                )
                 batch_deadline = time.monotonic() + 60.0
                 while time.monotonic() < batch_deadline:
-                    remaining = (
-                        state_in(REPEATER_A, "repeater").get("companion_message_total")
-                        or 0
+                    events = (
+                        state_in(MEDRE_FAULT, "medre", "p4drainw").get(
+                            "canonical_events"
+                        )
+                        or []
                     )
-                    if remaining == 0:
-                        return 0
+                    delivered = {
+                        marker
+                        for marker in (
+                            nonce_marker(json.dumps(event, sort_keys=True))
+                            for event in events
+                        )
+                        if marker is not None
+                    }
+                    if wake_batch_arrived_whole(batch, delivered):
+                        rows = (
+                            state_in(REPEATER_A, "repeater").get("companion_messages")
+                            or []
+                        )
+                        report["wake_batch_arrived_whole"] = True
+                        report["remaining_rows"] = len(rows)
+                        report["inert_rows"] = inert_rows_by_identity(rows)
+                        return report
                     time.sleep(3)
                 if time.monotonic() >= deadline:
                     break
-            remaining = (
+            report["remaining_rows"] = (
                 state_in(REPEATER_A, "repeater").get("companion_message_total") or 0
             )
-            return remaining
+            return report
         finally:
             self.stop_fault_medre()
             run(["docker", "rm", "-f", PROXY], timeout=120)
@@ -1394,6 +1462,34 @@ class FaultMatrix:
             }
         try:
             queue_snapshots: list[dict] = []
+            if verdict == "bounded":
+                # Clean-queue step: this case leaves preserved rows behind
+                # BY DESIGN and the next case's client would pop them
+                # first, so the drain runs immediately before the case
+                # (and again at the end of the invocation).  Fail closed
+                # only when the drain's wake batch does not arrive whole:
+                # then the queue state is unknown and the case cannot
+                # start; inert rows of another identity are not a reason
+                # to refuse.
+                queue_snapshots.append(
+                    self.companion_queue_snapshot("queue_before_drain")
+                )
+                drain_report = self.drain_companion_a()
+                queue_snapshots.append(
+                    self.companion_queue_snapshot("queue_after_drain")
+                )
+                if not drain_report.get("wake_batch_arrived_whole"):
+                    self.not_run(
+                        name,
+                        "the pre-case queue drain's wake batch did not arrive "
+                        "whole; the queue state is unknown and the case "
+                        "cannot start",
+                        {
+                            "queue_drain": drain_report,
+                            "queue_snapshots": queue_snapshots,
+                        },
+                    )
+                    return
             self.stop_bridge_medre()
             self.stop_fault_medre()
             self.start_proxy(fault)
@@ -1421,8 +1517,11 @@ class FaultMatrix:
                 # companion A and the rows ACCUMULATE (nothing drains
                 # them); the case confirms the batch queued BEFORE the
                 # fault MEDRE attaches - the attach is the observation
-                # window's start.
+                # window's start.  The BEFORE_BATCH snapshot is taken
+                # before the send, so it shows exactly what the queue
+                # held before this case's own rows arrived.
                 time.sleep(settle)
+                queue_snapshots.append(self.companion_queue_snapshot("before_batch"))
                 send = self.peer_send(count, prefix)
                 if send.get("pass") is not True or len(sent_markers(send)) != count:
                     self.not_run(
@@ -1430,7 +1529,6 @@ class FaultMatrix:
                     )
                     return
                 accepted = int(send.get("accepted_count") or 0)
-                queue_snapshots = [self.companion_queue_snapshot("before_batch")]
                 batch_queued = self.wait_for(
                     lambda: len(
                         state_in(REPEATER_A, "repeater", prefix).get(
@@ -1615,6 +1713,7 @@ class FaultMatrix:
                     "consumed_per_connection": consumed_per_connection,
                     "unattributed_consumed": unattributed_consumed,
                     "same_connection_proof": same_connection_proven,
+                    "queue_drain": drain_report,
                 }
                 verdict_rule = (
                     "selective-drop verdict (the documented worst case): the "
@@ -2712,14 +2811,22 @@ def main(argv: list[str] | None = None) -> int:
     # already recorded in each case's evidence.
     matrix.stop_fault_medre()
     try:
-        remaining = matrix.drain_companion_a()
+        drain_report = matrix.drain_companion_a()
     except (RuntimeError, OSError) as exc:
         print(f"companion A drain could not run: {exc}")
-        remaining = None
-    if remaining:
+        drain_report = None
+    if drain_report is not None and not drain_report.get("wake_batch_arrived_whole"):
         print(
-            f"companion A still holds {remaining} leftover row(s) after the "
-            "drain; a later listener at companion A will receive them"
+            "companion A drain failed: its wake batch did not arrive whole "
+            f"({drain_report.get('remaining_rows')} row(s) still held); a "
+            "later listener at companion A may receive stale rows"
+        )
+    elif drain_report is not None and drain_report.get("inert_rows"):
+        print(
+            "companion A drain left "
+            f"{drain_report.get('remaining_rows')} inert row(s) for another "
+            "lab identity (hash and ids in the drain's inert_rows); not "
+            "leftovers"
         )
     return (
         0

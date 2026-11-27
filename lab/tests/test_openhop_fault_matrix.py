@@ -908,7 +908,7 @@ MEDRE_LOG_ONE_ANSWERED_PROBE = (
 )
 
 
-def make_bounded_fakes(monkeypatch, tmp_path, preserved_markers):
+def make_bounded_fakes(monkeypatch, tmp_path, preserved_markers, drain_report=None):
     """Fake the rig behind run_case's bounded path.
 
     The fake companion store starts empty; the fake peer_send appends the
@@ -945,11 +945,16 @@ def make_bounded_fakes(monkeypatch, tmp_path, preserved_markers):
 
     def fake_snapshot(self, label):
         snapshot_labels.append(label)
-        kept = set(preserved_markers)
-        return {
-            "label": label,
-            "rows": [dict(row) for row in rows if row["marker"] in kept],
-        }
+        # The companion store holds every row appended so far; only
+        # at the observation's end do this run's lost rows disappear
+        # (swallowed by the link), so the final read keeps only the
+        # preserved markers.
+        if label == "observation_end":
+            kept = set(preserved_markers)
+            visible = [row for row in rows if row["marker"] in kept]
+        else:
+            visible = rows
+        return {"label": label, "rows": [dict(row) for row in visible]}
 
     monkeypatch.setattr(fault_matrix, "state_in", fake_state_in)
 
@@ -978,6 +983,19 @@ def make_bounded_fakes(monkeypatch, tmp_path, preserved_markers):
     monkeypatch.setattr(fault_matrix.FaultMatrix, "peer_send", fake_peer_send)
     monkeypatch.setattr(
         fault_matrix.FaultMatrix, "companion_queue_snapshot", fake_snapshot
+    )
+    if drain_report is None:
+        drain_report = {
+            "wake_batch_arrived_whole": True,
+            "rounds_used": 1,
+            "remaining_rows": 0,
+            "inert_rows": [],
+            "wake_batches": [],
+        }
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix,
+        "drain_companion_a",
+        lambda self: dict(drain_report),
     )
     return snapshot_labels
 
@@ -1010,9 +1028,133 @@ def test_the_bounded_record_carries_every_queue_snapshot_label_in_order(
     assert record["pass"] is True, record["failures"]
     labels = [snapshot["label"] for snapshot in record["queue_snapshots"]]
     assert labels == [
+        "queue_before_drain",
+        "queue_after_drain",
         "before_batch",
         "batch_confirmed",
         "attach_plus_3s",
         "observation_end",
         "end",
+    ]
+
+
+def test_before_batch_is_taken_before_the_batch(tmp_path, monkeypatch):
+    """The before_batch snapshot must show the queue BEFORE the case's
+    own rows arrive: taken after the send, it would already hold them."""
+    preserved = [f"p4qd-{index}-{index:06d}abc" for index in range(1, 6)]
+    make_bounded_fakes(monkeypatch, tmp_path, preserved)
+    matrix = fault_matrix.FaultMatrix(tmp_path / "evidence")
+    matrix.run_case(
+        "fault-selective-drop",
+        {"drop_message_frames": True},
+        6,
+        "p4qd",
+        0.0,
+        False,
+        "bounded",
+    )
+    record = json.loads(
+        (tmp_path / "evidence" / "fault-selective-drop.json").read_text()
+    )
+    before_batch = next(
+        snapshot
+        for snapshot in record["queue_snapshots"]
+        if snapshot["label"] == "before_batch"
+    )
+    assert before_batch["rows"] == []
+    batch_confirmed = next(
+        snapshot
+        for snapshot in record["queue_snapshots"]
+        if snapshot["label"] == "batch_confirmed"
+    )
+    assert len(batch_confirmed["rows"]) == 6
+
+
+def test_a_failed_wake_batch_fails_the_bounded_case_closed(tmp_path, monkeypatch):
+    """Fail closed ONLY on the drain's wake batch not arriving whole:
+    the queue state is unknown, so the case is NOT RUN with the drain
+    report in the record.  Inert rows are not a reason to refuse."""
+    inert = [{"companion_hash": "0x80", "ids": [1369, 1374]}]
+    preserved = [f"p4qd-{index}-{index:06d}abc" for index in range(1, 6)]
+    make_bounded_fakes(
+        monkeypatch,
+        tmp_path,
+        preserved,
+        drain_report={
+            "wake_batch_arrived_whole": True,
+            "rounds_used": 1,
+            "remaining_rows": 2,
+            "inert_rows": inert,
+            "wake_batches": [],
+        },
+    )
+    matrix = fault_matrix.FaultMatrix(tmp_path / "evidence-inert")
+    matrix.run_case(
+        "fault-selective-drop",
+        {"drop_message_frames": True},
+        6,
+        "p4qd",
+        0.0,
+        False,
+        "bounded",
+    )
+    record = json.loads(
+        (tmp_path / "evidence-inert" / "fault-selective-drop.json").read_text()
+    )
+    assert record["pass"] is True, record["failures"]
+    assert record["queue_drain"]["inert_rows"] == inert
+
+
+def test_a_wake_batch_that_never_arrives_whole_stops_the_case(tmp_path, monkeypatch):
+    failed = {
+        "wake_batch_arrived_whole": False,
+        "rounds_used": 2,
+        "remaining_rows": 4,
+        "inert_rows": [],
+        "wake_batches": [{"pass": True, "accepted_count": 8, "nonces": []}],
+    }
+    make_bounded_fakes(monkeypatch, tmp_path, [], drain_report=failed)
+    matrix = fault_matrix.FaultMatrix(tmp_path / "evidence-failed")
+    matrix.run_case(
+        "fault-selective-drop",
+        {"drop_message_frames": True},
+        6,
+        "p4qd",
+        0.0,
+        False,
+        "bounded",
+    )
+    record = json.loads(
+        (tmp_path / "evidence-failed" / "fault-selective-drop.json").read_text()
+    )
+    assert record["status"] == "NOT RUN"
+    assert "wake batch did not arrive whole" in record["reason"]
+    assert record["queue_drain"]["remaining_rows"] == 4
+
+
+def test_the_drain_criterion_requires_this_batchs_own_markers():
+    batch = {"nonces": [f"p4drainw-{index}-{index:06d}abc" for index in range(8)]}
+    delivered = set(batch["nonces"])
+    assert fault_matrix.wake_batch_arrived_whole(batch, delivered) is True
+    assert (
+        fault_matrix.wake_batch_arrived_whole(batch, delivered - {batch["nonces"][3]})
+        is False
+    )
+    # An earlier wake batch's rows cannot stand in for this one: the
+    # unique tails differ.
+    assert fault_matrix.wake_batch_arrived_whole(batch, {"p4drainw-0-stale01"}) is (
+        False
+    )
+    assert fault_matrix.wake_batch_arrived_whole({"nonces": []}, delivered) is False
+
+
+def test_inert_rows_are_grouped_by_identity_with_hash_and_ids():
+    rows = [
+        {"companion_hash": "0x80", "id": 1374},
+        {"companion_hash": "0x01", "id": 7},
+        {"companion_hash": "0x80", "id": 1369},
+    ]
+    assert fault_matrix.inert_rows_by_identity(rows) == [
+        {"companion_hash": "0x01", "ids": [7]},
+        {"companion_hash": "0x80", "ids": [1369, 1374]},
     ]
