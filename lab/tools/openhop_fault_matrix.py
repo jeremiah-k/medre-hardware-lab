@@ -156,6 +156,7 @@ MEDRE_FAULT = "medre-lab-medre-openhop-fault"
 PROBE_INTERVAL_S = 15.0
 MESSAGE_CARRYING_TYPES = frozenset({0x07, 0x08, 0x10, 0x11})
 PROBE_REPLY_TYPE = 0x0D
+DROP_MESSAGE_FRAMES_KEY = "drop_message_frames"
 
 RECONNECT = re.compile(r"reconnect attempt (\d+)", re.IGNORECASE)
 # The full marker is p4<case>-<index>-<unique>: the unique tail is what
@@ -240,22 +241,23 @@ def nonce_index(text: str) -> int | None:
     return int(match.group("index")) if match else None
 
 
-def splice_stall_events(proxy_log: str) -> list[tuple[float, str, int]]:
-    """Return (timestamp, connection) for every frame boundary the splice logged.
+def splice_stall_events(proxy_log: str) -> list[dict]:
+    """Return every frame-boundary event the splice logged, as dicts.
 
     The splice logs one JSON line per per-connection point where it
     started swallowing server->client frames - the budget exhaustion
     (``{"event": "stalled", "connection": N}``) and the content-triggered
     message-frame drops (``{"event": "message_frame_dropped",
-    "connection": N}``) - and ``docker logs -t`` prefixes each line with
-    the host's UTC time.  These events are the splice's own connection
-    identity: the boundaries that attribute MEDRE's answered probes and
-    the lost frames to the connection they belonged to, instead of
-    counting aggregates over the whole run.  Returns (timestamp, event,
-    connection) triples.
+    "connection": N, "packet_type": T}``) - and ``docker logs -t``
+    prefixes each line with the host's UTC time.  These events are the
+    splice's own connection identity: the boundaries that attribute
+    MEDRE's answered probes and the lost frames to the connection they
+    belonged to, instead of counting aggregates over the whole run.
+    Returns dicts with ``at`` (epoch), ``event``, ``connection`` and
+    ``packet_type`` (hex string when present).
     """
     boundary_events = {"stalled", "message_frame_dropped"}
-    events: list[tuple[float, str, int]] = []
+    events: list[dict] = []
     for line in proxy_log.splitlines():
         start = line.find("{")
         if start < 0:
@@ -270,8 +272,18 @@ def splice_stall_events(proxy_log: str) -> list[tuple[float, str, int]]:
         if payload.get("event") in boundary_events and isinstance(
             payload.get("connection"), int
         ):
-            events.append((stamp, payload["event"], payload["connection"]))
-    return sorted(events)
+            packet_type = payload.get("packet_type")
+            events.append(
+                {
+                    "at": stamp,
+                    "event": payload["event"],
+                    "connection": payload["connection"],
+                    "packet_type": (
+                        "0x%02x" % packet_type if isinstance(packet_type, int) else None
+                    ),
+                }
+            )
+    return sorted(events, key=lambda e: e["at"])
 
 
 def splice_link_events(proxy_log: str) -> list[dict]:
@@ -361,9 +373,9 @@ def connection_of(stamp: float, stalls: list[tuple[float, int]]) -> int | None:
     after it.  A stamp after the last stall belongs to a connection the
     splice never recorded stalling and cannot be attributed.
     """
-    for stall_stamp, _event, connection in stalls:
-        if stamp <= stall_stamp:
-            return connection
+    for event in stalls:
+        if stamp <= event["at"]:
+            return event["connection"]
     return None
 
 
@@ -908,11 +920,51 @@ class FaultMatrix:
         self.dir = evidence_dir
         self.dir.mkdir(parents=True, exist_ok=True)
         self.results: list[dict] = []
+        # Pass-through control for the selective-drop case: when set, the
+        # case arms its link WITHOUT drop_message_frames, so nothing is
+        # lost and the verdict fails on the missing proof by design.  The
+        # evidence records the control shape.
+        self.selective_drop_passthrough = False
         # The peer's measured per-send pacing (seconds between consecutive
         # accepted send completions), refreshed by every peer_send call; the
         # saturation window is derived from it.  The fallback pacing covers
         # a standalone saturation run with no preceding measurement.
         self.peer_pacing_s: float | None = None
+
+    def capture_case_logs(self, name: str) -> None:
+        """Save each fault-rig container's timestamped log into the evidence.
+
+        Called at the end of every case, BEFORE the end-of-run drain or any
+        teardown removes the containers.
+        """
+        for container, suffix in (
+            (PROXY, "proxy"),
+            (MEDRE_FAULT, "medre"),
+            (REPEATER_A, "repeater-a"),
+        ):
+            _rc, out, _err = run(["docker", "logs", "-t", container], timeout=120)
+            (self.dir / f"{name}.{suffix}.log").write_text(out, encoding="utf-8")
+
+    def companion_queue_snapshot(self, label: str) -> dict:
+        """WAL-aware snapshot of companion A's queue: one entry per row.
+
+        Reads the snapshot tool's own mode=ro path inside the repeater
+        container, all companion hashes, all columns, reduced to the
+        fields the queue analysis needs (id, companion_hash,
+        arrival_seq, marker).
+        """
+        snapshot = state_in(REPEATER_A, "repeater", "")
+        rows = []
+        for row in snapshot.get("companion_messages") or []:
+            rows.append(
+                {
+                    "id": row.get("id"),
+                    "companion_hash": row.get("companion_hash"),
+                    "arrival_seq": row.get("arrival_seq"),
+                    "marker": nonce_marker(row.get("text") or ""),
+                }
+            )
+        return {"label": label, "rows": rows}
 
     def write(self, name: str, payload: dict) -> None:
         payload.setdefault("label", "protocol-simulated")
@@ -1193,6 +1245,16 @@ class FaultMatrix:
         per-connection worst case whose spec bound (at most one consumed
         message per reconnect attempt) is asserted instead of zero loss.
         """
+        fault = dict(fault)
+        if self.selective_drop_passthrough and fault.get("drop_message_frames"):
+            # Pass-through control: the same link, armed without the frame
+            # drop, so nothing is lost and the verdict fails on the missing
+            # proof by design.  The evidence records the control shape.
+            fault = {
+                key: value
+                for key, value in fault.items()
+                if key != DROP_MESSAGE_FRAMES_KEY
+            }
         try:
             self.stop_bridge_medre()
             self.stop_fault_medre()
@@ -1230,6 +1292,7 @@ class FaultMatrix:
                     )
                     return
                 accepted = int(send.get("accepted_count") or 0)
+                queue_snapshots = [self.companion_queue_snapshot("before_batch")]
                 batch_queued = self.wait_for(
                     lambda: len(
                         state_in(REPEATER_A, "repeater", prefix).get(
@@ -1241,6 +1304,7 @@ class FaultMatrix:
                     180,
                     interval=2.0,
                 )
+                queue_snapshots.append(self.companion_queue_snapshot("batch_confirmed"))
                 if not batch_queued:
                     self.not_run(
                         name,
@@ -1251,6 +1315,18 @@ class FaultMatrix:
                 if not self.start_fault_medre():
                     self.not_run(name, "the fault MEDRE container did not start")
                     return
+                first_connect = re.compile(
+                    r"started \(mode=tcp, connected=True\)|reconnected successfully",
+                    re.IGNORECASE,
+                )
+                self.wait_for(
+                    lambda: first_connect.search(container_logs(MEDRE_FAULT))
+                    is not None,
+                    120,
+                    interval=2.0,
+                )
+                time.sleep(3)
+                queue_snapshots.append(self.companion_queue_snapshot("attach_plus_3s"))
             log = container_logs(MEDRE_FAULT)
             churn = count_reconnects(log)
             mine = sent_markers(send)
@@ -1277,6 +1353,7 @@ class FaultMatrix:
             ]
             preserved = len(set(persisted_indices))
             connection_evidence: dict = {}
+            queue_snapshots: list[dict] = []
             if verdict == "bounded":
                 # (b) CONTENT-TRIGGERED WAIT: the batch is already confirmed
                 # queued and the fault MEDRE has just attached, so the
@@ -1301,6 +1378,7 @@ class FaultMatrix:
                 # so a second consumed message (the next probe's fetch) is
                 # spanned too.
                 time.sleep(PROBE_INTERVAL_S)
+                queue_snapshots.append(self.companion_queue_snapshot("observation_end"))
                 # Per-connection attribution: the splice's own frame-boundary
                 # events carry the connection identity, so the answered
                 # probes and the lost frames are attributed to the
@@ -1424,9 +1502,11 @@ class FaultMatrix:
                     "pass": not failures,
                     "failures": failures,
                     "fault": fault,
+                    "passthrough_control": self.selective_drop_passthrough,
                     "verdict_rule": verdict_rule,
                     "requested_messages": count,
                     "peer_accepted_sends": send.get("accepted_count"),
+                    "queue_snapshots": queue_snapshots,
                     "reconnect_churn": churn,
                     "answered_probes": (
                         len(ANSWERED_PROBE.findall(log))
@@ -1444,6 +1524,10 @@ class FaultMatrix:
                     "probe": send,
                 },
             )
+            if verdict == "bounded":
+                queue_snapshots.append(self.companion_queue_snapshot("end"))
+            if verdict == "bounded" or verdict == "mild":
+                self.capture_case_logs(name)
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
 
@@ -1642,6 +1726,7 @@ class FaultMatrix:
                 },
             )
         except Exception as exc:  # pragma: no cover - defensive
+            self.capture_case_logs(name)
             self.not_run(name, f"{type(exc).__name__}: {exc}")
         finally:
             if fault_path is not None:
@@ -1918,6 +2003,7 @@ class FaultMatrix:
                 },
             )
         except Exception as exc:  # pragma: no cover - defensive
+            self.capture_case_logs(name)
             self.not_run(name, f"{type(exc).__name__}: {exc}")
 
         # -- the silent dead-link case ---------------------------------------
@@ -2116,6 +2202,7 @@ class FaultMatrix:
                 },
             )
         except Exception as exc:  # pragma: no cover - defensive
+            self.capture_case_logs(name)
             self.not_run(name, f"{type(exc).__name__}: {exc}")
         finally:
             if fault_path is not None:
@@ -2296,6 +2383,7 @@ class FaultMatrix:
                 },
             )
         except Exception as exc:  # pragma: no cover - defensive
+            self.capture_case_logs(name)
             self.not_run(name, f"{type(exc).__name__}: {exc}")
         finally:
             if fault_path is not None:
@@ -2348,9 +2436,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="regenerate the summary from the existing case files; run no case",
     )
+    parser.add_argument(
+        "--selective-drop-passthrough",
+        action="store_true",
+        help="arm the selective-drop case as a pass-through control: no "
+        "message frames are dropped, so the proof fails by design",
+    )
     args = parser.parse_args(argv)
 
     matrix = FaultMatrix(Path(args.evidence_dir))
+    matrix.selective_drop_passthrough = args.selective_drop_passthrough
     if args.summary_only:
         summary = case_summary.build_summary(
             matrix.dir,
@@ -2410,7 +2505,11 @@ def main(argv: list[str] | None = None) -> int:
     # client path.  Hygiene, not measurement: the preserved counts are
     # already recorded in each case's evidence.
     matrix.stop_fault_medre()
-    remaining = matrix.drain_companion_a()
+    try:
+        remaining = matrix.drain_companion_a()
+    except (RuntimeError, OSError) as exc:
+        print(f"companion A drain could not run: {exc}")
+        remaining = None
     if remaining:
         print(
             f"companion A still holds {remaining} leftover row(s) after the "

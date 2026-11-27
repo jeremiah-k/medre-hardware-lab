@@ -245,8 +245,8 @@ def test_splice_stall_events_carry_the_connection_identity():
     )
     events = fault_matrix.splice_stall_events(log)
     assert len(events) == 2
-    assert events[0][2] == 1 and events[1][2] == 2
-    assert events[0][0] < events[1][0]
+    assert events[0]["connection"] == 1 and events[1]["connection"] == 2
+    assert events[0]["at"] < events[1]["at"]
 
 
 def test_splice_events_include_the_content_triggered_frame_drops():
@@ -261,9 +261,10 @@ def test_splice_events_include_the_content_triggered_frame_drops():
     )
     events = fault_matrix.splice_stall_events(log)
     assert len(events) == 2
-    assert all(connection == 1 for _, _, connection in events)
-    assert all(event == "message_frame_dropped" for _, event, _ in events)
-    assert events[0][0] < events[1][0]
+    assert all(entry["connection"] == 1 for entry in events)
+    assert all(entry["event"] == "message_frame_dropped" for entry in events)
+    assert [entry["packet_type"] for entry in events] == ["0x0a", "0x07"]
+    assert events[0]["at"] < events[1]["at"]
 
 
 def test_connection_attribution_follows_the_stall_boundaries():
@@ -277,16 +278,16 @@ def test_connection_attribution_follows_the_stall_boundaries():
     )
     of = lambda stamp: fault_matrix.connection_of(stamp, events)  # noqa: E731
     assert of(0.0) == 1  # before the first stall: connection 1's live phase
-    assert of(events[0][0]) == 1
-    assert of(events[0][0] + 1) == 2  # after connection 1 stalled, client is on 2
-    assert of(events[1][0] + 1) is None  # after the last stall: unattributable
+    assert of(events[0]["at"]) == 1
+    assert of(events[0]["at"] + 1) == 2  # after connection 1 stalled, client is on 2
+    assert of(events[1]["at"] + 1) is None  # after the last stall: unattributable
 
 
 def test_per_connection_counts_ignore_unattributable_stamps():
     events = fault_matrix.splice_stall_events(
         '2026-11-26T18:00:40.000000Z {"event": "stalled", "connection": 2}'
     )
-    stall_stamp = events[0][0]
+    stall_stamp = events[0]["at"]
     counts = fault_matrix.per_connection_counts(
         [stall_stamp - 1, stall_stamp, stall_stamp + 1], events
     )

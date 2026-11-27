@@ -277,3 +277,55 @@ def test_dropper_holds_a_tail_that_could_still_grow(tmp_path):
     out = dropper.feed((3).to_bytes(2, "little") + b"\x07abc", connection=1)
     assert out == b""
     assert proxy.STATS["message_frames_dropped"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The OPENHOP_FAULT_PROXY_TRACE forwarded-frame trace (default off).
+# ---------------------------------------------------------------------------
+
+
+def test_trace_disabled_by_default():
+    import os
+
+    saved = os.environ.get(proxy.TRACE_ENV)
+    try:
+        os.environ.pop(proxy.TRACE_ENV, None)
+        assert proxy.trace_enabled() is False
+    finally:
+        if saved is not None:
+            os.environ[proxy.TRACE_ENV] = saved
+
+
+def test_trace_enabled_when_env_is_1():
+    import os
+
+    saved = os.environ.get(proxy.TRACE_ENV)
+    try:
+        os.environ[proxy.TRACE_ENV] = "1"
+        assert proxy.trace_enabled() is True
+    finally:
+        if saved is not None:
+            os.environ[proxy.TRACE_ENV] = saved
+        else:
+            os.environ.pop(proxy.TRACE_ENV, None)
+
+
+def test_trace_forward_records_describe_each_frame():
+    record_a = frame(b"\x05" + b"\x00" * 8)  # SELF_INFO reply
+    message_frame = frame(b"\x07" + b"p4qd-0-deadbeef01")
+    records = proxy.trace_forward_records(
+        2, record_a + message_frame + b"\x3e"  # trailing partial ignored
+    )
+    assert len(records) == 2
+    assert records[0]["event"] == "frame_forwarded"
+    assert records[0]["connection"] == 2
+    assert records[0]["packet_type"] == "0x05"
+    assert records[0]["marker"] is None
+    assert records[1]["packet_type"] == "0x07"
+    assert records[1]["marker"] == "p4qd-0-deadbeef01"
+
+
+def test_trace_forward_records_on_empty_and_garbage():
+    assert proxy.trace_forward_records(1, b"") == []
+    records = proxy.trace_forward_records(1, b"\x00\x01\x02")
+    assert records == []

@@ -319,6 +319,46 @@ MESSAGES_WAITING_PUSH = 0x83
 PROBE_REPLY_TYPE = 0x0D
 DROP_MESSAGE_FRAMES_KEY = "drop_message_frames"
 
+# When OPENHOP_FAULT_PROXY_TRACE=1, every server->client frame the splice
+# FORWARDS is logged with its inner packet type and, for message-carrying
+# frames, the lab marker found in the text.  Default off: normal runs are
+# unchanged.
+TRACE_ENV = "OPENHOP_FAULT_PROXY_TRACE"
+
+
+def trace_enabled() -> bool:
+    import os
+
+    return os.environ.get(TRACE_ENV, "") == "1"
+
+
+def _marker_in(payload: bytes) -> str | None:
+    import re
+
+    match = re.search(rb"p4[a-z0-9]{1,4}-\d+-[0-9a-f]{6,12}", payload)
+    return match.group(0).decode("ascii", "replace") if match else None
+
+
+def trace_forward_records(connection: int, data: bytes) -> list[dict]:
+    """Observational only: describe the frames inside a forwarded chunk."""
+    records: list[dict] = []
+    buf = data
+    while len(buf) >= 3 and buf[0] == FRAME_OUT_START:
+        length = int.from_bytes(buf[1:3], "little")
+        if len(buf) < 3 + length:
+            break
+        payload = buf[3 : 3 + length]
+        buf = buf[3 + length :]
+        records.append(
+            {
+                "event": "frame_forwarded",
+                "connection": connection,
+                "packet_type": "0x%02x" % (payload[0] if payload else 0),
+                "marker": _marker_in(payload),
+            }
+        )
+    return records
+
 
 class MessageFrameDropper:
     """Drop the message frames and their notifications; forward the rest.
@@ -530,6 +570,9 @@ async def handle(
                     data = dropper.feed(data, connection)
                     if not data:
                         continue
+                if trace_enabled():
+                    for record in trace_forward_records(connection, data):
+                        print(json.dumps(record), flush=True)
                 if delay_ms:
                     STATS["delayed_ms_total"] += delay_ms
                     await asyncio.sleep(delay_ms / 1000)
