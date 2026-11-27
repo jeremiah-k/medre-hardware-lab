@@ -32,6 +32,7 @@ Four verdicts exist and must not be confused:
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "openhop_fault_matrix.py"
@@ -750,4 +751,268 @@ def test_start_proxy_passes_the_trace_environment(tmp_path, monkeypatch):
     run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
     assert ["-e", "OPENHOP_FAULT_PROXY_TRACE=1"] in [
         run_cmd[index : index + 2] for index in range(len(run_cmd) - 1)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# The selective-drop accounting: the counts are read at the observation's
+# END (client stopped, the companion store read once after the stop,
+# splice events counted only up to the stop), a lost message is
+# attributed to the connection of the swallowed frame that carried its
+# marker, and the splice's swallowed message frames are cross-checked
+# against the lost rows per connection.
+# ---------------------------------------------------------------------------
+
+
+def frame_event(
+    at: float, connection: int, packet_type: int, marker: str | None = None
+):
+    return {
+        "at": at,
+        "event": "message_frame_dropped",
+        "connection": connection,
+        "packet_type": packet_type,
+        "marker": marker,
+    }
+
+
+def judge_selective_drop(**overrides):
+    """Run the selective-drop verdict with a clean measured run."""
+    kwargs = {
+        "accepted": 6,
+        "delivered_distinct": 0,
+        "preserved_distinct": 5,
+        "duplicate_wakes": 0,
+        "consumed_per_connection": {1: 1},
+        "answered_per_connection": {1: 2},
+        "unattributed_consumed": 0,
+        "same_connection_proven": True,
+    }
+    kwargs.update(overrides)
+    return fault_matrix.selective_drop_failures(**kwargs)
+
+
+def test_four_losses_with_two_answered_probes_fail_and_three_pass():
+    """Two answered probes put a connection's bound at three lost
+    messages (the unproven first fetch plus one per probe): four losses
+    fail it, three do not."""
+    over = judge_selective_drop(consumed_per_connection={1: 4}, preserved_distinct=2)
+    assert any("more than the documented bound" in failure for failure in over)
+    within = judge_selective_drop(consumed_per_connection={1: 3}, preserved_distinct=3)
+    assert within == []
+
+
+def test_a_lost_message_is_attributed_to_the_connection_of_its_swallowed_frame():
+    """The send-time connection says nothing; the swallowed frame that
+    carried the marker does."""
+    events = [
+        frame_event(1.0, 1, 0x07, "p4qd-0-aaaaaa01"),
+        frame_event(2.0, 2, 0x08, "p4qd-1-bbbbbb02"),
+        frame_event(3.0, 2, 0x83, None),  # a push carries no message
+    ]
+    assert fault_matrix.swallowed_marker_connections(events) == {
+        "p4qd-0-aaaaaa01": 1,
+        "p4qd-1-bbbbbb02": 2,
+    }
+
+
+def test_the_cross_check_agrees_when_every_swallowed_frame_is_lost():
+    events = [
+        frame_event(1.0, 1, 0x07, "p4qd-0-aaaaaa01"),
+        frame_event(2.0, 1, 0x10, "p4qd-1-bbbbbb02"),
+        frame_event(3.0, 2, 0x11, "p4qd-2-cccccc03"),
+    ]
+    cross = fault_matrix.selective_drop_cross_check(
+        events, ["p4qd-0-aaaaaa01", "p4qd-1-bbbbbb02", "p4qd-2-cccccc03"]
+    )
+    assert cross["equal"] is True
+    assert cross["per_connection"] == {
+        "1": {"swallowed_message_frames": 2, "lost_messages": 2, "equal": True},
+        "2": {"swallowed_message_frames": 1, "lost_messages": 1, "equal": True},
+    }
+
+
+def test_the_cross_check_fails_when_a_swallowed_frame_has_no_lost_row():
+    """Two swallowed message frames but one row missing: one swallowed
+    frame consumed nothing the store can show - the counts disagree."""
+    events = [
+        frame_event(1.0, 1, 0x07, "p4qd-0-aaaaaa01"),
+        frame_event(2.0, 1, 0x08, "p4qd-1-bbbbbb02"),
+    ]
+    cross = fault_matrix.selective_drop_cross_check(events, ["p4qd-0-aaaaaa01"])
+    assert cross["equal"] is False
+    assert cross["per_connection"]["1"] == {
+        "swallowed_message_frames": 2,
+        "lost_messages": 1,
+        "equal": False,
+    }
+    failures = judge_selective_drop(accounting_cross_check=cross)
+    assert any("cross-check" in failure for failure in failures)
+
+
+def test_a_swallowed_message_frame_without_a_marker_fails():
+    """A swallowed message frame with no lab marker cannot be counted for
+    any message: the accounting is refused."""
+    events = [frame_event(1.0, 1, 0x07, None)]
+    cross = fault_matrix.selective_drop_cross_check(events, [])
+    assert cross["equal"] is False
+    assert cross["swallowed_message_frames_without_marker"] == 1
+    failures = judge_selective_drop(accounting_cross_check=cross)
+    assert any("cross-check" in failure for failure in failures)
+
+
+def test_the_cross_check_fails_a_lost_row_without_a_swallowed_frame():
+    events = [frame_event(1.0, 1, 0x07, "p4qd-0-aaaaaa01")]
+    cross = fault_matrix.selective_drop_cross_check(
+        events, ["p4qd-0-aaaaaa01", "p4qd-3-dddddd04"]
+    )
+    assert cross["equal"] is False
+    assert cross["unattributed_lost_messages"] == 1
+
+
+def test_splice_stall_events_carry_the_frame_marker():
+    log = (
+        '2026-11-26T18:00:05.000000000Z {"event": "message_frame_dropped", '
+        '"connection": 1, "packet_type": 7, "marker": "p4qd-0-abc123"}'
+    )
+    events = fault_matrix.splice_stall_events(log)
+    assert events[0]["marker"] == "p4qd-0-abc123"
+    assert events[0]["packet_type"] == "0x07"
+
+
+def test_splice_link_events_carry_the_frame_marker():
+    log = (
+        '2026-11-26T18:00:05.000000000Z {"event": "message_frame_dropped", '
+        '"connection": 1, "packet_type": 16, "marker": "p4qd-1-def456"}'
+    )
+    events = fault_matrix.splice_link_events(log)
+    assert events[0]["marker"] == "p4qd-1-def456"
+    assert events[0]["packet_type"] == 0x10
+
+
+# ---------------------------------------------------------------------------
+# The case record's queue snapshots: the labels must reach the case file
+# in the order the case takes them.  run_case is driven against fakes
+# (no docker): the fakes answer the rig calls and record what ran.
+# ---------------------------------------------------------------------------
+
+PROXY_LOG_WITH_PROOF = (
+    '2026-11-26T18:00:05.000000000Z {"event": "listening"}\n'
+    '2026-11-26T18:00:10.000000000Z {"event": "message_frame_dropped", '
+    '"connection": 1, "packet_type": 7, "marker": "p4qd-0-000000abc"}\n'
+    '2026-11-26T18:00:20.000000000Z {"event": "probe_reply_forwarded", '
+    '"connection": 1, "packet_type": 13}\n'
+)
+MEDRE_LOG_ONE_ANSWERED_PROBE = (
+    "2026-11-26T18:00:08.000000000Z idle-link probe answered\n"
+)
+
+
+def make_bounded_fakes(monkeypatch, tmp_path, preserved_markers):
+    """Fake the rig behind run_case's bounded path.
+
+    The fake companion store starts empty; the fake peer_send appends the
+    case's six rows.  ``preserved_markers`` are the rows still present at
+    the observation's end.  Returns (written records, snapshot labels in
+    the order the case took them).
+    """
+    rows: list[dict] = []
+    snapshot_labels: list[str] = []
+    nonces = [f"p4qd-{index}-{index:06d}abc" for index in range(6)]
+
+    def fake_state_in(container, mode, needle=""):
+        if container == fault_matrix.REPEATER_A:
+            return {"companion_messages": [dict(row) for row in rows]}
+        return {"canonical_events": []}
+
+    def fake_peer_send(self, count, prefix):
+        for index, nonce in enumerate(nonces):
+            rows.append(
+                {
+                    "id": 100 + index,
+                    "companion_hash": "0x01",
+                    "arrival_seq": index + 1,
+                    "text": f"lab message {nonce}",
+                    "marker": nonce,
+                }
+            )
+        return {
+            "pass": True,
+            "accepted_count": count,
+            "nonces": nonces,
+            "sends": [],
+        }
+
+    def fake_snapshot(self, label):
+        snapshot_labels.append(label)
+        kept = set(preserved_markers)
+        return {
+            "label": label,
+            "rows": [dict(row) for row in rows if row["marker"] in kept],
+        }
+
+    monkeypatch.setattr(fault_matrix, "state_in", fake_state_in)
+
+    def fake_timestamped_logs(name):
+        if name == fault_matrix.MEDRE_FAULT:
+            return MEDRE_LOG_ONE_ANSWERED_PROBE
+        return PROXY_LOG_WITH_PROOF
+
+    monkeypatch.setattr(fault_matrix, "timestamped_logs", fake_timestamped_logs)
+    monkeypatch.setattr(fault_matrix.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix, "stop_bridge_medre", lambda self: None
+    )
+    monkeypatch.setattr(fault_matrix.FaultMatrix, "stop_fault_medre", lambda self: None)
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix, "start_proxy", lambda self, fault: None
+    )
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix, "start_fault_medre", lambda self: True
+    )
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix,
+        "wait_for",
+        lambda self, predicate, timeout, interval=1.0: True,
+    )
+    monkeypatch.setattr(fault_matrix.FaultMatrix, "peer_send", fake_peer_send)
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix, "companion_queue_snapshot", fake_snapshot
+    )
+    return snapshot_labels
+
+
+def test_the_bounded_record_carries_every_queue_snapshot_label_in_order(
+    tmp_path, monkeypatch
+):
+    """before_batch, batch_confirmed and attach_plus_3s used to be wiped
+    before the write; every label the case takes must reach the record,
+    in order, with end taken before the write."""
+    preserved = [f"p4qd-{index}-{index:06d}abc" for index in range(1, 6)]
+    make_bounded_fakes(monkeypatch, tmp_path, preserved)
+    matrix = fault_matrix.FaultMatrix(tmp_path / "evidence")
+    matrix.run_case(
+        "fault-selective-drop",
+        {"drop_message_frames": True},
+        6,
+        "p4qd",
+        0.0,
+        False,
+        "bounded",
+    )
+    records = [path for path in (tmp_path / "evidence").glob("*.json")]
+    record = None
+    for path in records:
+        payload = json.loads(path.read_text())
+        if payload.get("case") == "fault-selective-drop":
+            record = payload
+    assert record is not None
+    assert record["pass"] is True, record["failures"]
+    labels = [snapshot["label"] for snapshot in record["queue_snapshots"]]
+    assert labels == [
+        "before_batch",
+        "batch_confirmed",
+        "attach_plus_3s",
+        "observation_end",
+        "end",
     ]

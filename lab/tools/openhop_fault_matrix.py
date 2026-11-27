@@ -91,7 +91,14 @@ The matrix
                    an answered probe and a lost frame to the SAME
                    connection, observed within a window bounded by
                    at least two probe intervals after the batch is
-                   confirmed queued.
+                   confirmed queued.  The accounting is frozen at the
+                   observation's end: the fault MEDRE's log and store
+                   are captured, the client is stopped, the companion
+                   store is read once after the stop, and only the
+                   splice events up to the stop are counted; every
+                   lost message is attributed to the connection whose
+                   swallowed frame carried its marker and cross-checked
+                   against the swallowed frames per connection.
   idle_blackhole   BOTH directions of an up, idle link are blackholed
                    (no close, armed by writing the splice's fault file):
                    the idle-link probe must retire the connection within
@@ -274,13 +281,15 @@ def splice_stall_events(proxy_log: str) -> list[dict]:
     started swallowing server->client frames - the budget exhaustion
     (``{"event": "stalled", "connection": N}``) and the content-triggered
     message-frame drops (``{"event": "message_frame_dropped",
-    "connection": N, "packet_type": T}``) - and ``docker logs -t``
-    prefixes each line with the host's UTC time.  These events are the
-    splice's own connection identity: the boundaries that attribute
-    MEDRE's answered probes and the lost frames to the connection they
-    belonged to, instead of counting aggregates over the whole run.
-    Returns dicts with ``at`` (epoch), ``event``, ``connection`` and
-    ``packet_type`` (hex string when present).
+    "connection": N, "packet_type": T, "marker": M}``) - and ``docker
+    logs -t`` prefixes each line with the host's UTC time.  These events
+    are the splice's own connection identity: the boundaries that
+    attribute MEDRE's answered probes and the lost frames to the
+    connection they belonged to, instead of counting aggregates over the
+    whole run.  Returns dicts with ``at`` (epoch), ``event``,
+    ``connection``, ``packet_type`` (hex string when present) and
+    ``marker`` (the lab nonce the frame carried, None when it carries
+    none).
     """
     boundary_events = {"stalled", "message_frame_dropped"}
     events: list[dict] = []
@@ -307,6 +316,7 @@ def splice_stall_events(proxy_log: str) -> list[dict]:
                     "packet_type": (
                         "0x%02x" % packet_type if isinstance(packet_type, int) else None
                     ),
+                    "marker": payload.get("marker"),
                 }
             )
     return sorted(events, key=lambda e: e["at"])
@@ -345,6 +355,7 @@ def splice_link_events(proxy_log: str) -> list[dict]:
                     "event": payload["event"],
                     "connection": payload["connection"],
                     "packet_type": payload.get("packet_type"),
+                    "marker": payload.get("marker"),
                 }
             )
     return sorted(events, key=lambda e: e["at"])
@@ -386,6 +397,82 @@ def selective_drop_proof_report(link_events: list[dict]) -> dict:
         "probe_replies_forwarded_per_connection": probe_replies_forwarded,
         "message_frames_dropped_per_connection": message_frames_dropped,
         "same_connection_proven": proven,
+    }
+
+
+def swallowed_message_frames(events: list[dict]) -> list[dict]:
+    """The swallowed MESSAGE-CARRYING frames among the splice's events.
+
+    A dropped frame of one of the message-carrying types carried a queued
+    message; dropped NO_MORE_MSGS replies and MESSAGES_WAITING pushes
+    carry no message and never count here.
+    """
+    return [
+        event
+        for event in events
+        if event.get("event") == "message_frame_dropped"
+        and event.get("packet_type") in MESSAGE_CARRYING_TYPES
+    ]
+
+
+def swallowed_marker_connections(events: list[dict]) -> dict[str, int]:
+    """Map each swallowed message-carrying frame's marker to its connection.
+
+    This is the attribution rule for a lost message: it belongs to the
+    connection whose recorded drop carried the message's marker.
+    """
+    return {
+        event["marker"]: event["connection"]
+        for event in swallowed_message_frames(events)
+        if event.get("marker")
+    }
+
+
+def selective_drop_cross_check(events: list[dict], lost_markers: list[str]) -> dict:
+    """Cross-check the splice's own accounting against the final store read.
+
+    Per connection: the message-carrying frames the splice swallowed
+    (each named by the lab marker it carried) against the rows actually
+    lost at the final read - a swallowed frame consumed exactly the
+    message it carried, so the two counts must agree on every connection.
+    A swallowed message-carrying frame WITHOUT a marker cannot be counted
+    for any message, and a lost row whose swallowed frame the splice did
+    not record cannot be attributed; either makes ``equal`` false, and
+    the case fails on it.
+    """
+    swallowed = swallowed_message_frames(events)
+    frame_connections = swallowed_marker_connections(events)
+    per_connection: dict[str, dict] = {}
+    for event in swallowed:
+        entry = per_connection.setdefault(
+            str(event["connection"]),
+            {"swallowed_message_frames": 0, "lost_messages": 0, "equal": False},
+        )
+        entry["swallowed_message_frames"] += 1
+    unattributed_lost = 0
+    for marker in lost_markers:
+        connection = frame_connections.get(marker)
+        if connection is None:
+            unattributed_lost += 1
+            continue
+        entry = per_connection.setdefault(
+            str(connection),
+            {"swallowed_message_frames": 0, "lost_messages": 0, "equal": False},
+        )
+        entry["lost_messages"] += 1
+    for entry in per_connection.values():
+        entry["equal"] = entry["swallowed_message_frames"] == entry["lost_messages"]
+    without_marker = sum(1 for event in swallowed if not event.get("marker"))
+    equal = (
+        without_marker == 0
+        and unattributed_lost == 0
+        and all(entry["equal"] for entry in per_connection.values())
+    )
+    return {
+        "per_connection": per_connection,
+        "swallowed_message_frames_without_marker": without_marker,
+        "unattributed_lost_messages": unattributed_lost,
+        "equal": equal,
     }
 
 
@@ -800,6 +887,7 @@ def selective_drop_failures(
     answered_per_connection: dict[int, int],
     unattributed_consumed: int,
     same_connection_proven: bool,
+    accounting_cross_check: dict | None = None,
 ) -> list[str]:
     """Judge the per-connection worst case by the spec's documented bound.
 
@@ -847,6 +935,14 @@ def selective_drop_failures(
             "message frame attributed to it: the per-connection attribution "
             "does not prove the selective drop"
         )
+    if accounting_cross_check is not None:
+        if not accounting_cross_check.get("equal"):
+            failures.append(
+                "the accounting cross-check failed: the swallowed "
+                "message-carrying frames the splice recorded and the lost "
+                "rows disagree, or a swallowed frame carried no lab marker "
+                f"({json.dumps(accounting_cross_check, sort_keys=True)})"
+            )
     for connection, consumed_on_connection in sorted(consumed_per_connection.items()):
         answered_on_connection = answered_per_connection.get(connection, 0)
         bound = 1 + max(0, answered_on_connection)
@@ -957,20 +1053,31 @@ class FaultMatrix:
         # a standalone saturation run with no preceding measurement.
         self.peer_pacing_s: float | None = None
 
-    def capture_case_logs(self, name: str) -> None:
+    def capture_case_logs(
+        self, name: str, captured: dict[str, str] | None = None
+    ) -> None:
         """Save each fault-rig container's timestamped log into the evidence.
 
         Called at the end of every case, BEFORE the end-of-run drain or any
         teardown removes the containers.  The logs are read through the
         merged pipe, so a container that logs to stderr (the repeater's
         ``logging`` output) is saved whole, in true time order.
+        ``captured`` supplies log text already read from a container that
+        has since been removed: the bounded selective-drop case freezes
+        its MEDRE (log captured, client stopped) before the accounting,
+        so its log is saved from the freeze capture.
         """
+        captured = captured or {}
         for container, suffix in (
             (PROXY, "proxy"),
             (MEDRE_FAULT, "medre"),
             (REPEATER_A, "repeater-a"),
         ):
-            merged = timestamped_logs(container)
+            merged = (
+                captured[container]
+                if container in captured
+                else timestamped_logs(container)
+            )
             (self.dir / f"{name}.{suffix}.log").write_text(merged, encoding="utf-8")
 
     def companion_queue_snapshot(self, label: str) -> dict:
@@ -1286,6 +1393,7 @@ class FaultMatrix:
                 if key != DROP_MESSAGE_FRAMES_KEY
             }
         try:
+            queue_snapshots: list[dict] = []
             self.stop_bridge_medre()
             self.stop_fault_medre()
             self.start_proxy(fault)
@@ -1357,31 +1465,6 @@ class FaultMatrix:
                 )
                 time.sleep(3)
                 queue_snapshots.append(self.companion_queue_snapshot("attach_plus_3s"))
-            log = container_logs(MEDRE_FAULT)
-            churn = count_reconnects(log)
-            mine = sent_markers(send)
-            queue_snapshots: list[dict] = []
-            events = (
-                state_in(MEDRE_FAULT, "medre", prefix).get("canonical_events") or []
-            )
-            indices = [
-                marker
-                for marker in (
-                    nonce_marker(json.dumps(event, sort_keys=True)) for event in events
-                )
-                if marker is not None and marker in mine
-            ]
-            distinct = len(set(indices))
-            duplicates = len(indices) - distinct
-            persisted = (
-                state_in(REPEATER_A, "repeater", prefix).get("companion_messages") or []
-            )
-            persisted_indices = [
-                marker
-                for marker in (nonce_marker(row.get("text") or "") for row in persisted)
-                if marker is not None and marker in mine
-            ]
-            preserved = len(set(persisted_indices))
             connection_evidence: dict = {}
             if verdict == "bounded":
                 # (b) CONTENT-TRIGGERED WAIT: the batch is already confirmed
@@ -1407,40 +1490,80 @@ class FaultMatrix:
                 # so a second consumed message (the next probe's fetch) is
                 # spanned too.
                 time.sleep(PROBE_INTERVAL_S)
-                queue_snapshots.append(self.companion_queue_snapshot("observation_end"))
-                # Per-connection attribution: the splice's own frame-boundary
-                # events carry the connection identity, so the answered
-                # probes and the lost frames are attributed to the
-                # connection they belonged to instead of being counted as
-                # run totals.
-                stalls = splice_stall_events(timestamped_logs(PROXY))
+                # FREEZE before accounting: the observation ends when the
+                # fault MEDRE stops.  Capture its log and its store while
+                # it is up, stop it, take the store snapshot that ends the
+                # observation, and read the splice log ONCE; every count
+                # below derives from those reads, and splice events after
+                # the freeze are not accounted.  Accounting from reads
+                # taken at the attach would miss everything the link
+                # consumed DURING the observation.
                 stamped_medre_log = timestamped_logs(MEDRE_FAULT)
+                events = (
+                    state_in(MEDRE_FAULT, "medre", prefix).get("canonical_events") or []
+                )
+                freeze_at = time.time()
+                self.stop_fault_medre()
+                observation_end = self.companion_queue_snapshot("observation_end")
+                queue_snapshots.append(observation_end)
+                link_events = [
+                    event
+                    for event in splice_link_events(timestamped_logs(PROXY))
+                    if event["at"] <= freeze_at
+                ]
+                stalls = [
+                    event
+                    for event in link_events
+                    if event["event"] in ("stalled", "message_frame_dropped")
+                ]
+                log = stamped_medre_log
+                churn = count_reconnects(log)
+                mine = sent_markers(send)
+                indices = [
+                    marker
+                    for marker in (
+                        nonce_marker(json.dumps(event, sort_keys=True))
+                        for event in events
+                    )
+                    if marker is not None and marker in mine
+                ]
+                distinct = len(set(indices))
+                duplicates = len(indices) - distinct
+                # The ONE companion read the accounting derives from: the
+                # snapshot that ended the observation.
+                persisted_markers = {
+                    marker
+                    for marker in (row.get("marker") for row in observation_end["rows"])
+                    if marker is not None and marker in mine
+                }
+                preserved = len(persisted_markers)
+                persisted_at_companion = len(persisted_markers)
+                lost_messages = sorted(mine - set(indices) - persisted_markers)
+                # Per-connection attribution: the answered probes are
+                # attributed to the connection of the stall boundary they
+                # precede; a LOST message belongs to the connection of the
+                # swallowed frame that carried its marker - the send-time
+                # connection has no relation to the fetch that popped the
+                # row later.
                 probe_stamps = [
                     stamp
-                    for line in stamped_medre_log.splitlines()
+                    for line in log.splitlines()
                     if ANSWERED_PROBE.search(line)
                     and (stamp := line_time(line)) is not None
                 ]
                 answered_per_connection = per_connection_counts(probe_stamps, stalls)
-                send_stamps: dict[str, float] = {}
-                for entry in send.get("sends") or []:
-                    marker = nonce_marker(entry.get("nonce") or "")
-                    stamp = wall_timestamp(entry.get("finished_at"))
-                    if marker is not None and stamp is not None:
-                        send_stamps[marker] = stamp
+                frame_connections = swallowed_marker_connections(link_events)
                 consumed_per_connection: dict[int, int] = {}
                 unattributed_consumed = 0
-                for marker in mine - set(indices) - set(persisted_indices):
-                    stamp = send_stamps.get(marker)
-                    connection = (
-                        connection_of(stamp, stalls) if stamp is not None else None
-                    )
+                for marker in lost_messages:
+                    connection = frame_connections.get(marker)
                     if connection is None:
                         unattributed_consumed += 1
                     else:
                         consumed_per_connection[connection] = (
                             consumed_per_connection.get(connection, 0) + 1
                         )
+                cross_check = selective_drop_cross_check(link_events, lost_messages)
                 same_connection_proven = any(
                     consumed_on_connection > 0
                     and answered_per_connection.get(connection, 0) > 0
@@ -1457,9 +1580,7 @@ class FaultMatrix:
                     answered_per_connection=answered_per_connection,
                     unattributed_consumed=unattributed_consumed,
                     same_connection_proven=same_connection_proven,
-                )
-                proof_report = selective_drop_proof_report(
-                    splice_link_events(timestamped_logs(PROXY))
+                    accounting_cross_check=cross_check,
                 )
                 connection_evidence = {
                     "link_definition": (
@@ -1481,7 +1602,12 @@ class FaultMatrix:
                                 "%Y-%m-%dT%H:%M:%S+00:00",
                                 time.gmtime(event["at"]),
                             ),
-                            "packet_type": event["packet_type"],
+                            "packet_type": (
+                                "0x%02x" % event["packet_type"]
+                                if isinstance(event["packet_type"], int)
+                                else event["packet_type"]
+                            ),
+                            "marker": event.get("marker"),
                         }
                         for event in stalls
                     ],
@@ -1503,11 +1629,49 @@ class FaultMatrix:
                     "swallowed message frames are the same connection's by "
                     "construction; the proof requires one connection with "
                     "both, observed within an observation window bounded by "
-                    "at least two probe intervals; every other accepted "
-                    "message is delivered or still preserved at the "
-                    "companion; zero duplicates"
+                    "at least two probe intervals; the accounting is frozen "
+                    "at the observation's end (the fault MEDRE's log and "
+                    "store captured, the client stopped, the companion "
+                    "store read once after the stop, splice events counted "
+                    "only up to the stop), every lost message attributed to "
+                    "the connection of the swallowed frame that carried its "
+                    "marker, and the splice's swallowed message frames "
+                    "cross-checked against the lost rows per connection; "
+                    "every other accepted message is delivered or still "
+                    "preserved at the companion; zero duplicates"
                 )
             else:
+                log = container_logs(MEDRE_FAULT)
+                churn = count_reconnects(log)
+                mine = sent_markers(send)
+                events = (
+                    state_in(MEDRE_FAULT, "medre", prefix).get("canonical_events") or []
+                )
+                indices = [
+                    marker
+                    for marker in (
+                        nonce_marker(json.dumps(event, sort_keys=True))
+                        for event in events
+                    )
+                    if marker is not None and marker in mine
+                ]
+                distinct = len(set(indices))
+                duplicates = len(indices) - distinct
+                persisted = (
+                    state_in(REPEATER_A, "repeater", prefix).get("companion_messages")
+                    or []
+                )
+                persisted_indices = [
+                    marker
+                    for marker in (
+                        nonce_marker(row.get("text") or "") for row in persisted
+                    )
+                    if marker is not None and marker in mine
+                ]
+                preserved = len(set(persisted_indices))
+                persisted_at_companion = len(persisted_indices)
+                lost_messages: list[str] = []
+                cross_check = None
                 failures = fault_case_failures(
                     accepted=int(send.get("accepted_count") or 0),
                     delivered_distinct=distinct,
@@ -1523,6 +1687,15 @@ class FaultMatrix:
                     "zero retirements for idle fetch windows; the mild-fault "
                     "cases must deliver everything without churn"
                 )
+            lost_wakes = (
+                len(lost_messages)
+                if verdict == "bounded"
+                else max(0, preserved - distinct)
+            )
+            if verdict == "bounded":
+                # The END snapshot is part of the record: take it BEFORE
+                # the case file is written, or the label never reaches it.
+                queue_snapshots.append(self.companion_queue_snapshot("end"))
             consumed = max(
                 0, int(send.get("accepted_count") or 0) - distinct - preserved
             )
@@ -1548,16 +1721,18 @@ class FaultMatrix:
                     "arrivals_at_medre": len(indices),
                     "distinct_at_medre": distinct,
                     "duplicate_wakes": duplicates,
-                    "persisted_at_companion": len(persisted_indices),
+                    "persisted_at_companion": persisted_at_companion,
                     "distinct_persisted": preserved,
                     "consumed_wakes": consumed,
-                    "lost_wakes": max(0, preserved - distinct),
+                    "lost_wakes": lost_wakes,
+                    "lost_messages": lost_messages,
+                    "accounting_cross_check": cross_check,
                     "probe": send,
                 },
             )
             if verdict == "bounded":
-                queue_snapshots.append(self.companion_queue_snapshot("end"))
-            if verdict == "bounded" or verdict == "mild":
+                self.capture_case_logs(name, captured={MEDRE_FAULT: stamped_medre_log})
+            elif verdict == "mild":
                 self.capture_case_logs(name)
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")

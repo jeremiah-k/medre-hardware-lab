@@ -53,8 +53,13 @@
 #                    probes are answered, the message frames are
 #                    swallowed; the verdict asserts the documented bound
 #                    (at most one consumed message per answered liveness
-#                    probe beyond the unproven first fetch) and reports
-#                    the consumed count
+#                    probe beyond the unproven first fetch), accounts
+#                    the queue at the observation's end (client stopped,
+#                    the store read once after the stop), attributes
+#                    every lost message to the connection whose
+#                    swallowed frame carried its marker, and
+#                    cross-checks the swallowed frames against the lost
+#                    rows per connection
 #   idle_blackhole   both directions of an up, idle link are blackholed
 #                    (no close): the idle-link probe must retire within
 #                    its measured window, backoff must continue without
