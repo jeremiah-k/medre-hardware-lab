@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import struct
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -166,55 +167,58 @@ async def _connect(port: int) -> _Peer:
     return _Peer(reader, writer)
 
 
+@asynccontextmanager
+async def _radio_peers(relay, count):
+    server = await asyncio.start_server(relay.handle_client, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    async with server:
+        peers = []
+        try:
+            for _ in range(count):
+                peers.append(await _connect(port))
+            yield peers
+        finally:
+            for peer in peers:
+                peer.close()
+            await asyncio.gather(
+                *(peer.writer.wait_closed() for peer in peers), return_exceptions=True
+            )
+
+
 def test_two_client_mapping_and_no_echo():
     """A TX on one client is RX'd by the OTHER client, never echoed back."""
 
     async def scenario():
         relay = relay_mod.VirtualRadioRelay()
-        server = await asyncio.start_server(relay.handle_client, "127.0.0.1", 0)
-        port = server.sockets[0].getsockname()[1]
-        async with server:
-            serve_task = asyncio.create_task(server.serve_forever())
-            try:
-                a = await _connect(port)
-                b = await _connect(port)
+        async with _radio_peers(relay, 2) as peers:
+            a, b = peers
+            # Both ends handshake like the openHop radio driver does.
+            await a.send(relay_mod.CMD_PING)
+            assert await a.expect(relay_mod.CMD_PONG) == b""
+            await b.send(relay_mod.CMD_PING)
+            assert await b.expect(relay_mod.CMD_PONG) == b""
 
-                # Both ends handshake like the openHop radio driver does.
-                await a.send(relay_mod.CMD_PING)
-                assert await a.expect(relay_mod.CMD_PONG) == b""
-                await b.send(relay_mod.CMD_PING)
-                assert await b.expect(relay_mod.CMD_PONG) == b""
+            payload = b"meshcore-group-text-payload"
+            await b.send(relay_mod.CMD_TX_REQUEST, payload)
 
-                payload = b"meshcore-group-text-payload"
-                await b.send(relay_mod.CMD_TX_REQUEST, payload)
+            # The peer receives the payload as an RX_PACKET frame with the
+            # documented 6-byte signal header.
+            cmd, rx_payload = await a.recv()
+            assert cmd == relay_mod.CMD_RX_PACKET
+            rssi, snr_x10, signal_rssi = struct.unpack("<hhh", rx_payload[:6])
+            assert rx_payload[6:] == payload
+            assert (rssi, snr_x10, signal_rssi) == (
+                relay_mod.SIM_RSSI_DBM,
+                relay_mod.SIM_SNR_X10,
+                relay_mod.SIM_SIGNAL_RSSI_DBM,
+            )
 
-                # The peer receives the payload as an RX_PACKET frame with the
-                # documented 6-byte signal header.
-                cmd, rx_payload = await a.recv()
-                assert cmd == relay_mod.CMD_RX_PACKET
-                rssi, snr_x10, signal_rssi = struct.unpack("<hhh", rx_payload[:6])
-                assert rx_payload[6:] == payload
-                assert (rssi, snr_x10, signal_rssi) == (
-                    relay_mod.SIM_RSSI_DBM,
-                    relay_mod.SIM_SNR_X10,
-                    relay_mod.SIM_SIGNAL_RSSI_DBM,
-                )
+            # The transmitter is told the TX completed.
+            await b.expect(relay_mod.CMD_TX_DONE)
 
-                # The transmitter is told the TX completed.
-                await b.expect(relay_mod.CMD_TX_DONE)
-
-                # NO echo: the sender must not receive its own packet.
-                with pytest.raises(asyncio.TimeoutError):
-                    await b.recv(timeout=0.6)
-
-                a.close()
-                b.close()
-            finally:
-                serve_task.cancel()
-                try:
-                    await serve_task
-                except asyncio.CancelledError:
-                    pass
+            # NO echo: the sender must not receive its own packet.
+            with pytest.raises(asyncio.TimeoutError):
+                await b.recv(timeout=0.6)
 
     asyncio.run(scenario())
 
@@ -222,32 +226,20 @@ def test_two_client_mapping_and_no_echo():
 def test_rx_start_is_acknowledged_and_config_is_echoed():
     async def scenario():
         relay = relay_mod.VirtualRadioRelay()
-        server = await asyncio.start_server(relay.handle_client, "127.0.0.1", 0)
-        port = server.sockets[0].getsockname()[1]
-        async with server:
-            serve_task = asyncio.create_task(server.serve_forever())
-            try:
-                peer = await _connect(port)
-                config = struct.pack(
-                    relay_mod.RADIO_CONFIG_FMT, 869618000, 62500, 8, 8, 14, 0x12, 32
-                )
-                await peer.send(relay_mod.CMD_SET_CONFIG, config)
-                assert await peer.expect(relay_mod.CMD_CONFIG_RESP) == config
+        async with _radio_peers(relay, 1) as peers:
+            (peer,) = peers
+            config = struct.pack(
+                relay_mod.RADIO_CONFIG_FMT, 869618000, 62500, 8, 8, 14, 0x12, 32
+            )
+            await peer.send(relay_mod.CMD_SET_CONFIG, config)
+            assert await peer.expect(relay_mod.CMD_CONFIG_RESP) == config
 
-                await peer.send(relay_mod.CMD_RX_START)
-                assert await peer.expect(relay_mod.CMD_RX_STARTED) == b""
+            await peer.send(relay_mod.CMD_RX_START)
+            assert await peer.expect(relay_mod.CMD_RX_STARTED) == b""
 
-                await peer.send(relay_mod.CMD_STATUS_REQ)
-                status = await peer.expect(relay_mod.CMD_STATUS_RESP)
-                assert len(status) == relay_mod.STATUS_RESP_SIZE
-
-                peer.close()
-            finally:
-                serve_task.cancel()
-                try:
-                    await serve_task
-                except asyncio.CancelledError:
-                    pass
+            await peer.send(relay_mod.CMD_STATUS_REQ)
+            status = await peer.expect(relay_mod.CMD_STATUS_RESP)
+            assert len(status) == relay_mod.STATUS_RESP_SIZE
 
     asyncio.run(scenario())
 
@@ -255,22 +247,11 @@ def test_rx_start_is_acknowledged_and_config_is_echoed():
 def test_unknown_command_is_rejected_with_an_error_frame():
     async def scenario():
         relay = relay_mod.VirtualRadioRelay()
-        server = await asyncio.start_server(relay.handle_client, "127.0.0.1", 0)
-        port = server.sockets[0].getsockname()[1]
-        async with server:
-            serve_task = asyncio.create_task(server.serve_forever())
-            try:
-                peer = await _connect(port)
-                await peer.send(0x77)
-                payload = await peer.expect(relay_mod.CMD_ERROR)
-                assert payload == bytes([relay_mod.ERR_INVALID_CMD])
-                peer.close()
-            finally:
-                serve_task.cancel()
-                try:
-                    await serve_task
-                except asyncio.CancelledError:
-                    pass
+        async with _radio_peers(relay, 1) as peers:
+            (peer,) = peers
+            await peer.send(0x77)
+            payload = await peer.expect(relay_mod.CMD_ERROR)
+            assert payload == bytes([relay_mod.ERR_INVALID_CMD])
 
     asyncio.run(scenario())
 
@@ -279,25 +260,14 @@ def test_auth_is_optional_and_rejected_when_a_token_is_configured():
     """No token is preferred: the relay stays open. A configured token must match."""
 
     async def scenario(relay):
-        server = await asyncio.start_server(relay.handle_client, "127.0.0.1", 0)
-        port = server.sockets[0].getsockname()[1]
-        async with server:
-            serve_task = asyncio.create_task(server.serve_forever())
-            try:
-                peer = await _connect(port)
-                await peer.send(relay_mod.CMD_AUTH, b"wrong-token")
-                if relay.token:
-                    payload = await peer.expect(relay_mod.CMD_ERROR)
-                    assert payload == bytes([relay_mod.ERR_UNAUTHORIZED])
-                else:
-                    assert await peer.expect(relay_mod.CMD_AUTH_OK) == b""
-                peer.close()
-            finally:
-                serve_task.cancel()
-                try:
-                    await serve_task
-                except asyncio.CancelledError:
-                    pass
+        async with _radio_peers(relay, 1) as peers:
+            (peer,) = peers
+            await peer.send(relay_mod.CMD_AUTH, b"wrong-token")
+            if relay.token:
+                payload = await peer.expect(relay_mod.CMD_ERROR)
+                assert payload == bytes([relay_mod.ERR_UNAUTHORIZED])
+            else:
+                assert await peer.expect(relay_mod.CMD_AUTH_OK) == b""
 
     asyncio.run(scenario(relay_mod.VirtualRadioRelay()))
     asyncio.run(scenario(relay_mod.VirtualRadioRelay(token="secret")))
