@@ -106,7 +106,11 @@ then runs the lifecycle, packet, bridge, backlog, ordering and fault
 stages. It checks each matrix's recorded source selection after all three
 matrices pass and always attempts teardown when it started a rig. Each
 stage has a log and an exit status with elapsed seconds in
-`timeline.jsonl`. A failed stage prevents later qualification stages.
+`timeline.jsonl`. A failed stage prevents later qualification stages. The
+qualification holds an exclusive advisory lock on
+`lab/state/openhop-qualification.lock` for the life of its process, so a
+second simultaneous invocation is refused before it touches anything;
+the lock releases when the process exits or dies.
 
 The cold start from a fully-down rig is exactly:
 

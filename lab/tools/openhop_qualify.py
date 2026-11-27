@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import signal
@@ -15,6 +16,42 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DOWN = ["bash", "lab/down.sh"]
+LOCK_PATH = ROOT / "lab/state/openhop-qualification.lock"
+
+# The open file description holding this checkout's qualification lock.
+# flock locks belong to the description, not the path, so a second
+# invocation - in this or any other process - is refused while a
+# qualification runs, and the kernel releases the lock if the holder
+# dies, leaving the file itself harmless.
+_qualification_lock = None
+
+
+def acquire_qualification_lock(path: Path | None = None):
+    """Hold an exclusive advisory lock for the life of the process.
+
+    A second qualification stops here with an error naming the lock
+    file; the rig-down check runs only after the lock is ours.
+    """
+    global _qualification_lock
+    if _qualification_lock is not None:
+        return _qualification_lock
+    target = LOCK_PATH if path is None else Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle = target.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise ValueError(
+            f"another qualification already holds {target}; the lock "
+            "admits one qualification at a time per checkout"
+        )
+    handle.seek(0)
+    handle.truncate()
+    print(f"{os.getpid()}\n", file=handle)
+    handle.flush()
+    _qualification_lock = handle
+    return handle
 
 
 def stages(evidence: Path, skip_build: bool):
@@ -130,7 +167,8 @@ def run_stage(evidence: Path, name: str, command: list[str]) -> int:
     return status
 
 
-def qualify(evidence: Path, *, skip_build: bool) -> int:
+def qualify(evidence: Path, *, skip_build: bool, lock_path: Path | None = None) -> int:
+    acquire_qualification_lock(lock_path)
     assert_rig_down()
     evidence.mkdir(mode=0o700, parents=True)
     needs_down = False
