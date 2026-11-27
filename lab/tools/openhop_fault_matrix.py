@@ -1267,13 +1267,15 @@ class FaultMatrix:
             "--fault-file",
             "/opt/openhop-fault/fault.json",
         ]
-        run(cmd, timeout=300)
-        deadline = time.monotonic() + 45
-        while time.monotonic() < deadline:
-            if container_running(PROXY):
-                time.sleep(1)
-                return
-            time.sleep(1)
+        rc, _, _ = run(cmd, timeout=300)
+        if rc:
+            raise RuntimeError(f"the fault splice did not launch (exit {rc})")
+        # The proxy announces readiness only once its TCP socket listens.
+        # Allow ten seconds for the measured one-to-two-second container start.
+        if not self.wait_for(
+            lambda: '"event": "listening"' in container_logs(PROXY), 10, interval=0.25
+        ):
+            raise RuntimeError("the fault splice did not announce a listening socket")
 
     def wait_for(self, predicate, timeout: float, interval: float = 1.0) -> bool:
         deadline = time.monotonic() + timeout
@@ -1399,7 +1401,7 @@ class FaultMatrix:
         return data
 
     def drain_companion_a(
-        self, rounds: int = 2, wake_batch: int = 8, seconds: float = 90.0
+        self, rounds: int = 2, wake_batch: int = 2, seconds: float = 90.0
     ) -> dict:
         """Drain companion A's leftover queue rows through their owner.
 

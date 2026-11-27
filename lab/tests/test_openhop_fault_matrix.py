@@ -732,7 +732,9 @@ def test_start_proxy_passes_the_trace_environment(tmp_path, monkeypatch):
         return 0, "", ""
 
     monkeypatch.setattr(fault_matrix, "run", fake_run)
-    monkeypatch.setattr(fault_matrix, "container_running", lambda name: True)
+    monkeypatch.setattr(
+        fault_matrix, "container_logs", lambda name: '{"event": "listening"}'
+    )
     monkeypatch.setattr(fault_matrix.time, "sleep", lambda seconds: None)
     matrix = fault_matrix.FaultMatrix(tmp_path)
     matrix.start_proxy({"drop_message_frames": True})

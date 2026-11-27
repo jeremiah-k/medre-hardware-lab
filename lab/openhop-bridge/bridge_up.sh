@@ -249,19 +249,22 @@ wait_healthy medre-lab-mesh-c-medre 240
 wait_healthy medre-lab-mesh-c-peer 240
 wait_healthy medre-lab-medre-openhop-bridge 240
 
-# MEDRE's adapters connect asynchronously; give the sessions a bounded
-# moment to attach before the proof drives traffic.
+# Process liveness is weaker than adapter readiness. Use only log lines
+# from the current process, and wait for both endpoints to connect.
 log "Waiting for the MEDRE adapter sessions to attach"
-for attempt in $(seq 1 24); do
-	if docker logs medre-lab-medre-openhop-bridge 2>&1 |
-		grep "MeshCoreSession openhop-a started" >/dev/null; then
-		echo "  meshcore session attached (${attempt}0s)"
+bridge=medre-lab-medre-openhop-bridge
+started_at="$(docker inspect -f '{{.State.StartedAt}}' "${bridge}")"
+ready=0
+for attempt in $(seq 1 240); do
+	if startup="$(docker logs --since "${started_at}" "${bridge}" 2>&1)" &&
+		grep -Eq 'MeshCoreSession openhop-a( started .*connected=True|: reconnected successfully)' <<<"${startup}" &&
+		grep -q 'MeshtasticSession radio-c started (mode=tcp)' <<<"${startup}"; then
+		ready=1
 		break
 	fi
-	((attempt == 24)) && die "MEDRE's meshcore session did not attach within 240s"
-	sleep 10
+	sleep 1
 done
-sleep 5
+((ready)) || die "MEDRE did not connect both adapters within 240s"
 
 mkdir -p "${LOG_DIR}"
 docker logs medre-lab-openhop-radio-relay >"${LOG_DIR}/relay-${TS}.log" 2>&1 || true
