@@ -13,6 +13,7 @@ conclusion is a test failure rather than a wrong line in an evidence file:
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 MODULE_PATH = (
@@ -124,33 +125,203 @@ def test_summary_only_exits_zero_without_running_cases(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# The cross-store merge premise: the newer (or live) block must be in
-# memory ONLY when the client drains - nothing persisted while the store
-# was locked, and at least one row still unpersisted at the drain.  The
-# decision is a pure function; both counts land in the record either way,
-# and the drain runs before the NOT RUN so no rows are left behind.
+# The cross-store merge premise: the newer block must be in memory ONLY
+# when the client drains.  The o1 store lock outlasts the repeater's
+# whole persist-retry budget, so the premise is strict - BOTH pre-drain
+# counts must be 0; any other combination fails it.  The decision is a
+# pure function; the counts land in the record either way, and the drain
+# runs before the NOT RUN so no rows are left behind.
 # ---------------------------------------------------------------------------
 
 
-def test_the_merge_premise_holds_with_nothing_persisted_early():
-    assert ordering.merge_premise_reason(0, 0, 3) is None
+def test_the_merge_premise_holds_with_nothing_persisted_before_the_drain():
+    assert ordering.merge_premise_reason(0, 0) is None
 
 
-def test_the_merge_premise_holds_with_some_but_not_all_persisted_before_the_drain():
-    assert ordering.merge_premise_reason(0, 1, 3) is None
-
-
-def test_the_merge_premise_fails_when_the_lock_did_not_hold():
-    reason = ordering.merge_premise_reason(2, 2, 3)
+def test_the_merge_premise_fails_when_any_row_was_persisted_while_the_lock_held():
+    reason = ordering.merge_premise_reason(1, 0)
     assert reason is not None
     assert "while the store was locked" in reason
 
 
-def test_the_merge_premise_fails_when_everything_was_persisted_before_the_drain():
-    reason = ordering.merge_premise_reason(0, 3, 3)
+def test_the_merge_premise_fails_when_any_row_was_persisted_before_the_drain():
+    reason = ordering.merge_premise_reason(0, 1)
     assert reason is not None
     assert "before the drain" in reason
+    assert "persist-retry budget" in reason
 
 
-def test_the_merge_premise_tolerates_an_empty_block():
-    assert ordering.merge_premise_reason(0, 0, 0) is None
+def test_a_row_persisted_while_locked_is_reported_before_a_row_persisted_later():
+    reason = ordering.merge_premise_reason(2, 2)
+    assert reason is not None
+    assert "while the store was locked" in reason
+
+
+# ---------------------------------------------------------------------------
+# The o1 flow, offline: the rig plumbing is stubbed so the case runs
+# end to end without Docker.  These pin the construction - the 100 s
+# lock (retry deadline + interval + send margin), the strict premise,
+# the three persisted counts in the record - and the after-drain rule:
+# a NEWER row on disk once the drain has completed is a FAIL, not a
+# NOT RUN.
+# ---------------------------------------------------------------------------
+
+
+class _FakeLock:
+    def __init__(self) -> None:
+        self.seconds: int = 0
+        self.wait_timeout: int | None = None
+
+    def poll(self) -> int:
+        return 0
+
+    def wait(self, timeout: int | None = None) -> int:
+        self.wait_timeout = timeout
+        return 0
+
+    def kill(self) -> None:
+        return None
+
+
+def _stub_rig(monkeypatch, *, store_order: list[str], queue_rows):
+    """Stub every rig touchpoint the ordering cases use.
+
+    ``queue_rows(needle, drained)`` returns the companion store rows a
+    store read sees for that needle at that stage of the case; the
+    ``drained`` flag flips when the case starts MEDRE.  ``store_order``
+    is the arrival order MEDRE's store holds.  Returns the fake lock and
+    the state flag so a test can assert on them.
+    """
+    state = {"drained": False}
+
+    def fake_start_medre(self):
+        state["drained"] = True
+
+    def fake_repeater_queue(self, needle):
+        rows = queue_rows(needle, state["drained"])
+        return [{"text": row} for row in rows], {}
+
+    def fake_markers_from_store(self, needle, only=None):
+        return [row for row in store_order if only is None or row in only]
+
+    def fake_peer_send(self, count, prefix, settle=3.0):
+        return {
+            "accepted_count": count,
+            "nonces": [f"{prefix}-{index}-{index:02x}" for index in range(count)],
+        }
+
+    lock = _FakeLock()
+
+    def fake_hold_exclusive_lock(seconds):
+        lock.seconds = seconds
+        return lock
+
+    monkeypatch.setattr(
+        ordering.OrderingMatrix,
+        "preconditions",
+        lambda self, note: {
+            "note": note,
+            "medre_stopped": True,
+            "companion_a_client_free": True,
+        },
+    )
+    monkeypatch.setattr(
+        ordering.OrderingMatrix,
+        "wait_for",
+        lambda self, predicate, timeout, interval=1.0: True,
+    )
+    monkeypatch.setattr(ordering.OrderingMatrix, "peer_send", fake_peer_send)
+    monkeypatch.setattr(ordering.OrderingMatrix, "repeater_queue", fake_repeater_queue)
+    monkeypatch.setattr(
+        ordering.OrderingMatrix, "markers_from_store", fake_markers_from_store
+    )
+    monkeypatch.setattr(ordering.OrderingMatrix, "start_medre", fake_start_medre)
+    monkeypatch.setattr(ordering.backlog, "container_running", lambda name: True)
+    monkeypatch.setattr(ordering.backlog, "checked_docker", lambda *args, **kwargs: "")
+    monkeypatch.setattr(ordering.backlog, "restart_repeater", lambda container: None)
+    monkeypatch.setattr(
+        ordering.backlog, "hold_exclusive_lock", fake_hold_exclusive_lock
+    )
+    return lock, state
+
+
+def test_case_o1_locks_past_the_retry_budget_and_passes_with_clean_counts(
+    tmp_path, monkeypatch
+):
+    store_order = [marker("o1a", i, f"{i:02x}") for i in range(5)] + [
+        marker("o1b", i, f"{i:02x}") for i in range(5)
+    ]
+
+    def queue_rows(needle, drained):
+        return []
+
+    lock, _ = _stub_rig(monkeypatch, store_order=store_order, queue_rows=queue_rows)
+    matrix = ordering.OrderingMatrix(tmp_path / "ev-o1", "openhop-bridge")
+    matrix.case_o1()
+    path = tmp_path / "ev-o1" / "o1-older-persisted-newer-memory.json"
+    record = json.loads(path.read_text())
+    assert record["pass"] is True
+    assert record["failures"] == []
+    assert record["newer_persisted_while_store_locked"] == 0
+    assert record["newer_persisted_before_drain"] == 0
+    assert record["newer_persisted_after_drain"] == 0
+    assert record["block_verdict"]["distinct"] == 10
+    # 100 s lock (60 s retry deadline + 1 s interval + send margin), and
+    # the wait must be bounded past the lock, not past the old 30 s.
+    assert lock.seconds == 100
+    assert lock.wait_timeout == 130
+
+
+def test_case_o1_fails_when_a_newer_row_lands_on_disk_during_the_drain(
+    tmp_path, monkeypatch
+):
+    store_order = [marker("o1a", i, f"{i:02x}") for i in range(5)] + [
+        marker("o1b", i, f"{i:02x}") for i in range(5)
+    ]
+    # A retried row is one of the sent markers; the fake peer sends the
+    # unique tails "00".."04".
+    late_row = marker("o1b", 4, "04")
+
+    def queue_rows(needle, drained):
+        return [late_row] if needle == "p4o1b" and drained else []
+
+    lock, _ = _stub_rig(monkeypatch, store_order=store_order, queue_rows=queue_rows)
+    matrix = ordering.OrderingMatrix(tmp_path / "ev-o1-late", "openhop-bridge")
+    matrix.case_o1()
+    path = tmp_path / "ev-o1-late" / "o1-older-persisted-newer-memory.json"
+    record = json.loads(path.read_text())
+    assert record["pass"] is False
+    assert matrix.results[0]["status"] == "FAIL"
+    assert record["newer_persisted_after_drain"] == 1
+    assert any("during the drain" in failure for failure in record["failures"])
+
+
+def test_case_o1_is_not_run_when_a_newer_row_was_persisted_before_the_drain(
+    tmp_path, monkeypatch
+):
+    store_order = [marker("o1a", i, f"{i:02x}") for i in range(5)] + [
+        marker("o1b", i, f"{i:02x}") for i in range(5)
+    ]
+    reads = {"p4o1b": 0}
+
+    def queue_rows(needle, drained):
+        # The two pre-drain reads: while the lock held nothing was on
+        # disk; between the lift and the drain a retry landed.
+        if needle == "p4o1b" and not drained:
+            reads["p4o1b"] += 1
+            return [] if reads["p4o1b"] == 1 else [store_order[-1]]
+        return []
+
+    lock, state = _stub_rig(monkeypatch, store_order=store_order, queue_rows=queue_rows)
+    matrix = ordering.OrderingMatrix(tmp_path / "ev-o1-premise", "openhop-bridge")
+    matrix.case_o1()
+    path = tmp_path / "ev-o1-premise" / "o1-older-persisted-newer-memory.json"
+    record = json.loads(path.read_text())
+    assert record["status"] == "NOT RUN"
+    assert record["pass"] is False
+    assert record["newer_persisted_while_store_locked"] == 0
+    assert record["newer_persisted_before_drain"] == 1
+    assert "persist-retry budget" in record["reason"]
+    # The drain still ran, so no rows are left behind.
+    assert state["drained"] is True
+    assert lock.seconds == 100

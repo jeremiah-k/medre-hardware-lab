@@ -15,10 +15,14 @@ or NOT RUN makes it 1 (--summary-only writes no case and exits 0).
 
   o1-older-persisted-newer-memory
       OLDER messages are persisted at the companion while NO client is
-      attached.  NEWER messages then arrive while the store is locked, so
-      they stay in memory.  The lock lifts and the client syncs: the sync
-      must serve the lowest outstanding arrival number across BOTH stores,
-      i.e. OLDER then NEWER.
+      attached.  NEWER messages then arrive while the store is locked
+      for 100 s - longer than the repeater's whole persist-retry budget
+      (a failed persist is retried every 1 s until 60 s after its first
+      failure, then never again) - so every retry lands while the lock
+      holds and the NEWER block stays in memory BY CONSTRUCTION.  The
+      lock lifts and the client syncs: the sync must serve the lowest
+      outstanding arrival number across BOTH stores, i.e. OLDER then
+      NEWER.
 
   o2-restart-backlog-then-live
       A backlog is persisted, the REPEATER is restarted (the queue
@@ -147,20 +151,21 @@ def merged_block_verdict(markers: list[str], blocks: list[str]) -> dict:
 
 
 def merge_premise_reason(
-    persisted_while_locked: int, persisted_before_drain: int, requested: int
+    persisted_while_locked: int, persisted_before_drain: int
 ) -> str | None:
     """Return why the cross-store merge premise failed, or None.
 
     The merge claim (the sync serves the lowest outstanding arrival
-    number across the in-memory AND the persisted queue) needs the newer
-    (or live) block to be IN MEMORY ONLY when the client drains:
-    nothing of it persisted while the store was locked, and at least one
-    row of it still unpersisted when the drain began.  A row persisted
-    WHILE THE LOCK WAS HELD means the lock did not hold; every row
-    persisted BEFORE THE DRAIN means the in-memory block is empty, and
-    FIFO over the persisted store alone would produce the asserted
-    order.  Either way the case is NOT RUN - but only AFTER the drain,
-    so no rows are left behind.
+    number across the in-memory AND the persisted queue) is only provable
+    when the newer block is IN MEMORY ONLY when the client drains.  The
+    store lock is held longer than the repeater's whole persist-retry
+    budget, so the premise is strict: a row persisted WHILE THE LOCK WAS
+    HELD means the lock did not hold, and a row persisted AFTER THE LIFT
+    but BEFORE THE DRAIN means a retry outlived the budget - either way
+    part of the newer block is on disk and FIFO over the persisted store
+    alone would produce the asserted order.  Both counts must be 0.  The
+    case is NOT RUN - but only AFTER the drain, so no rows are left
+    behind.
     """
     if persisted_while_locked > 0:
         return (
@@ -168,11 +173,12 @@ def merge_premise_reason(
             "was locked: the lock did not hold, so the newer block was not "
             "in memory only and the merge premise cannot be verified"
         )
-    if requested > 0 and persisted_before_drain >= requested:
+    if persisted_before_drain > 0:
         return (
-            f"every one of the {requested} newer row(s) was already persisted "
-            "before the drain began: the in-memory block is empty, and FIFO "
-            "over the persisted store alone would produce the asserted order"
+            f"{persisted_before_drain} row(s) were persisted after the lock "
+            "lifted but before the drain: the lock did not outlast the "
+            "persist-retry budget, so the newer block was not in memory "
+            "only and the merge premise cannot be verified"
         )
     return None
 
@@ -261,6 +267,17 @@ class OrderingMatrix:
 
     # -- cases -----------------------------------------------------------
     def case_o1(self, older: int = 5, newer: int = 5) -> None:
+        """OLDER persisted block first, NEWER memory block second.
+
+        The NEWER block is held in memory BY CONSTRUCTION: the store lock
+        (100 s) outlasts the repeater's whole persist-retry budget (a
+        failed persist is retried every 1 s until 60 s after its first
+        failure, then never again), so every retry of the NEWER block
+        lands while the lock still holds and nothing persists the block
+        afterwards.  The premise is strict - both pre-drain persisted
+        counts must be 0 - and a NEWER row on disk after the drain is a
+        FAIL: a retry would have landed during the drain itself.
+        """
         name = "o1-older-persisted-newer-memory"
         old_prefix, new_prefix = "p4o1a", "p4o1b"
         restore_bridge = False
@@ -293,8 +310,17 @@ class OrderingMatrix:
                 )
                 return
             # Lock the store so the NEWER batch cannot be persisted and
-            # stays in the in-memory queue.
-            lock_proc = backlog.hold_exclusive_lock(30)
+            # stays in the in-memory queue.  The duration is derived from
+            # the repeater's persist-retry budget
+            # (repeater/companion/frame_server.py): a failed persist is
+            # retried every _PERSIST_RETRY_INTERVAL_S (1 s) until
+            # _PERSIST_RETRY_DEADLINE_S (60 s) after its first failure,
+            # and after that deadline nothing persists the message again.
+            # 100 s = 60 s deadline + 1 s interval + margin for the NEWER
+            # batch's send time, so every retry lands while the lock
+            # holds and the NEWER block stays in memory by construction.
+            lock_started = time.monotonic()
+            lock_proc = backlog.hold_exclusive_lock(100)
             if lock_proc is None:
                 self.not_run(
                     name,
@@ -309,32 +335,44 @@ class OrderingMatrix:
                 rows_while_locked, only=new_markers_sent
             )
             try:
-                lock_proc.wait(timeout=60)
+                lock_proc.wait(timeout=130)
             except subprocess.TimeoutExpired:
                 lock_proc.kill()
                 lock_proc.wait()
                 raise
-            # The merge premise, read BEFORE the drain: how much of the
-            # NEWER block the store had already swallowed.
+            lock_hold_seconds = round(time.monotonic() - lock_started, 3)
+            # The strict merge premise, read BEFORE the drain: with the
+            # lock outlasting the retry budget, BOTH counts must be 0 -
+            # a row here means some of the NEWER block reached the disk.
             rows_before_drain, _ = self.repeater_queue(new_prefix)
             newer_persisted_before_drain, _ = backlog.count_nonce_rows(
                 rows_before_drain, only=new_markers_sent
             )
             premise_failure = merge_premise_reason(
-                persisted_while_locked, newer_persisted_before_drain, newer
+                persisted_while_locked, newer_persisted_before_drain
             )
             mine = old_markers_sent | new_markers_sent
+            drain_started = time.monotonic()
             self.start_medre()
             self.wait_for(
                 lambda: len(self.markers_from_store("p4o1", mine)) >= older + newer,
                 timeout=180,
                 interval=3.0,
             )
+            drain_seconds = round(time.monotonic() - drain_started, 3)
             markers = self.markers_from_store("p4o1", mine)
             verdict = merged_block_verdict(markers, ["o1a", "o1b"])
             remaining_rows, _ = self.repeater_queue("")
             remaining_count, remaining_markers = backlog.count_nonce_rows(
                 remaining_rows, only=mine
+            )
+            # Read AFTER the drain has completed, BEFORE the record is
+            # written: the NEWER block was in memory before the drain and
+            # was delivered, so a row on disk here means a persist retry
+            # landed during the drain.
+            rows_after_drain, _ = self.repeater_queue(new_prefix)
+            newer_persisted_after_drain, _ = backlog.count_nonce_rows(
+                rows_after_drain, only=new_markers_sent
             )
             failures: list[str] = []
             if not old_send.get("accepted_count") or not new_send.get("accepted_count"):
@@ -359,16 +397,23 @@ class OrderingMatrix:
                 failures.append(
                     f"{remaining_count} marker(s) remained persisted after the drain"
                 )
+            if newer_persisted_after_drain:
+                failures.append(
+                    f"{newer_persisted_after_drain} NEWER row(s) were persisted "
+                    "during the drain: a persist retry landed after the lock "
+                    "lifted, so the NEWER block was not in memory only"
+                )
             if premise_failure:
                 # The premise failed AFTER the drain ran, so no rows are
-                # left behind; the case is NOT RUN with both counts in
-                # the record.
+                # left behind; the case is NOT RUN with the pre-drain
+                # counts in the record.
                 self.not_run(
                     name,
                     premise_failure,
                     {
                         "newer_persisted_while_store_locked": persisted_while_locked,
                         "newer_persisted_before_drain": newer_persisted_before_drain,
+                        "newer_persisted_after_drain": newer_persisted_after_drain,
                         "preconditions": pre,
                     },
                 )
@@ -386,13 +431,18 @@ class OrderingMatrix:
                     "newer_accepted": new_send.get("accepted_count"),
                     "newer_persisted_while_store_locked": persisted_while_locked,
                     "newer_persisted_before_drain": newer_persisted_before_drain,
+                    "newer_persisted_after_drain": newer_persisted_after_drain,
+                    "lock_hold_seconds": lock_hold_seconds,
+                    "drain_seconds": drain_seconds,
                     "block_verdict": verdict,
                     "remaining_persisted": remaining_markers,
                     "ordering_promise": (
                         "sync serves the lowest outstanding arrival number "
-                        "across the in-memory and the SQLite queue; the OLDER "
-                        "persisted block must arrive entirely before the NEWER "
-                        "in-memory block"
+                        "across the in-memory and the SQLite queue; the NEWER "
+                        "block is held in memory by construction (the store "
+                        "lock outlasts the whole persist-retry budget), so "
+                        "the OLDER persisted block must arrive entirely "
+                        "before the NEWER in-memory block"
                     ),
                     "older_send": old_send,
                     "newer_send": new_send,
