@@ -2,7 +2,7 @@
 # =============================================================================
 # lab/run-scenarios.sh - cross-instance scenario suite runner.
 #
-# Usage: lab/run-scenarios.sh [name ...]
+# Usage: lab/run-scenarios.sh [--evidence-dir DIR] [name ...]
 #   name      scenario name without the scenario- prefix / .sh suffix
 #             (e.g. smoke, reply-correlation). No arguments = run all.
 #
@@ -14,6 +14,13 @@
 # The runner NEVER manages containers: it runs against an ALREADY-UP rig
 # (lab/up.sh). Scenario scripts may SKIP themselves (exit 2) when an optional
 # rig feature they need is absent; skips are reported but do not fail the run.
+#
+# Evidence fence: when at least one scenario will actually execute, the run
+# first stamps a per-run evidence directory (default evidence/scenarios/<ts>,
+# or --evidence-dir DIR) with the source-selection record (see
+# lab/scenario_evidence.py), then writes one case file per executed scenario
+# and a summary. Carry a recorded pass forward with:
+#   python3 lab/tools/openhop_case_summary.py --verify-selection <dir> --profile scenarios
 # =============================================================================
 set -uo pipefail
 
@@ -52,10 +59,34 @@ declare -A DEFERRED_SCENARIOS=(
 	["threenode-same-mesh"]="DEFERRED by owner (2026-11-10): same-mesh multi-relay loop handling is a later work item; scenario kept in scenarios/deferred/"
 )
 
-if (($# > 0)); then
-	SELECTED=("$@")
-else
+EVIDENCE_DIR_ARG=""
+SELECTED=()
+while (($#)); do
+	case "$1" in
+	--evidence-dir)
+		if (($# < 2)); then
+			echo "ERROR: --evidence-dir requires a directory argument" >&2
+			exit 2
+		fi
+		EVIDENCE_DIR_ARG="$2"
+		shift 2
+		;;
+	--evidence-dir=*)
+		EVIDENCE_DIR_ARG="${1#*=}"
+		shift
+		;;
+	*)
+		SELECTED+=("$1")
+		shift
+		;;
+	esac
+done
+if ((${#SELECTED[@]} == 0)); then
 	SELECTED=("${ALL_SCENARIOS[@]}")
+fi
+EVIDENCE_DIR="${LAB_ROOT}/evidence/scenarios/${RUN_TS}"
+if [[ -n ${EVIDENCE_DIR_ARG} ]]; then
+	EVIDENCE_DIR="${EVIDENCE_DIR_ARG}"
 fi
 
 # Normal qualification requires independently recorded full source pins. Missing
@@ -70,6 +101,28 @@ for name in "${SELECTED[@]}"; do
 		break
 	fi
 done
+
+# --- Evidence fence ----------------------------------------------------------
+# Only scenarios that will actually execute bind and write evidence: a
+# deferred-only or unknown-only selection runs nothing and records nothing.
+# The stamp precedes every case file, so a run cannot begin under content it
+# will not be able to name (fail-closed: a bind refusal stops the run).
+declare -a RUNNABLE=()
+for name in "${SELECTED[@]}"; do
+	[[ -n ${DEFERRED_SCENARIOS[${name}]-} ]] && continue
+	[[ -f ${SCENARIO_DIR}/scenario-${name}.sh ]] && RUNNABLE+=("${name}")
+done
+BOUND=0
+if ((${#RUNNABLE[@]} > 0)); then
+	mkdir -p "${EVIDENCE_DIR}"
+	if python3 "${LAB_ROOT}/lab/scenario_evidence.py" --bind "${EVIDENCE_DIR}" >/dev/null; then
+		BOUND=1
+		echo "Evidence directory: ${EVIDENCE_DIR}"
+	else
+		echo "ERROR: the scenario run is refused: no source-selection stamp in ${EVIDENCE_DIR}" >&2
+		exit 1
+	fi
+fi
 
 declare -a RESULT_NAMES=()
 declare -a RESULT_STATUS=()
@@ -122,7 +175,21 @@ for name in "${SELECTED[@]}"; do
 	RESULT_NAMES+=("${name}")
 	RESULT_STATUS+=("${verdict}")
 	RESULT_LOGS+=("${log_file}")
+	if ((BOUND)); then
+		if ! python3 "${LAB_ROOT}/lab/scenario_evidence.py" --record-case "${EVIDENCE_DIR}" \
+			"${name}" "${verdict}" "${log_file#"${LAB_ROOT}/"}" >/dev/null; then
+			echo "ERROR: could not record the ${name} case file in ${EVIDENCE_DIR}" >&2
+			FAILED=$((FAILED + 1))
+		fi
+	fi
 done
+
+if ((BOUND)); then
+	if ! python3 "${LAB_ROOT}/lab/scenario_evidence.py" --write-summary "${EVIDENCE_DIR}" >/dev/null; then
+		echo "ERROR: could not write the evidence summary in ${EVIDENCE_DIR}" >&2
+		FAILED=$((FAILED + 1))
+	fi
+fi
 
 echo ""
 echo "==================================================================="
