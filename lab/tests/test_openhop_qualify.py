@@ -40,6 +40,12 @@ def test_qualification_runs_every_stage_and_keeps_fault_last(tmp_path, monkeypat
     )
 
 
+def test_campaign_matrices_run_fail_fast(tmp_path):
+    arguments = dict(qualify.stages(tmp_path, skip_build=True))
+    for matrix in ("backlog", "ordering", "fault"):
+        assert "--fail-fast" in arguments[matrix]
+
+
 @pytest.mark.parametrize("failure", ["lifecycle-up", "packet-path", "verify-ordering"])
 def test_qualification_preserves_first_failure_and_attempts_cleanup(
     tmp_path, monkeypatch, failure

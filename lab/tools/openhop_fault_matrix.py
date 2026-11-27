@@ -2969,6 +2969,11 @@ def main(argv: list[str] | None = None) -> int:
         help="arm the selective-drop case as a pass-through control: no "
         "message frames are dropped, so the proof fails by design",
     )
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="stop after the first case that does not pass",
+    )
     args = parser.parse_args(argv)
 
     matrix = FaultMatrix(Path(args.evidence_dir))
@@ -2987,29 +2992,28 @@ def main(argv: list[str] | None = None) -> int:
         case_summary.bind_source_selection(matrix.dir, LAB_ROOT, "openhop-fault")
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         parser.error(str(exc))
-    if args.case == "all":
-        matrix.case_idle_blackhole()
-        for key in WINDOW_RUNNERS:
-            getattr(matrix, WINDOW_RUNNERS[key])()
-        selected = list(CASES)
-    else:
-        selected = []
-        if args.case == "idle_blackhole":
-            matrix.case_idle_blackhole()
-        elif args.case in WINDOW_RUNNERS:
-            getattr(matrix, WINDOW_RUNNERS[args.case])()
-        else:
-            selected = [args.case]
+    selected = (
+        ["idle_blackhole", *WINDOW_RUNNERS, *CASES]
+        if args.case == "all"
+        else [args.case]
+    )
     for key in selected:
-        fault, count, prefix, expect_recovery, verdict = CASES[key]
-        matrix.run_case(
-            f"fault-{key.replace('_', '-')}",
-            fault,
-            count,
-            prefix,
-            expect_recovery,
-            verdict,
-        )
+        if key == "idle_blackhole":
+            matrix.case_idle_blackhole()
+        elif key in WINDOW_RUNNERS:
+            getattr(matrix, WINDOW_RUNNERS[key])()
+        else:
+            fault, count, prefix, expect_recovery, verdict = CASES[key]
+            matrix.run_case(
+                f"fault-{key.replace('_', '-')}",
+                fault,
+                count,
+                prefix,
+                expect_recovery,
+                verdict,
+            )
+        if args.fail_fast and any(row["status"] != "PASS" for row in matrix.results):
+            break
     # The summary is built from the EVIDENCE DIRECTORY, not from the cases
     # this invocation ran: re-running one case must not drop the other
     # cases from the summary.

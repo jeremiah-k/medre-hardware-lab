@@ -1041,6 +1041,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="regenerate the summary from the existing case files; run no case",
     )
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="stop after the first case that does not pass",
+    )
     args = parser.parse_args(argv)
 
     matrix = OrderingMatrix(Path(args.evidence_dir), args.profile)
@@ -1062,6 +1067,8 @@ def main(argv: list[str] | None = None) -> int:
     selected = list(CASES) if args.case == "all" else [args.case]
     for key in selected:
         getattr(matrix, CASES[key])()
+        if args.fail_fast and any(row["status"] != "PASS" for row in matrix.results):
+            break
     summary = case_summary.build_summary(
         matrix.dir,
         prefix="o",

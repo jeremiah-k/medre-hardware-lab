@@ -46,6 +46,7 @@ def stages(evidence: Path, skip_build: bool):
         yield matrix, [
             sys.executable,
             f"lab/tools/openhop_{matrix}_matrix.py",
+            "--fail-fast",
             "--evidence-dir",
             str(evidence / matrix),
         ]
