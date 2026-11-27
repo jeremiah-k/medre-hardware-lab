@@ -494,6 +494,19 @@ def selective_drop_cross_check(events: list[dict], lost_markers: list[str]) -> d
     }
 
 
+def reconnected_after_retirement(log: str) -> bool:
+    """True when the log shows a reconnect success after its last retirement.
+
+    The reconnect evidence the stall cases wait for: the line only counts
+    when it follows the connection's retirement, and the log is read ONCE
+    so the slice and its anchor come from the same snapshot.
+    """
+    anchor = log.rfind("retiring connection")
+    if anchor < 0:
+        return False
+    return "reconnected successfully" in log[anchor:]
+
+
 def nonce_marker(text: str) -> str | None:
     """Return the FULL nonce marker, or None.
 
@@ -1088,7 +1101,8 @@ def drain_stall_failures(
         )
     if retired_during_window and not reconnected_after_window:
         failures.append(
-            "the connection retired inside the window and never reconnected after it ended"
+            "the connection retired inside the window and never "
+            "reconnected after it ended"
         )
     limit = 45.0 if retired_during_window else 15.0
     if resume_seconds_after_window is None:
@@ -1096,11 +1110,13 @@ def drain_stall_failures(
     elif resume_seconds_after_window > limit:
         if retired_during_window:
             failures.append(
-                "the drain resumed later than the reconnect backoff and probe budget (45 s)"
+                "the drain resumed later than the reconnect backoff "
+                "and probe budget (45 s)"
             )
         else:
             failures.append(
-                "the surviving connection took longer than one probe interval (15 s) to resume"
+                "the surviving connection took longer than one probe "
+                "interval (15 s) to resume"
             )
     return failures
 
@@ -1229,7 +1245,7 @@ class FaultMatrix:
             "python3",
             "/opt/openhop-fault/openhop_fault_proxy.py",
             "--listen-host",
-            "0.0.0.0",  # nosec B104 # The splice serves the private lab Docker network only; the compose file publishes no host port.
+            "0.0.0.0",  # nosec B104 # serves the private lab Docker network only.
             "--listen-port",
             "5050",
             "--upstream-host",
@@ -1999,14 +2015,7 @@ class FaultMatrix:
                 time.sleep(window_end - time.time())
             write_fault(state_dir / "fault.json", {})
             self.wait_for(
-                lambda: (
-                    "reconnected successfully"
-                    in container_logs(MEDRE_FAULT)[
-                        container_logs(MEDRE_FAULT).rfind("retiring connection") :
-                    ]
-                    if "retiring connection" in container_logs(MEDRE_FAULT)
-                    else False
-                ),
+                lambda: reconnected_after_retirement(container_logs(MEDRE_FAULT)),
                 120,
                 interval=2.0,
             )
@@ -2276,14 +2285,7 @@ class FaultMatrix:
                 time.sleep(window_end - time.time())
             write_fault(state_dir / "fault.json", {})
             self.wait_for(
-                lambda: (
-                    "reconnected successfully"
-                    in container_logs(MEDRE_FAULT)[
-                        container_logs(MEDRE_FAULT).rfind("retiring connection") :
-                    ]
-                    if "retiring connection" in container_logs(MEDRE_FAULT)
-                    else False
-                ),
+                lambda: reconnected_after_retirement(container_logs(MEDRE_FAULT)),
                 120,
                 interval=2.0,
             )
@@ -2694,14 +2696,7 @@ class FaultMatrix:
             cleared_at = time.time()
             write_fault(state_dir / "fault.json", {})
             self.wait_for(
-                lambda: (
-                    "reconnected successfully"
-                    in container_logs(MEDRE_FAULT)[
-                        container_logs(MEDRE_FAULT).rfind("retiring connection") :
-                    ]
-                    if "retiring connection" in container_logs(MEDRE_FAULT)
-                    else False
-                ),
+                lambda: reconnected_after_retirement(container_logs(MEDRE_FAULT)),
                 90,
                 interval=2.0,
             )

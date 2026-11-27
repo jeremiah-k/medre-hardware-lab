@@ -839,7 +839,7 @@ class Matrix:
                 "python3",
                 "/opt/openhop-fault/openhop_fault_proxy.py",
                 "--listen-host",
-                "0.0.0.0",  # nosec B104 # The splice serves the private lab Docker network only; compose publishes no host port.
+                "0.0.0.0",  # nosec B104 # serves the private lab Docker network only.
                 "--listen-port",
                 "5050",
                 "--upstream-host",
@@ -937,7 +937,8 @@ class Matrix:
                 failures.append("the peer sent no accepted message")
             if persisted_count == 0:
                 failures.append(
-                    "the repeater persisted no nonce-bearing message while no client was attached"
+                    "the repeater persisted no nonce-bearing message "
+                    "while no client was attached"
                 )
             if set(persisted_indices) != mine or set(markers) != mine:
                 failures.append(
@@ -945,7 +946,8 @@ class Matrix:
                 )
             if report["distinct"] != persisted_count:
                 failures.append(
-                    f"MEDRE recorded {report['distinct']} of the {persisted_count} persisted nonces"
+                    f"MEDRE recorded {report['distinct']} of the "
+                    f"{persisted_count} persisted nonces"
                 )
             if report["duplicate_arrivals"]:
                 failures.append(
@@ -1751,11 +1753,13 @@ class Matrix:
                 )
             if report["distinct"] != persisted_after:
                 failures.append(
-                    f"MEDRE recorded {report['distinct']} of the {persisted_after} persisted nonces"
+                    f"MEDRE recorded {report['distinct']} of the "
+                    f"{persisted_after} persisted nonces"
                 )
             if report["duplicate_arrivals"]:
                 failures.append(
-                    f"{report['duplicate_arrivals']} duplicate arrivals after the restart"
+                    f"{report['duplicate_arrivals']} duplicate "
+                    f"arrivals after the restart"
                 )
             self.write(
                 name,

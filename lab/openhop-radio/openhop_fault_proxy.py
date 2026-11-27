@@ -655,7 +655,7 @@ async def main() -> None:
     # the private compose network; it publishes no host port.
     parser.add_argument(
         "--listen-host",
-        default="0.0.0.0",  # nosec B104 # The splice serves the private lab Docker network only; the compose file publishes no host port.
+        default="0.0.0.0",  # nosec B104 # serves the private lab Docker network only.
     )
     parser.add_argument("--listen-port", type=int, default=5100)
     parser.add_argument("--upstream-host", default="openhop-repeater-a")

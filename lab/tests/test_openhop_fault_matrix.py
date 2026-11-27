@@ -1485,3 +1485,23 @@ def test_events_with_foreign_tails_do_not_satisfy_the_delivery_gate():
         {"text": f"lab message p4qn-{index}-0000{index}0abc"} for index in range(3)
     ]
     assert fault_matrix.delivered_this_run(this_run, mine) == 3
+
+
+def test_reconnected_after_retirement_reads_one_snapshot():
+    """The reconnect evidence is judged from ONE log snapshot: the slice
+    and its anchor come from the same read."""
+    log = "\n".join(
+        [
+            "2026-11-26T18:00:00.000000000Z reconnected successfully (old)",
+            "2026-11-26T18:00:10.000000000Z receive pump failed; retiring connection",
+            "2026-11-26T18:00:15.000000000Z reconnected successfully",
+        ]
+    )
+    assert fault_matrix.reconnected_after_retirement(log) is True
+    assert (
+        fault_matrix.reconnected_after_retirement(
+            "2026-11-26T18:00:10.000000000Z retiring connection"
+        )
+        is False
+    )
+    assert fault_matrix.reconnected_after_retirement("no retirement at all") is False

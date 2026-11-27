@@ -529,7 +529,9 @@ class OrderingMatrix:
                     name,
                     premise_failure,
                     {
-                        "live_persisted_while_store_locked": live_persisted_while_locked,
+                        "live_persisted_while_store_locked": (
+                            live_persisted_while_locked
+                        ),
                         "live_persisted_before_drain": live_persisted_before_drain,
                         "preconditions": pre,
                     },
@@ -625,7 +627,8 @@ class OrderingMatrix:
                 )
             if warning_delta:
                 failures.append(
-                    f"the readable WAL store triggered {warning_delta} unreadable-store warnings"
+                    f"the readable WAL store triggered {warning_delta} "
+                    "unreadable-store warnings"
                 )
             if report["duplicate_arrivals"]:
                 failures.append(
