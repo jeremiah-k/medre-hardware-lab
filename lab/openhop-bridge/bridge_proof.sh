@@ -331,33 +331,38 @@ import json
 import sys
 from pathlib import Path
 
+# The store-row selection is importable and offline-tested: the bridged
+# text lives in the canonical event's metadata (payload carries "{}" or a
+# portnum object), so the nonce is matched anywhere in the stored row.
+sys.path.insert(0, "lab/tools")
+import openhop_bridge_store_select as store_select
+
 state = json.loads(Path(sys.argv[1]).read_text())
 evidence_dir = Path(sys.argv[2])
 proof = json.loads(Path(sys.argv[3]).read_text())
 
 # Select the test messages first, then associate every store transition
 # by event ID. A receipt can commit after the peer has observed delivery.
-nonces = {
-    nonce
-    for direction in ("direction_mc_to_mesh", "direction_mesh_to_mc")
-    if (nonce := (proof.get(direction) or {}).get("nonce"))
-}
-events = [
-    row for row in state["canonical_events"]
-    if any(nonce in (row.get("payload") or "") for nonce in nonces)
-]
-event_ids = {row["event_id"] for row in events}
-receipts = [row for row in state["delivery_receipts"] if row["event_id"] in event_ids]
-outbox = [row for row in state["delivery_outbox"] if row["event_id"] in event_ids]
-refs = [row for row in state["native_message_refs"] if row["event_id"] in event_ids]
+selection = store_select.select_nonce_events(
+    state,
+    (
+        (proof.get("direction_mc_to_mesh") or {}).get("nonce"),
+        (proof.get("direction_mesh_to_mc") or {}).get("nonce"),
+    ),
+)
+nonces = selection["nonces"]
+events = selection["events"]
+event_ids = selection["event_ids"]
+receipts = selection["receipts"]
+outbox = selection["outbox"]
+refs = selection["refs"]
 
 # Exactly ONE canonical event per bridged direction: no duplicate client
 # event at companion A, and no double-bridged event. The failures are
 # COLLECTED, not raised, so the rest of the evidence is still captured.
 store_failures: list[str] = []
 if len(nonces) != 2 or any(
-    sum(nonce in (row.get("payload") or "") for row in events) != 1
-    for nonce in nonces
+    count != 1 for count in selection["events_per_nonce"].values()
 ):
     store_failures.append("expected one canonical event for each proof nonce")
 if len(events) != 2:
