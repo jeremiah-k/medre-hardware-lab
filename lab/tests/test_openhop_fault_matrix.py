@@ -13,10 +13,12 @@ Four verdicts exist and must not be confused:
   the designed outcome, reconnect attempts continue on backoff without
   success, and when the window ends everything queued must be delivered.
 * the drain-stall verdict judges the reply-stall window that is armed
-  while a backlog drain is in flight: at most the one in-flight message
-  may be consumed, every other accepted message is delivered once, no
-  reconnect succeeds while the window holds, and the drain resumes
-  without a reconnect or within one probe interval after it ends.
+  while a backlog drain is in flight: the case does not observe which
+  frame the stall catches, so the verdict asserts the bound - at most
+  one message may be consumed, every other accepted message is
+  delivered once, no reconnect succeeds while the window holds, and
+  the drain resumes without a reconnect or within one probe interval
+  after it ends.
 * the selective-drop verdict judges the per-connection worst case the
   spec bounds: at most one consumed message per answered liveness probe
   beyond the unproven first fetch, every other accepted message
@@ -310,7 +312,7 @@ def test_the_drain_stall_run_without_a_reconnect_passes():
 
 def test_more_than_one_consumed_message_fails_the_drain_stall():
     failures = judge_drain_stall(delivered_distinct=117)
-    assert any("more than the one in-flight frame" in failure for failure in failures)
+    assert any("more than the one message the bound admits" in f for f in failures)
 
 
 def test_an_undelivered_backlog_message_fails_the_drain_stall():
@@ -1363,6 +1365,35 @@ def test_the_drain_stall_case_captures_logs_once_on_completion(tmp_path, monkeyp
     # returning instantly the thread is done before the join.
     matrix.case_reply_stall_during_drain()
     assert captured == ["fault-reply-stall-drain"]
+
+
+def test_the_drain_stall_record_states_the_bound_not_the_exact_frame(
+    tmp_path, monkeypatch
+):
+    """The case arms its window at the first delivery it observes and
+    cannot see which frame the stall catches: the record's fault note and
+    verdict rule must claim the bound, never name the swallowed frame."""
+    make_window_fakes(monkeypatch, tmp_path, 60, "p4qsd", [5, 6, 7], success_offset=52)
+    matrix = fault_matrix.FaultMatrix(tmp_path / "evidence")
+    matrix.peer_pacing_s = None
+    matrix.case_reply_stall_during_drain()
+    record = read_case_record(tmp_path, "fault-reply-stall-drain")
+    assert record is not None
+    note = record["fault"]["note"]
+    rule = record["verdict_rule"]
+    for text in (note, rule):
+        assert "does not observe which frame the stall catches" in text
+        assert "on the wire" not in text
+        assert "the one the splice swallows" not in text
+        assert "in-flight message" not in text
+    assert "at most one message may be consumed" in note
+    assert "a run may consume none" in note
+    assert "at most one message may be consumed" in rule
+    assert "a run may consume none" in rule
+    assert "zero duplicates" in rule
+    assert "every other accepted message is delivered once" in rule
+    assert "no reconnect succeeds while the window holds" in rule
+    assert "recovery follows the spec's two branches" in rule
 
 
 def make_blackhole_fakes(monkeypatch, tmp_path, count=3, prefix="p4blackhole"):

@@ -44,15 +44,17 @@
 #                    construction; probe retirements of the silent link
 #                    are designed, nothing may be consumed, and the
 #                    backlog is delivered once the window ends
-#   reply_stall_drain TIME WINDOW armed while a backlog drain is in
-#                    flight: the frame the drain had on the wire is
-#                    swallowed, at most that one message may be consumed,
-#                    recovery follows the spec's branches (a silence the
-#                    connection survives resumes on the same connection
-#                    within one probe interval of the window's end; a
-#                    longer silence retires and recovery follows the
-#                    reconnect backoff plus one gated probe budget), and
-#                    every other message is delivered once
+#   reply_stall_drain TIME WINDOW armed at the first delivery observed
+#                    while a backlog drain is running: the case does not
+#                    observe which frame the stall catches, so it asserts
+#                    the bound - at most one message may be consumed (a
+#                    run may consume none), recovery follows the spec's
+#                    branches (a silence the connection survives resumes
+#                    on the same connection within one probe interval of
+#                    the window's end; a longer silence retires and
+#                    recovery follows the reconnect backoff plus one
+#                    gated probe budget), and every other message is
+#                    delivered once
 #   selective_drop   the per-connection worst case the spec bounds: the
 #                    probes are answered, the message frames are
 #                    swallowed; the verdict asserts the documented bound

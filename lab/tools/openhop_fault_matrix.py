@@ -69,13 +69,16 @@ The matrix
                    predicted figure (batch x measured peer pacing x
                    1.5 + 10 s, fallback pacing 2 s/send) is recorded
                    for information; the measured window governs.
-  reply_stall_drain a TIME WINDOW armed while a backlog drain is in
-                   flight: the frame the drain had on the wire when the
-                   window opened is swallowed.  At most that one message
-                   may be consumed; recovery follows the spec's branches -
-                   a silence the connection survives resumes on the same
-                   connection within one probe interval of the window's
-                   end, a longer silence retires and recovery follows the
+  reply_stall_drain a TIME WINDOW armed at the first delivery observed
+                   while a backlog drain is running.  The case does not
+                   observe which frame the stall catches, so it asserts
+                   the bound: at most one message may be consumed (the
+                   one whose reply is swallowed if a fetch is in flight
+                   when the stall begins; a run may consume none);
+                   recovery follows the spec's branches - a silence the
+                   connection survives resumes on the same connection
+                   within one probe interval of the window's end, a
+                   longer silence retires and recovery follows the
                    reconnect backoff plus one gated probe budget - and
                    every other accepted message is delivered once; zero
                    duplicates.
@@ -1063,14 +1066,15 @@ def drain_stall_failures(
 ) -> list[str]:
     """Judge a reply-stall window armed during a backlog drain.
 
-    The window opens while the drain has a fetched frame on the wire: the
-    node has popped that message and the splice swallows its frame, so
-    that one message may be consumed - the fetch window it belonged to
-    elapses with no inbound traffic and the pump parks instead of
-    re-issuing into the stalled link.  What the spec promises, and what
-    this verdict asserts:
+    The window arms at the first delivery the case observes while the
+    drain is running; the case does not observe which frame the stall
+    catches - whether a fetch was in flight at that instant is not
+    visible to it.  What the spec promises, and what this verdict
+    asserts, is therefore a bound:
 
-    * at most ONE message is consumed (the in-flight frame's);
+    * at most ONE message is consumed (the one whose reply is swallowed
+      if a fetch is in flight when the stall begins; a run may consume
+      none);
     * zero duplicates anywhere in the run;
     * every other accepted message is delivered once: the drain resumes
       and accounts for all of them, so nothing is still queued at the
@@ -1094,7 +1098,7 @@ def drain_stall_failures(
     if consumed > 1:
         failures.append(
             f"{consumed} message(s) were consumed into the stall, more than "
-            "the one in-flight frame the window could swallow"
+            "the one message the bound admits"
         )
     if delivered_distinct + preserved_distinct > accepted:
         failures.append(
@@ -2305,12 +2309,12 @@ class FaultMatrix:
         """Arm a reply-stall window while a backlog drain is in flight.
 
         The peer queues a deep backlog and the case watches MEDRE's store:
-        the moment the first delivery is observed the drain is pulling
-        frames across the splice, and the window is armed, so the frame
-        the drain has on the wire is the one the splice swallows.
-        The window holds 45 s across every connection inside it, then
-        ends and the case waits for the reconnect and the delivery of
-        everything that was queued.
+        the window is armed at the first delivery observed while the
+        drain is running.  The case does not observe which frame the
+        stall catches, so the verdict asserts the bound: at most one
+        message may be consumed.  The window holds 45 s across every
+        connection inside it, then ends and the case waits for the
+        reconnect and the delivery of everything that was queued.
         """
         name = "fault-reply-stall-drain"
         # The prefix is unique per run: the arm trigger and the delivery
@@ -2359,9 +2363,9 @@ class FaultMatrix:
 
             sender = threading.Thread(target=queue_backlog, daemon=True)
             sender.start()
-            # Arm at the first OBSERVED delivery: the drain is pulling
-            # frames across the splice right now, so the next frame it
-            # puts on the wire is the one the window swallows.
+            # Arm at the first OBSERVED delivery.  Whether a fetch is in
+            # flight at that instant is not observable, so the verdict
+            # asserts the bound instead of naming the swallowed frame.
             armed = False
             armed_at = 0.0
             window_end = 0.0
@@ -2486,26 +2490,34 @@ class FaultMatrix:
                         "persistent_across_connections": True,
                         "note": (
                             "45 s reply-stall window armed at the first "
-                            "observed delivery: the frame the drain has on "
-                            "the wire is the one the splice swallows"
+                            "delivery observed while a backlog drain was "
+                            "running; the case does not observe which "
+                            "frame the stall catches, so the verdict "
+                            "asserts the bound: at most one message may "
+                            "be consumed (a run may consume none)"
                         ),
                     },
                     "verdict_rule": (
-                        "drain-stall verdict: the window arms while a backlog "
-                        "drain is in flight, so at most the one in-flight "
-                        "message may be consumed; zero duplicates; every "
-                        "other accepted message is delivered once; no "
+                        "drain-stall verdict: the window arms at the "
+                        "first delivery observed while a backlog drain "
+                        "is running, and the case does not observe which "
+                        "frame the stall catches, so it asserts the "
+                        "bound - at most one message may be consumed "
+                        "(the one whose reply is swallowed if a fetch is "
+                        "in flight when the stall begins; a run may "
+                        "consume none); zero duplicates; every other "
+                        "accepted message is delivered once; no "
                         "reconnect succeeds while the window holds; "
-                        "recovery follows the spec's branches - a silence "
-                        "the connection survives resumes the drain on the "
-                        "same connection within one probe interval of the "
-                        "window's end, a longer silence retires the "
-                        "connection and recovery follows the reconnect "
-                        "backoff (one to thirty seconds on TCP under "
-                        "bounded jitter) plus one probe budget for a gated "
-                        "reconnect; the case's measured bound is 45 s on "
-                        "the retired branch and one probe interval on the "
-                        "surviving branch"
+                        "recovery follows the spec's two branches - a "
+                        "silence the connection survives resumes the "
+                        "drain on the same connection within one probe "
+                        "interval of the window's end, a longer silence "
+                        "retires the connection and recovery follows "
+                        "the reconnect backoff (one to thirty seconds "
+                        "on TCP under bounded jitter) plus one probe "
+                        "budget for a gated reconnect; the case's "
+                        "measured bound is 45 s on the retired branch "
+                        "and one probe interval on the surviving branch"
                     ),
                     "requested_messages": count,
                     "peer_accepted_sends": accepted,
