@@ -1,12 +1,14 @@
 """Offline checks for the opt-in openHop VIRTUAL RADIO profile.
 
-Topology and wiring assertions only: they read the committed compose,
-config and script files and never contact Docker, a radio or a network.
+Topology and wiring assertions read the committed Compose, config
+and script files. The packet proof uses a Docker command stub.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -109,17 +111,21 @@ def test_radio_network_is_private(compose):
 def test_radio_repeaters_have_separate_state(compose):
     """Each repeater owns its own identity/volume: they are two distinct nodes."""
     services = compose["services"]
-    volumes_a = {
-        v["source"]
-        for v in services["openhop-repeater-a"]["volumes"]
-        if isinstance(v, dict)
-    }
-    volumes_b = {
-        v["source"]
-        for v in services["openhop-repeater-b"]["volumes"]
-        if isinstance(v, dict)
-    }
-    assert volumes_a != volumes_b
+
+    def state_volume(service: str) -> str:
+        sources = []
+        for mount in services[service]["volumes"]:
+            if isinstance(mount, str):
+                source, target, *_ = mount.split(":")
+            else:
+                source, target = mount["source"], mount["target"]
+            if target == "/var/lib/openhop_repeater":
+                sources.append(source)
+        assert len(sources) == 1
+        assert sources[0] in compose["volumes"]
+        return sources[0]
+
+    assert state_volume("openhop-repeater-a") != state_volume("openhop-repeater-b")
     # The companion identity key is generated per instance, never committed.
     assert (
         "__RADIO_COMPANION_IDENTITY_KEY__" in RADIO_CONFIG.read_text()
@@ -220,25 +226,45 @@ def test_probe_and_proof_scripts_exist():
     assert "NOT physical RF" in proof
 
 
-def test_packet_proof_refuses_when_a_medre_holds_companion_a():
-    """The proof's subscriber must be companion A's only client.
-
-    The openHop companion accepts ONE client at a time and evicts the
-    previous one, so a proof run while a MEDRE runtime holds companion A
-    would evict MEDRE, whose reconnect evicts the subscriber right back
-    and drives the measured deliveries to zero. The proof must refuse
-    before connecting, naming the container that holds the slot.
-    """
-    proof = (ROOT / "lab" / "openhop-radio" / "packet_proof.sh").read_text()
-    for holder in (
-        "medre-lab-medre-openhop-bridge",
-        "medre-lab-medre-openhop-fault",
-    ):
-        assert holder in proof, f"the proof never checks for {holder}"
-    assert "ONE client" in proof
-    # The refusal must happen in the precondition phase, before any
-    # probe container runs.
-    assert proof.index("Phase 0: preconditions") < proof.index("Phase 1: packet proof")
+@pytest.mark.parametrize(
+    "holder",
+    ("medre-lab-medre-openhop-bridge", "medre-lab-medre-openhop-fault"),
+)
+def test_packet_proof_refuses_when_a_medre_holds_companion_a(tmp_path, holder):
+    """Refuse to evict either MEDRE client before the proof launches its probe."""
+    docker = tmp_path / "docker"
+    calls = tmp_path / "calls"
+    docker.write_text("""#!/bin/sh
+printf '%s\n' "$*" >> "$MEDRE_TEST_DOCKER_CALLS"
+[ "$1" = inspect ] || exit 9
+case "$4" in
+    "$MEDRE_TEST_SLOT_HOLDER"|medre-lab-openhop-*) echo true ;;
+    *) echo false ;;
+esac
+""")
+    docker.chmod(0o700)
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "lab" / "openhop-radio" / "packet_proof.sh"),
+            "--evidence-dir",
+            str(tmp_path / "evidence"),
+        ],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": os.pathsep.join((str(tmp_path), os.environ["PATH"])),
+            "MEDRE_TEST_DOCKER_CALLS": str(calls),
+            "MEDRE_TEST_SLOT_HOLDER": holder,
+        },
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert f"slot is held by the running container {holder}" in result.stderr
+    assert all(call.startswith("inspect ") for call in calls.read_text().splitlines())
 
 
 def test_bring_up_exposes_the_radio_profile():
