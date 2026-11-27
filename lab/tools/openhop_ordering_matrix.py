@@ -8,6 +8,11 @@ oldest first across the in-memory and persisted queues - each run on the
 REAL rig: a real repeater process, its real SQLite store, a real MEDRE
 client:
 
+EXIT CONTRACT
+-------------
+Exit status 0 only when EVERY case this invocation ran is PASS; any FAIL
+or NOT RUN makes it 1 (--summary-only writes no case and exits 0).
+
   o1-older-persisted-newer-memory
       OLDER messages are persisted at the companion while NO client is
       attached.  NEWER messages then arrive while the store is locked, so
@@ -653,7 +658,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     case_summary.write_summary(matrix.dir, summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
-    return 0
+    return (
+        0
+        if matrix.results and all(row["status"] == "PASS" for row in matrix.results)
+        else 1
+    )
 
 
 if __name__ == "__main__":

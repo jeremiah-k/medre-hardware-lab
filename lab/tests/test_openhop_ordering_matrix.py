@@ -72,3 +72,52 @@ def test_a_missing_block_is_reported_without_a_false_cross_violation():
 
 def test_every_ordering_case_is_registered():
     assert set(ordering.CASES) == {"o1", "o2", "o3"}
+
+
+# ---------------------------------------------------------------------------
+# The exit contract: 0 only when every case this invocation ran is PASS;
+# a FAIL or a NOT RUN makes it 1; --summary-only writes no case and stays 0.
+# ---------------------------------------------------------------------------
+
+
+def test_main_exits_nonzero_when_a_case_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        ordering.case_summary, "bind_source_selection", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        ordering.OrderingMatrix,
+        "case_o1",
+        lambda self: self.write("o1-older-persisted-newer-memory", {"pass": False}),
+    )
+    assert ordering.main(["--evidence-dir", str(tmp_path / "ev"), "--case", "o1"]) == 1
+
+
+def test_main_exits_nonzero_when_a_case_was_not_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        ordering.case_summary, "bind_source_selection", lambda *args, **kwargs: None
+    )
+
+    def not_run(self):
+        self.write("o2-restart-backlog-then-live", {"pass": False})
+        self.results[-1]["status"] = "NOT RUN"
+
+    monkeypatch.setattr(ordering.OrderingMatrix, "case_o2", not_run)
+    assert ordering.main(["--evidence-dir", str(tmp_path / "ev2"), "--case", "o2"]) == 1
+
+
+def test_main_exits_zero_when_every_ran_case_passed(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        ordering.case_summary, "bind_source_selection", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        ordering.OrderingMatrix,
+        "case_o3",
+        lambda self: self.write("o3-store-locked-memory-served", {"pass": True}),
+    )
+    assert ordering.main(["--evidence-dir", str(tmp_path / "ev3"), "--case", "o3"]) == 0
+
+
+def test_summary_only_exits_zero_without_running_cases(tmp_path):
+    assert (
+        ordering.main(["--evidence-dir", str(tmp_path / "ev4"), "--summary-only"]) == 0
+    )

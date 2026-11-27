@@ -427,3 +427,50 @@ def test_start_splice_passes_the_trace_environment(tmp_path, monkeypatch):
     assert ["-e", "OPENHOP_FAULT_PROXY_TRACE=1"] in [
         run_cmd[index : index + 2] for index in range(len(run_cmd) - 1)
     ]
+
+
+# ---------------------------------------------------------------------------
+# The exit contract: 0 only when every case this invocation ran is PASS;
+# a FAIL or a NOT RUN makes it 1; --summary-only writes no case and stays 0.
+# ---------------------------------------------------------------------------
+
+
+def test_main_exits_nonzero_when_a_case_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        matrix.case_summary, "bind_source_selection", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        matrix.Matrix,
+        "case_c1",
+        lambda self: self.write("c1-backlog-120-medre-restart", {"pass": False}),
+    )
+    assert matrix.main(["--evidence-dir", str(tmp_path / "ev"), "--case", "c1"]) == 1
+
+
+def test_main_exits_nonzero_when_a_case_was_not_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        matrix.case_summary, "bind_source_selection", lambda *args, **kwargs: None
+    )
+
+    def not_run(self):
+        self.write("c2-backlog-with-live", {"pass": False})
+        self.results[-1]["status"] = "NOT RUN"
+
+    monkeypatch.setattr(matrix.Matrix, "case_c2", not_run)
+    assert matrix.main(["--evidence-dir", str(tmp_path / "ev2"), "--case", "c2"]) == 1
+
+
+def test_main_exits_zero_when_every_ran_case_passed(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        matrix.case_summary, "bind_source_selection", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        matrix.Matrix,
+        "case_c3",
+        lambda self: self.write("c3-backlog-fifo-order", {"pass": True}),
+    )
+    assert matrix.main(["--evidence-dir", str(tmp_path / "ev3"), "--case", "c3"]) == 0
+
+
+def test_summary_only_exits_zero_without_running_cases(tmp_path):
+    assert matrix.main(["--evidence-dir", str(tmp_path / "ev4"), "--summary-only"]) == 0

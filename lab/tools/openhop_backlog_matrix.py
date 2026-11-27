@@ -7,6 +7,11 @@ Six questions about the MEDRE <-> openHop companion link, each measured on
 the lab's virtual radio rig.  Every case reports PASS / FAIL / NOT RUN with
 the counts it measured and the evidence path it wrote.
 
+EXIT CONTRACT
+-------------
+Exit status 0 only when EVERY case this invocation ran is PASS; any FAIL
+or NOT RUN makes it 1 (--summary-only writes no case and exits 0).
+
   c1-backlog-120-medre-restart
       120 unique nonces are sent while MEDRE is STOPPED, so the companion
       persists them with no client attached.  MEDRE is then started and must
@@ -1786,7 +1791,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     case_summary.write_summary(matrix.dir, summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
-    return 0
+    return (
+        0
+        if matrix.results and all(row["status"] == "PASS" for row in matrix.results)
+        else 1
+    )
 
 
 if __name__ == "__main__":
