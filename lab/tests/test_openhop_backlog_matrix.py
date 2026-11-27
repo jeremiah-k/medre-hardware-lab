@@ -509,3 +509,24 @@ def test_shrinking_samples_still_fail_and_the_count_check_still_applies():
         for failure in failures
     )
     assert not any("delivered + preserved" in failure for failure in failures)
+
+
+# ---------------------------------------------------------------------------
+# c3's order check runs over the WHOLE recorded arrival order - the same
+# report c1 uses - not just the first two arrivals: "no newer message
+# ahead of an older one" means any inversion, anywhere.
+# ---------------------------------------------------------------------------
+
+
+def test_c3_order_check_fails_an_inversion_beyond_the_first_two():
+    """Indices [0, 1, 3, 2]: the first two are ordered, but 3 arriving
+    before 2 is a newer message ahead of an older one."""
+    markers = [f"p4c3-{index}-deadbeef" for index in [0, 1, 3, 2]]
+    report = matrix.ordering_report(markers)
+    assert report["out_of_order_arrivals"] == 1
+
+
+def test_c3_order_check_passes_a_fully_ordered_sequence():
+    markers = [f"p4c3-{index}-deadbeef" for index in range(10)]
+    report = matrix.ordering_report(markers)
+    assert report["out_of_order_arrivals"] == 0

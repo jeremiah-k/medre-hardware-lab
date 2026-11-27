@@ -1308,15 +1308,18 @@ class Matrix:
                 failures.append(
                     "the peer sent no accepted message while the store was locked"
                 )
-            # Use MEDRE's recorded arrival order across both queue tiers.
+            # Use MEDRE's recorded arrival order across both queue tiers,
+            # judged over the WHOLE sequence like c1's report: any newer
+            # index ahead of an older one is out-of-order delivery, not
+            # just an inversion among the first two.
             order = [nonce_index(marker) for marker in markers]
-            first_two = [index for index in order if index is not None][:2]
-            ordering_verdict = "PASS"
-            if len(first_two) == 2 and first_two[0] > first_two[1]:
-                ordering_verdict = "FAIL"
+            ordering_verdict = (
+                "PASS" if report["out_of_order_arrivals"] == 0 else "FAIL"
+            )
+            if report["out_of_order_arrivals"]:
                 failures.append(
-                    f"the newer message {first_two[0]} was delivered before the older "
-                    f"message {first_two[1]}"
+                    f"{report['out_of_order_arrivals']} arrival(s) were out of "
+                    f"order: indices {order}"
                 )
             self.write(
                 name,
@@ -1331,7 +1334,7 @@ class Matrix:
                     "distinct_at_medre": report["distinct"],
                     "duplicate_arrivals": report["duplicate_arrivals"],
                     "arrival_order_indices": order,
-                    "first_two_arrival_indices": first_two,
+                    "out_of_order_arrivals": report["out_of_order_arrivals"],
                     "ordering_verdict": ordering_verdict,
                     "ordering_note": "Indices show the recorded arrival order.",
                     "persisted_after_unlock": persisted_count,
