@@ -1185,7 +1185,9 @@ def log_line(epoch: float, text: str) -> str:
     )
 
 
-def make_window_fakes(monkeypatch, tmp_path, count, prefix, send_offsets):
+def make_window_fakes(
+    monkeypatch, tmp_path, count, prefix, send_offsets, success_offset=None
+):
     """Fake the rig behind run_window_case.
 
     ``send_offsets`` are seconds after the peer_send call when each send
@@ -1203,12 +1205,16 @@ def make_window_fakes(monkeypatch, tmp_path, count, prefix, send_offsets):
     def fake_peer_send(self, batch_count, batch_prefix):
         now = time_module.time()
         arm["epoch"] = now
-        window_end = now + max(send_offsets) + fault_matrix.SATURATION_WINDOW_HEADROOM_S
+        resolved_success = (
+            success_offset
+            if success_offset is not None
+            else max(send_offsets) + fault_matrix.SATURATION_WINDOW_HEADROOM_S + 2
+        )
         medre_log["text"] = (
             log_line(now + 1, "reconnect attempt 1 after RuntimeError")
             + log_line(now + 2, "receive pump failed; retiring connection")
             + log_line(
-                window_end + 2,
+                now + resolved_success,
                 "reconnected successfully to openhop-fault-proxy:5050",
             )
         )
@@ -1250,11 +1256,6 @@ def make_window_fakes(monkeypatch, tmp_path, count, prefix, send_offsets):
         fault_matrix, "timestamped_logs", lambda name: medre_log["text"]
     )
     monkeypatch.setattr(fault_matrix.time, "sleep", lambda seconds: None)
-    monkeypatch.setattr(
-        fault_matrix.FaultMatrix,
-        "capture_case_logs",
-        lambda self, name, captured=None: None,
-    )
     return fault_writes
 
 
@@ -1312,3 +1313,124 @@ def test_a_fixed_window_keeps_the_abort_and_records_the_send(tmp_path, monkeypat
     assert record["status"] == "NOT RUN"
     assert "did not finish inside the fault window" in record["reason"]
     assert record["probe"]["sends"], "the send result must survive the NOT RUN"
+
+
+# ---------------------------------------------------------------------------
+# Every case runner saves its container logs on the NORMAL completion
+# path, immediately before the record is written - not only in the
+# exception branches.
+# ---------------------------------------------------------------------------
+
+
+def test_window_runners_capture_logs_once_on_completion(tmp_path, monkeypatch):
+    captured: list[str] = []
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix,
+        "capture_case_logs",
+        lambda self, name, captured_logs=None: captured.append(name),
+    )
+    make_window_fakes(monkeypatch, tmp_path, 6, "p4qsr", [5, 15, 25])
+    matrix = fault_matrix.FaultMatrix(tmp_path / "evidence")
+    matrix.case_reply_stall()
+    assert captured == ["fault-reply-stall"]
+
+
+def test_the_reconnect_case_captures_logs_once_on_completion(tmp_path, monkeypatch):
+    captured: list[str] = []
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix,
+        "capture_case_logs",
+        lambda self, name, captured_logs=None: captured.append(name),
+    )
+    make_window_fakes(monkeypatch, tmp_path, 6, "p4qn", [5, 6, 7], success_offset=32)
+    matrix = fault_matrix.FaultMatrix(tmp_path / "evidence")
+    matrix.case_reconnect()
+    assert captured == ["fault-reconnect"]
+
+
+def test_the_idle_blackhole_case_captures_logs_once_on_completion(
+    tmp_path, monkeypatch
+):
+    captured: list[str] = []
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix,
+        "capture_case_logs",
+        lambda self, name, captured_logs=None: captured.append(name),
+    )
+    make_blackhole_fakes(monkeypatch, tmp_path)
+    matrix = fault_matrix.FaultMatrix(tmp_path / "evidence")
+    matrix.case_idle_blackhole()
+    assert captured == ["fault-idle-blackhole"]
+
+
+def test_the_drain_stall_case_captures_logs_once_on_completion(tmp_path, monkeypatch):
+    captured: list[str] = []
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix,
+        "capture_case_logs",
+        lambda self, name, captured_logs=None: captured.append(name),
+    )
+    make_window_fakes(monkeypatch, tmp_path, 60, "p4qsd", [5, 6, 7], success_offset=52)
+    matrix = fault_matrix.FaultMatrix(tmp_path / "evidence")
+    matrix.peer_pacing_s = None
+    # The drain case sends in a background thread; with the fake peer_send
+    # returning instantly the thread is done before the join.
+    matrix.case_reply_stall_during_drain()
+    assert captured == ["fault-reply-stall-drain"]
+
+
+def make_blackhole_fakes(monkeypatch, tmp_path, count=3, prefix="p4blackhole"):
+    """Fake the rig behind case_idle_blackhole: the retirement line lands
+    20 s after the arm, the reconnect attempt inside the hold and the
+    success after the clear."""
+    import time as time_module
+
+    nonces = [f"{prefix}-{index}-{index:06d}abc" for index in range(count)]
+    medre_log = {"text": ""}
+
+    def fake_peer_send(self, batch_count, batch_prefix):
+        now = time_module.time()
+        medre_log["text"] = (
+            log_line(now + 0.1, "reconnect attempt 1 after RuntimeError")
+            + log_line(
+                now + 20,
+                "receive pump failed (RuntimeError: idle-link liveness "
+                "probe unanswered); retiring connection",
+            )
+            + log_line(now + 40, "reconnected successfully")
+        )
+        return {
+            "pass": True,
+            "accepted_count": count,
+            "nonces": nonces,
+            "sends": [
+                {"finished_at": iso_stamp(now + 5 + index)} for index in range(count)
+            ],
+        }
+
+    def fake_state_in(container, mode, needle=""):
+        if container == fault_matrix.REPEATER_A:
+            return {"companion_messages": []}
+        return {"canonical_events": [{"text": nonce} for nonce in nonces]}
+
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix, "stop_bridge_medre", lambda self: None
+    )
+    monkeypatch.setattr(fault_matrix.FaultMatrix, "stop_fault_medre", lambda self: None)
+    monkeypatch.setattr(fault_matrix.FaultMatrix, "start_proxy", lambda self, f: None)
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix, "start_fault_medre", lambda self: True
+    )
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix,
+        "wait_for",
+        lambda self, predicate, timeout, interval=1.0: True,
+    )
+    monkeypatch.setattr(fault_matrix.FaultMatrix, "peer_send", fake_peer_send)
+    monkeypatch.setattr(fault_matrix, "write_fault", lambda path, fault: None)
+    monkeypatch.setattr(fault_matrix, "state_in", fake_state_in)
+    monkeypatch.setattr(fault_matrix, "container_logs", lambda name: medre_log["text"])
+    monkeypatch.setattr(
+        fault_matrix, "timestamped_logs", lambda name: medre_log["text"]
+    )
+    monkeypatch.setattr(fault_matrix.time, "sleep", lambda seconds: None)

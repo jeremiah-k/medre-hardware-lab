@@ -2043,6 +2043,7 @@ class FaultMatrix:
                 reconnect_successes_while_armed=successes_while_armed,
                 reconnect_seconds_after_restore=reconnect_seconds,
             )
+            self.capture_case_logs(name)
             self.write(
                 name,
                 {
@@ -2332,6 +2333,7 @@ class FaultMatrix:
             )
             if delivered_before_arm >= accepted:
                 failures.append("the backlog was exhausted when the stall was armed")
+            self.capture_case_logs(name)
             self.write(
                 name,
                 {
@@ -2536,6 +2538,7 @@ class FaultMatrix:
                 reconnected_after_window=success_after is not None,
                 reconnect_seconds_after_window=reconnect_seconds,
             )
+            self.capture_case_logs(name)
             self.write(
                 name,
                 {
@@ -2726,6 +2729,7 @@ class FaultMatrix:
                 delivered_distinct=distinct,
                 reconnect_seconds_after_restore=reconnect_seconds,
             )
+            self.capture_case_logs(name)
             self.write(
                 name,
                 {
