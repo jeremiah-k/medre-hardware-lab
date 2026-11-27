@@ -37,7 +37,14 @@ The matrix
                    link answers slowly but answers.
   repeated_waiting several MESSAGES_WAITING notifications arrive in a row
                    while a backlog is waiting.
-  reconnect        the link recovers and the client reconnects.
+  reconnect        TIME WINDOW: a bounded close window breaks the
+                   established link (the first request in flight is
+                   closed, re-armed per connection inside the window).
+                   The window then ends and the adapter must reconnect
+                   through its own reconnect path - its reconnect
+                   attempts and its reconnected-successfully line are the
+                   required evidence, not merely traffic resuming - and
+                   deliver the batch once on the new connection.
   reply_stall      TIME WINDOW: every server->client frame is swallowed
                    for the window's duration, on every connection inside
                    it (handshake replies and liveness-probe replies are
@@ -539,6 +546,72 @@ def window_stall_failures(
         failures.append(
             f"the post-window reconnect took "
             f"{reconnect_seconds_after_restore:.1f} s"
+        )
+    return failures
+
+
+def reconnect_case_failures(
+    *,
+    accepted: int,
+    delivered_distinct: int,
+    preserved_distinct: int,
+    duplicate_wakes: int,
+    reconnect_attempts_while_faulted: int,
+    reconnect_successes_while_faulted: int,
+    reconnected_after_window: bool,
+    reconnect_seconds_after_window: float | None,
+) -> list[str]:
+    """Judge the case named ``reconnect`` by its own claim.
+
+    The case breaks the established link with a bounded close window and
+    is named for what must follow: the adapter reconnecting.  Traffic
+    resuming is not the claim - the ADAPTER's reconnect evidence is, so
+    the verdict asserts:
+
+    * reconnect attempts on the backoff while the close window holds and
+      NONE of them succeeds (the handshake is closed like any other
+      request);
+    * a reconnect observed AFTER the window ends through the adapter's
+      own "reconnected successfully" line - a line that only follows a
+      disconnect-reconnect, never a clean first connect.  Without it the
+      case is not a pass, whatever arrived;
+    * the reconnect lands within the case's measured bound (the
+      reconnect backoff plus one gated probe budget, 45 s);
+    * every accepted message is delivered once on the new connection;
+    * zero duplicates anywhere in the run.
+    """
+    failures: list[str] = []
+    if duplicate_wakes:
+        failures.append(f"{duplicate_wakes} duplicate wake(s) reached MEDRE's store")
+    if accepted > 0 and delivered_distinct + preserved_distinct != accepted:
+        failures.append(
+            f"{delivered_distinct} delivered + {preserved_distinct} preserved at "
+            f"the companion != {accepted} accepted messages"
+        )
+    if preserved_distinct:
+        failures.append(
+            f"{preserved_distinct} message(s) were still queued at the "
+            "companion after the reconnect should have drained them"
+        )
+    if reconnect_attempts_while_faulted < 1:
+        failures.append("no reconnect attempt was recorded while the fault held")
+    if reconnect_successes_while_faulted:
+        failures.append(
+            f"{reconnect_successes_while_faulted} reconnect(s) succeeded while "
+            "the close window still held"
+        )
+    if not reconnected_after_window:
+        failures.append(
+            "no reconnect was observed after the fault ended: the adapter's "
+            "reconnect evidence is missing, and traffic resuming is not a "
+            "reconnect"
+        )
+    elif reconnect_seconds_after_window is None:
+        failures.append("the reconnect line carried no parsable timestamp")
+    elif reconnect_seconds_after_window > 45.0:
+        failures.append(
+            f"the post-fault reconnect took {reconnect_seconds_after_window:.1f} s, "
+            "later than the reconnect backoff and probe budget (45 s)"
         )
     return failures
 
@@ -1529,6 +1602,202 @@ class FaultMatrix:
             if fault_path is not None:
                 write_fault(fault_path, {})
 
+    def case_reconnect(self) -> None:
+        """Break the established link once, then require the reconnect.
+
+        Phase 1: the splice forwards with the case's mild delay and the
+        fault MEDRE connects; the run waits out an idle window so the
+        pump is parked.  Phase 2 (T0): a bounded close window is armed -
+        the first request in flight (the parked pump's next probe, within
+        one probe interval of the arm) has its connection closed, and the
+        close re-arms with every connection inside the window, so the
+        reconnect attempts' handshakes are closed too.  Phase 3 (T1): the
+        window ends, the adapter must reconnect through its own reconnect
+        path, and the batch is sent and must be delivered once on the new
+        connection.
+        """
+        name = "fault-reconnect"
+        prefix = "p4qn"
+        count = 6
+        window_seconds = 30.0
+        state_dir = LAB_ROOT / "lab/state/openhop-fault"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        fault_path = None
+        try:
+            self.stop_bridge_medre()
+            self.stop_fault_medre()
+            self.start_proxy({"delay_ms": 400})
+            if not self.wait_for(lambda: container_running(PROXY), 60, interval=1.0):
+                self.not_run(name, "the fault splice did not start")
+                return
+            if not self.start_fault_medre():
+                self.not_run(name, "the fault MEDRE container did not start")
+                return
+            # A clean first connect logs "started (mode=tcp, connected=True)";
+            # "reconnected successfully" only follows a disconnect-reconnect.
+            first_connect = re.compile(
+                r"started \(mode=tcp, connected=True\)|reconnected successfully",
+                re.IGNORECASE,
+            )
+            if not self.wait_for(
+                lambda: first_connect.search(container_logs(MEDRE_FAULT)) is not None,
+                120,
+                interval=2.0,
+            ):
+                self.not_run(name, "the fault MEDRE never completed its first connect")
+                return
+            # Let the drain rounds finish and the pump park before the
+            # window opens, so the first request it closes is the parked
+            # pump's own probe.
+            time.sleep(25)
+            armed_at = time.time()
+            window_end = armed_at + window_seconds
+            fault_path = state_dir / "fault.json"
+            write_fault(
+                fault_path,
+                {
+                    "delay_ms": 400,
+                    "close_on_request_until": window_end,
+                },
+            )
+            # The deadline is the authoritative window end: the splice
+            # re-reads the file per chunk and stops closing the moment it
+            # has passed.
+            if time.time() < window_end:
+                time.sleep(window_end - time.time())
+            write_fault(state_dir / "fault.json", {})
+
+            def reconnected_after_window() -> bool:
+                for line in timestamped_logs(MEDRE_FAULT).splitlines():
+                    stamp = line_time(line)
+                    if (
+                        stamp is not None
+                        and stamp >= window_end
+                        and "reconnected successfully" in line
+                    ):
+                        return True
+                return False
+
+            self.wait_for(reconnected_after_window, 120, interval=2.0)
+            time.sleep(5)
+            send = self.peer_send(count, prefix)
+            mine = sent_markers(send)
+            if send.get("pass") is not True or len(mine) != count:
+                self.not_run(name, "the peer did not accept the complete traffic batch")
+                return
+            accepted = int(send.get("accepted_count") or 0)
+            self.wait_for(
+                lambda: len(
+                    state_in(MEDRE_FAULT, "medre", prefix).get("canonical_events") or []
+                )
+                >= accepted,
+                180,
+                interval=3.0,
+            )
+            # The drain: a 6-message batch delivers in seconds on this
+            # rig, so a short margin is plenty.
+            time.sleep(12)
+            log = timestamped_logs(MEDRE_FAULT)
+            churn = count_reconnects(log)
+            events = (
+                state_in(MEDRE_FAULT, "medre", prefix).get("canonical_events") or []
+            )
+            arrivals = [
+                marker
+                for marker in (
+                    nonce_marker(json.dumps(event, sort_keys=True)) for event in events
+                )
+                if marker is not None and marker in mine
+            ]
+            distinct = len(set(arrivals))
+            duplicates = len(arrivals) - distinct
+            persisted = (
+                state_in(REPEATER_A, "repeater", prefix).get("companion_messages") or []
+            )
+            persisted_indices = [
+                marker
+                for marker in (nonce_marker(row.get("text") or "") for row in persisted)
+                if marker is not None and marker in mine
+            ]
+            preserved = len(set(persisted_indices))
+            attempts_while_faulted = 0
+            successes_while_faulted = 0
+            success_after = None
+            for line in log.splitlines():
+                stamp = line_time(line)
+                if stamp is None:
+                    continue
+                if RECONNECT.search(line) and armed_at <= stamp <= window_end:
+                    attempts_while_faulted += 1
+                if "reconnected successfully" in line and stamp >= armed_at:
+                    if stamp <= window_end:
+                        successes_while_faulted += 1
+                    elif success_after is None:
+                        success_after = stamp
+            reconnect_seconds = (
+                success_after - window_end if success_after is not None else None
+            )
+            failures = reconnect_case_failures(
+                accepted=accepted,
+                delivered_distinct=distinct,
+                preserved_distinct=preserved,
+                duplicate_wakes=duplicates,
+                reconnect_attempts_while_faulted=attempts_while_faulted,
+                reconnect_successes_while_faulted=successes_while_faulted,
+                reconnected_after_window=success_after is not None,
+                reconnect_seconds_after_window=reconnect_seconds,
+            )
+            self.write(
+                name,
+                {
+                    "case": name,
+                    "pass": not failures,
+                    "failures": failures,
+                    "fault": {
+                        "keys": ["delay_ms", "close_on_request_until"],
+                        "window_seconds": window_seconds,
+                        "persistent_across_connections": True,
+                        "note": (
+                            "30 s close window armed while the pump was "
+                            "parked: the first request in flight is closed, "
+                            "and every handshake inside the window with it"
+                        ),
+                    },
+                    "verdict_rule": (
+                        "reconnect verdict: reconnect attempts continue on "
+                        "backoff and none succeeds while the close window "
+                        "holds; after the window ends the adapter must show "
+                        "its own reconnect evidence - a reconnected-"
+                        "successfully line, which only follows a disconnect-"
+                        "reconnect - within the measured 45 s bound, and "
+                        "every accepted message is delivered once on the new "
+                        "connection; traffic resuming alone is not a pass"
+                    ),
+                    "requested_messages": count,
+                    "peer_accepted_sends": accepted,
+                    "armed_at": time.strftime(
+                        "%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(armed_at)
+                    ),
+                    "window_seconds": window_seconds,
+                    "reconnect_churn": churn,
+                    "reconnect_attempts_while_faulted": attempts_while_faulted,
+                    "reconnect_successes_while_faulted": successes_while_faulted,
+                    "reconnected_after_window": success_after is not None,
+                    "reconnect_seconds_after_window": reconnect_seconds,
+                    "arrivals_at_medre": len(arrivals),
+                    "distinct_at_medre": distinct,
+                    "duplicate_wakes": duplicates,
+                    "distinct_persisted": preserved,
+                    "consumed_wakes": max(0, accepted - distinct - preserved),
+                    "probe": send,
+                },
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self.not_run(name, f"{type(exc).__name__}: {exc}")
+        finally:
+            if fault_path is not None:
+                write_fault(fault_path, {})
+
     def case_idle_blackhole(self) -> None:
         """Blackhole an up, idle link in both directions, no close.
 
@@ -1719,15 +1988,18 @@ CASES = {
     "latency_over": ({"delay_ms": 4000}, 6, "p4qo", 25.0, False, "mild"),
     "selective_drop": ({"stall_after_n": 3}, 6, "p4qd", 25.0, False, "bounded"),
     "repeated_waiting": ({"delay_ms": 200}, 20, "p4qr", 25.0, True, "mild"),
-    "reconnect": ({"delay_ms": 400}, 6, "p4qn", 12.0, True, "mild"),
 }
 
-# The time-window cases run their own arm / queue / clear flow.
+# The time-window cases run their own arm / queue / clear flow; the
+# reconnect case is one of them: its claim (the link recovers and the
+# client reconnects) needs a fault that starts and ends, and its verdict
+# asserts the adapter's own reconnect evidence.
 WINDOW_RUNNERS = {
     "reply_stall": "case_reply_stall",
     "mid_fetch_close": "case_mid_fetch_close",
     "saturation": "case_saturation",
     "reply_stall_drain": "case_reply_stall_during_drain",
+    "reconnect": "case_reconnect",
 }
 
 

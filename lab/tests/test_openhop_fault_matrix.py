@@ -416,7 +416,7 @@ def test_the_drain_stall_case_is_registered_as_a_window_case():
 
 def test_the_registry_matches_each_verdict():
     """Every registered case names its judge; mild cases must recover."""
-    recovering = {"latency_under", "repeated_waiting", "reconnect"}
+    recovering = {"latency_under", "repeated_waiting"}
     for key, (*_, expect_recovery, verdict) in fault_matrix.CASES.items():
         if key in recovering:
             assert expect_recovery, f"{key} must expect recovery"
@@ -432,6 +432,75 @@ def test_the_registry_matches_each_verdict():
     for key in fault_matrix.WINDOW_RUNNERS:
         assert key not in fault_matrix.CASES
         assert hasattr(fault_matrix.FaultMatrix, fault_matrix.WINDOW_RUNNERS[key])
+
+
+def test_the_reconnect_case_is_registered_as_a_window_case():
+    """The case named reconnect runs the arm/clear flow its claim needs."""
+    assert fault_matrix.WINDOW_RUNNERS.get("reconnect") == "case_reconnect"
+    assert "reconnect" not in fault_matrix.CASES
+
+
+def judge_reconnect(**overrides):
+    """Run the reconnect verdict with a reconnected measured run."""
+    kwargs = {
+        "accepted": 6,
+        "delivered_distinct": 6,
+        "preserved_distinct": 0,
+        "duplicate_wakes": 0,
+        "reconnect_attempts_while_faulted": 3,
+        "reconnect_successes_while_faulted": 0,
+        "reconnected_after_window": True,
+        "reconnect_seconds_after_window": 4.0,
+    }
+    kwargs.update(overrides)
+    return fault_matrix.reconnect_case_failures(**kwargs)
+
+
+def test_a_clean_reconnect_run_passes():
+    assert judge_reconnect() == []
+
+
+def test_traffic_without_reconnect_evidence_fails_the_reconnect_case():
+    """Resuming traffic is not the claim; the adapter's evidence is."""
+    failures = judge_reconnect(reconnected_after_window=False)
+    assert any(
+        "no reconnect was observed after the fault ended" in failure
+        for failure in failures
+    )
+
+
+def test_no_reconnect_attempt_while_the_window_holds_fails():
+    failures = judge_reconnect(reconnect_attempts_while_faulted=0)
+    assert any("no reconnect attempt" in failure for failure in failures)
+
+
+def test_a_reconnect_success_inside_the_window_fails():
+    failures = judge_reconnect(reconnect_successes_while_faulted=1)
+    assert any("succeeded while" in failure for failure in failures)
+
+
+def test_a_missing_post_window_reconnect_fails_the_reconnect_case():
+    assert judge_reconnect(reconnected_after_window=False) != []
+
+
+def test_a_reconnect_later_than_the_bound_fails():
+    failures = judge_reconnect(reconnect_seconds_after_window=46.0)
+    assert any("later than the reconnect backoff" in failure for failure in failures)
+
+
+def test_undelivered_messages_fail_the_reconnect_case():
+    failures = judge_reconnect(delivered_distinct=5)
+    assert any("5 delivered + 0 preserved" in failure for failure in failures)
+
+
+def test_duplicates_fail_the_reconnect_case():
+    failures = judge_reconnect(duplicate_wakes=1)
+    assert any("duplicate" in failure for failure in failures)
+
+
+def test_something_still_preserved_fails_the_reconnect_case():
+    failures = judge_reconnect(delivered_distinct=5, preserved_distinct=1)
+    assert any("still queued at the companion" in failure for failure in failures)
 
 
 def test_surviving_link_must_resume_inside_one_probe_interval():
