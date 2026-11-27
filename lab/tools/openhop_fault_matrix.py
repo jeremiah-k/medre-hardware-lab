@@ -532,6 +532,43 @@ def wake_batch_arrived_whole(batch: dict, delivered_markers: set[str]) -> bool:
     return bool(markers) and markers <= delivered_markers
 
 
+def this_run_rows(rows: list[dict], mine: set[str]) -> tuple[int, int]:
+    """Split prefix-scoped companion rows into this run's and foreign.
+
+    Returns (this run's rows, rows of another run).  A store read scoped
+    only by the PREFIX also matches an earlier run's rows - the unique
+    tails are what tell the runs apart - so a wait condition counting
+    prefix rows can be satisfied by leftovers before this run's batch
+    has even arrived.
+    """
+    own = 0
+    foreign = 0
+    for row in rows:
+        marker = nonce_marker(row.get("text") or "")
+        if marker is not None and marker in mine:
+            own += 1
+        else:
+            foreign += 1
+    return own, foreign
+
+
+def delivered_this_run(events: list[dict], mine: set[str]) -> int:
+    """How many of THIS run's markers a MEDRE store snapshot holds.
+
+    MEDRE's store is cumulative, so a count over the prefix alone rises
+    with an earlier run's events; the unique tails scope the count to
+    this run.
+    """
+    markers = {
+        marker
+        for marker in (
+            nonce_marker(json.dumps(event, sort_keys=True)) for event in events
+        )
+        if marker is not None
+    }
+    return len(markers & mine)
+
+
 def inert_rows_by_identity(rows: list[dict]) -> list[dict]:
     """Group the rows that remain after the drain by companion identity.
 
@@ -1530,16 +1567,27 @@ class FaultMatrix:
                     )
                     return
                 accepted = int(send.get("accepted_count") or 0)
+                # The batch gate counts only THIS run's markers: a prefix
+                # read alone also matches an earlier run's leftovers, and
+                # the record carries how many of those it saw (zero after
+                # the clean-queue drain).
+                mine = sent_markers(send)
                 batch_queued = self.wait_for(
-                    lambda: len(
+                    lambda: this_run_rows(
                         state_in(REPEATER_A, "repeater", prefix).get(
                             "companion_messages"
                         )
-                        or []
-                    )
+                        or [],
+                        mine,
+                    )[0]
                     >= accepted,
                     180,
                     interval=2.0,
+                )
+                _, foreign_prefix_rows = this_run_rows(
+                    state_in(REPEATER_A, "repeater", prefix).get("companion_messages")
+                    or [],
+                    mine,
                 )
                 queue_snapshots.append(self.companion_queue_snapshot("batch_confirmed"))
                 if not batch_queued:
@@ -1685,6 +1733,7 @@ class FaultMatrix:
                     "probe_interval_s": PROBE_INTERVAL_S,
                     "observation_bound_s": 3 * PROBE_INTERVAL_S,
                     "batch_confirmed_queued": batch_queued,
+                    "foreign_prefix_rows_at_batch_gate": foreign_prefix_rows,
                     **proof_report,
                     "splice_frame_events": [
                         {
@@ -2454,9 +2503,13 @@ class FaultMatrix:
                 self.not_run(name, "the peer did not accept the complete traffic batch")
                 return
             accepted = int(send.get("accepted_count") or 0)
+            # MEDRE's store is cumulative: count only THIS run's markers,
+            # or an earlier run's events would satisfy the wait.
             self.wait_for(
-                lambda: len(
-                    state_in(MEDRE_FAULT, "medre", prefix).get("canonical_events") or []
+                lambda: delivered_this_run(
+                    state_in(MEDRE_FAULT, "medre", prefix).get("canonical_events")
+                    or [],
+                    mine,
                 )
                 >= accepted,
                 180,

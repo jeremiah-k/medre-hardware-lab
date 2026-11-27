@@ -1447,3 +1447,41 @@ def test_the_recorded_answered_probes_equal_the_per_connection_sum(
     per_connection = record["answered_probes_per_connection"]
     assert record["answered_probes"] == sum(per_connection.values())
     assert record["answered_probes"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The wait conditions count only THIS run's markers: a prefix read alone
+# is satisfied by an earlier run's leftovers, whose unique tails differ.
+# ---------------------------------------------------------------------------
+
+
+def test_prefix_rows_with_foreign_tails_do_not_satisfy_the_batch_gate():
+    mine = {f"p4qd-{index}-0000{index}0abc" for index in range(6)}
+    rows = [
+        {"text": f"lab message p4qd-{index}-777{index}7abc"}  # foreign tails
+        for index in range(6)
+    ]
+    own, foreign = fault_matrix.this_run_rows(rows, mine)
+    assert own == 0
+    assert foreign == 6
+    own_rows, _ = fault_matrix.this_run_rows([], mine)
+    assert own_rows == 0
+    own, foreign = fault_matrix.this_run_rows(
+        [{"text": f"lab message p4qd-{index}-0000{index}0abc"} for index in range(6)],
+        mine,
+    )
+    assert own == 6
+    assert foreign == 0
+
+
+def test_events_with_foreign_tails_do_not_satisfy_the_delivery_gate():
+    mine = {f"p4qn-{index}-0000{index}0abc" for index in range(6)}
+    events = [
+        {"text": f"lab message p4qn-{index}-999{index}9abc"}  # an earlier run
+        for index in range(6)
+    ]
+    assert fault_matrix.delivered_this_run(events, mine) == 0
+    this_run = [
+        {"text": f"lab message p4qn-{index}-0000{index}0abc"} for index in range(3)
+    ]
+    assert fault_matrix.delivered_this_run(this_run, mine) == 3
