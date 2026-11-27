@@ -24,7 +24,9 @@ WITH_MEDRE=0
 WITH_NORMAL=0
 WITH_OPENHOP=0
 WITH_OPENHOP_RADIO=0
+FLAGS=()
 for arg in "$@"; do
+	FLAGS+=("${arg}")
 	case "${arg}" in
 	--reset) DO_RESET=1 ;;
 	--skip-build) SKIP_BUILD=1 ;;
@@ -76,6 +78,30 @@ log() { printf '\n=== %s ===\n' "$*"; }
 die() {
 	echo "ERROR: $*" >&2
 	exit 1
+}
+
+# --- Last-bringup record ------------------------------------------------------
+# lab/state/last-bringup.json names the CHOICES of the last completed
+# bring-up (topology + flags) and the sources.lock.json content hash it
+# was provisioned from. medre-lab preset save consumes it; generated
+# state (tokens, rooms) is deliberately not part of the record. Written
+# on every exit path that leaves a rig UP (both openHop profiles exit
+# early, so each one records on its own).
+write_last_bringup_record() {
+	local topology="base"
+	if ((WITH_MEDRE)); then
+		topology="stress"
+	elif ((WITH_NORMAL)); then
+		topology="normal"
+	elif ((WITH_OPENHOP)); then
+		topology="openhop"
+	elif ((WITH_OPENHOP_RADIO)); then
+		topology="openhop-radio"
+	fi
+	log "Recording lab/state/last-bringup.json (topology ${topology})"
+	python3 lab/last_bringup.py --topology "${topology}" \
+		${FLAGS[@]+"${FLAGS[@]}"} >/dev/null ||
+		die "could not record lab/state/last-bringup.json"
 }
 
 # Topology modes are mutually exclusive: BOTH run a medre instance as
@@ -464,6 +490,7 @@ EOF
   Lifecycle check:   lab/openhop/lifecycle_check.sh
   Teardown:          lab/down.sh
 EOF
+	write_last_bringup_record
 	exit 0
 fi
 
@@ -631,6 +658,7 @@ EOF
   Packet proof: lab/openhop-radio/packet_proof.sh
   Teardown:     lab/down.sh
 EOF
+	write_last_bringup_record
 	exit 0
 fi
 
@@ -1457,6 +1485,8 @@ normal_profile:
   shared_rooms: #lab-bridge (ch0) / #lab-bridge-ch2 (ch2); mmrelay-a/b map ONLY these two rooms in this mode
 EOF
 fi
+
+write_last_bringup_record
 
 log "Interop lab is UP"
 cat <<'EOF'
