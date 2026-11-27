@@ -59,7 +59,8 @@ the configured duration across every connection inside the window):
   most one queued message per probe interval - deterministically: no
   chunk-count budget whose phasing could race the pump's fetch cycles.
   A dropped message frame or notification logs one JSON line with the
-  connection identity, and a forwarded probe reply logs one too, so
+  connection identity and the lab marker the frame carried (null when it
+  carries none), and a forwarded probe reply logs one too, so
   the verdict can prove per connection that the same link both
   answered a probe and lost a message frame.  The splice still never
   SPEAKS the protocol: it reads frame boundaries and one packet-type
@@ -95,6 +96,10 @@ which is a different fault.
 The faults are applied to ONE connection at a time; the counters are
 reported in the splice's own log (chunk counts and stall events, never
 payload bytes).
+
+The lab drivers always start the splice with OPENHOP_FAULT_PROXY_TRACE=1,
+so every forwarded frame is traced (packet type and lab marker) alongside
+the fault events; the cases' verdicts read those trace lines.
 
 WHY A PROXY
 -----------
@@ -322,8 +327,10 @@ FRAME_IN_START = 0x3C
 
 # When OPENHOP_FAULT_PROXY_TRACE=1, every server->client frame the splice
 # FORWARDS is logged with its inner packet type and, for message-carrying
-# frames, the lab marker found in the text.  Default off: normal runs are
-# unchanged.
+# frames, the lab marker found in the text.  Both lab drivers
+# (openhop_fault_matrix.start_proxy and openhop_backlog_matrix.start_splice)
+# start the splice with the variable set, so the trace is always on in rig
+# runs; the switch only exists so a manually started splice can run quiet.
 TRACE_ENV = "OPENHOP_FAULT_PROXY_TRACE"
 
 
@@ -442,6 +449,7 @@ class MessageFrameDropper:
                             "event": "message_frame_dropped",
                             "connection": connection,
                             "packet_type": frame[3],
+                            "marker": _marker_in(frame[3:]),
                         }
                     ),
                     flush=True,

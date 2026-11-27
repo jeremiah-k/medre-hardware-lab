@@ -408,3 +408,22 @@ def test_backlog_with_live_judge_fails_a_shortfall():
 def test_backlog_with_live_judge_fails_duplicates():
     failures = judge_c2(duplicate_arrivals=1)
     assert any("duplicate arrivals" in failure for failure in failures)
+
+
+def test_start_splice_passes_the_trace_environment(tmp_path, monkeypatch):
+    """Both splice starts run the proxy with the forwarded-frame trace
+    ALWAYS on: no case may start a splice without it."""
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, timeout=300):
+        commands.append(cmd)
+        return 0, "", ""
+
+    monkeypatch.setattr(matrix, "run", fake_run)
+    monkeypatch.setattr(matrix, "FAULT_STATE_DIR", tmp_path / "fault-state")
+    rig = matrix.Matrix(tmp_path / "evidence", "openhop-bridge")
+    rig.start_splice({"delay_ms": 900})
+    run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
+    assert ["-e", "OPENHOP_FAULT_PROXY_TRACE=1"] in [
+        run_cmd[index : index + 2] for index in range(len(run_cmd) - 1)
+    ]

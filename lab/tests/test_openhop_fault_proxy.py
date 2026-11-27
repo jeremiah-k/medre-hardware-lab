@@ -280,7 +280,9 @@ def test_dropper_holds_a_tail_that_could_still_grow(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# The OPENHOP_FAULT_PROXY_TRACE forwarded-frame trace (default off).
+# The OPENHOP_FAULT_PROXY_TRACE forwarded-frame trace.  Both lab drivers
+# start the splice with the variable set, so the trace is always on in
+# rig runs; these tests pin the mechanism and the record shapes.
 # ---------------------------------------------------------------------------
 
 
@@ -342,3 +344,53 @@ def test_trace_c2s_records_describe_command_frames():
 def test_trace_c2s_records_ignores_foreign_starts_and_partials():
     assert proxy.trace_c2s_records(1, b"\x3e\x01\x00") == []
     assert proxy.trace_c2s_records(1, b"<\x05\x00") == []  # length 5, only 2 bytes
+
+
+# ---------------------------------------------------------------------------
+# The drop event's marker: a swallowed message frame is a consumed
+# message, so its event names the lab marker the frame carried (null
+# when it carries none) with the same extraction the forwarded-frame
+# trace uses.
+# ---------------------------------------------------------------------------
+
+
+def dropper_events(capsys) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("{")
+    ]
+
+
+def test_a_dropped_message_frame_event_carries_its_marker(tmp_path, capsys):
+    dropper, _ = make_dropper(tmp_path)
+    dropped = dropper.feed(
+        frame(b"\x07" + b"p4qd-3-c0ffee12 and more text"), connection=2
+    )
+    assert dropped == b""
+    events = dropper_events(capsys)
+    dropped_events = [e for e in events if e["event"] == "message_frame_dropped"]
+    assert len(dropped_events) == 1
+    assert dropped_events[0]["marker"] == "p4qd-3-c0ffee12"
+    assert dropped_events[0]["connection"] == 2
+
+
+def test_a_dropped_frame_without_a_marker_logs_marker_null(tmp_path, capsys):
+    dropper, _ = make_dropper(tmp_path)
+    dropper.feed(frame(b"\x07" + b"\x00" * 8), connection=1)
+    dropper.feed(NO_MORE_MSGS_REPLY, connection=1)
+    dropper.feed(MESSAGES_WAITING_PUSH, connection=1)
+    dropped_events = [
+        e for e in dropper_events(capsys) if e["event"] == "message_frame_dropped"
+    ]
+    assert len(dropped_events) == 3
+    assert all(event["marker"] is None for event in dropped_events)
+
+
+def test_the_drop_event_marker_uses_the_same_extraction_as_the_trace():
+    """One extraction rule: the trace record and the drop event of the
+    same frame must name the same marker."""
+    payload = b"\x08" + b"tail p4qs-11-abc123def "
+    assert proxy._marker_in(payload) == "p4qs-11-abc123def"
+    records = proxy.trace_forward_records(1, frame(payload))
+    assert records[0]["marker"] == "p4qs-11-abc123def"

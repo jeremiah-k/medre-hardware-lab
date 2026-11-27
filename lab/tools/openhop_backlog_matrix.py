@@ -102,6 +102,11 @@ REPEATER_B = "medre-lab-openhop-repeater-b"
 MEDRE_BRIDGE = "medre-lab-medre-openhop-bridge"
 MEDRE_FAULT = "medre-lab-medre-openhop-fault"
 PROXY = "medre-lab-openhop-fault-proxy"
+
+# The splice's forwarded-frame trace: both drivers start the splice with
+# it ALWAYS on, so the case records carry every forwarded frame's packet
+# type and lab marker next to the fault events.
+PROXY_TRACE_ENV = "OPENHOP_FAULT_PROXY_TRACE"
 RELAY = "medre-lab-openhop-radio-relay"
 FAULT_STATE_DIR = LAB_ROOT / "lab/state/openhop-fault"
 
@@ -805,6 +810,8 @@ class Matrix:
                 "openhop-fault-proxy",
                 "--user",
                 f"{os.getuid()}:{os.getgid()}",
+                "-e",
+                f"{PROXY_TRACE_ENV}=1",
                 "-v",
                 f"{LAB_ROOT / 'lab/openhop-radio/openhop_fault_proxy.py'}:"
                 "/opt/openhop-fault/openhop_fault_proxy.py:ro",

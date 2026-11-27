@@ -731,3 +731,23 @@ def test_capture_case_logs_save_the_merged_streams_in_order(tmp_path, monkeypatc
         path = tmp_path / f"case-x.{suffix}.log"
         assert path.exists()
         assert path.read_text(encoding="utf-8") == saved[container]
+
+
+def test_start_proxy_passes_the_trace_environment(tmp_path, monkeypatch):
+    """Both splice starts run the proxy with the forwarded-frame trace
+    ALWAYS on: no case may start a splice without it."""
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, timeout=600):
+        commands.append(cmd)
+        return 0, "", ""
+
+    monkeypatch.setattr(fault_matrix, "run", fake_run)
+    monkeypatch.setattr(fault_matrix, "container_running", lambda name: True)
+    monkeypatch.setattr(fault_matrix.time, "sleep", lambda seconds: None)
+    matrix = fault_matrix.FaultMatrix(tmp_path)
+    matrix.start_proxy({"drop_message_frames": True})
+    run_cmd = next(cmd for cmd in commands if cmd[:2] == ["docker", "run"])
+    assert ["-e", "OPENHOP_FAULT_PROXY_TRACE=1"] in [
+        run_cmd[index : index + 2] for index in range(len(run_cmd) - 1)
+    ]
