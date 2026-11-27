@@ -46,6 +46,26 @@ the configured duration across every connection inside the window):
   together are the lab's silent-dead-link fault: to the two ends the link
   simply stops speaking while every socket stays open.
 
+  drop_message_frames (boolean, content-triggered): parse the companion
+  frames on the server -> client side (">" 0x3E + 2-byte LE length +
+  data, data[0] = packet type) and swallow exactly the message path -
+  the replies to the client's 0x0a sync command (CONTACT/CHANNEL_MSG_
+  RECV 0x07/0x08 and their V3 forms 0x10/0x11, plus the empty drain's
+  NO_MORE_MSGS 0x0a) AND the MESSAGES_WAITING 0x83 pushes that
+  announce them - forwarding the handshake reply and the
+  liveness-probe replies unchanged.  This constructs the documented
+  per-connection worst case - a link that ANSWERS THE PROBES AND
+  SWALLOWS THE MESSAGE FRAMES and therefore consumes at most one
+  queued message per answered probe - deterministically: no
+  chunk-count budget whose phasing could race the pump's fetch cycles,
+  and no delivered notification to arm extra drains.  Every dropped
+  frame logs one JSON line with the connection identity (so the
+  verdict can attribute the lost frames per connection).  The splice
+  still never SPEAKS the protocol: it reads frame boundaries and one
+  packet-type byte from the wire, forwards all payload bytes of every
+  forwarded frame unchanged, and logs counters and drop events, never
+  payload bytes.
+
   stall_server_to_client_on_request (boolean) opens the reply stall at
                                  the FIRST client->server chunk observed
                                  while it is armed: the request itself
@@ -110,6 +130,8 @@ STATS = {
     "close_window_closes": 0,
     "request_stall_opens": 0,
     "request_stall_chunks_withheld": 0,
+    "message_frames_dropped": 0,
+    "frame_resyncs": 0,
 }
 
 # The dynamic flags live in the fault file; re-read with this pace while a
@@ -283,6 +305,83 @@ class RequestStall:
         return self.open
 
 
+# MeshCore companion wire format (this splice's server -> client side):
+# ">" (0x3E) + 2-byte little-endian length + data, where data[0] is the
+# packet type: the reply to the client's 0x0a sync (GET_MSG) command
+# carries the drained message frames (CONTACT_MSG_RECV 0x07,
+# CHANNEL_MSG_RECV 0x08, and their V3 forms 0x10/0x11) or the empty
+# drain's NO_MORE_MSGS 0x0a; MESSAGES_WAITING pushes carry 0x83; the
+# handshake and the idle-link probe replies echo their own commands.
+FRAME_OUT_START = 0x3E
+MESSAGE_FRAME_TYPES = frozenset({0x07, 0x08, 0x0A, 0x10, 0x11})
+MESSAGES_WAITING_PUSH = 0x83
+DROP_MESSAGE_FRAMES_KEY = "drop_message_frames"
+
+
+class MessageFrameDropper:
+    """Drop the message frames and their notifications; forward the rest.
+
+    CONTENT-TRIGGERED, never timing-triggered: the frame boundary and
+    the packet type are read from the wire, so a link that answers the
+    handshake and the liveness probes and swallows exactly the message
+    path is constructed, with no chunk-count phasing to race the pump's
+    fetch cycles.  Dropped: the replies to the client's 0x0a sync
+    command (the drained message frames and the empty drain's
+    NO_MORE_MSGS) AND the MESSAGES_WAITING pushes that announce them.
+    Swallowing the notifications is what makes the link the documented
+    worst case the spec bounds at one consumed message per answered
+    probe: the spec arms one extra drain per delivered notification, so
+    a link that delivers notifications would consume one message per
+    notification instead - a different (and unspec-bounded) shape.  A
+    dropped message frame or notification logs one JSON line with the
+    connection identity, so the verdict can attribute the lost frames
+    to the connection they belonged to.  Per connection: one instance,
+    one buffer; partial frames are held until complete and a byte that
+    cannot start a frame is counted as a resync and skipped.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.buf = b""
+
+    def active(self) -> bool:
+        return bool(read_dynamic_fault(self.path).get(DROP_MESSAGE_FRAMES_KEY))
+
+    def feed(self, data: bytes, connection: int) -> bytes:
+        """Parse frames out of ``data`` and return what must be forwarded."""
+        self.buf += data
+        out = bytearray()
+        while self.buf:
+            if len(self.buf) < 3:
+                break
+            if self.buf[0] != FRAME_OUT_START:
+                STATS["frame_resyncs"] += 1
+                self.buf = self.buf[1:]
+                continue
+            length = int.from_bytes(self.buf[1:3], "little")
+            if len(self.buf) < 3 + length:
+                break
+            frame = self.buf[: 3 + length]
+            self.buf = self.buf[3 + length :]
+            if len(frame) > 3 and (
+                frame[3] in MESSAGE_FRAME_TYPES or frame[3] == MESSAGES_WAITING_PUSH
+            ):
+                STATS["message_frames_dropped"] += 1
+                print(
+                    json.dumps(
+                        {
+                            "event": "message_frame_dropped",
+                            "connection": connection,
+                            "packet_type": frame[3],
+                        }
+                    ),
+                    flush=True,
+                )
+                continue
+            out += frame
+        return bytes(out)
+
+
 async def pipe(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -340,6 +439,7 @@ async def handle(
     STATS["connections"] += 1
     connection = STATS["connections"]
     blackhole = Blackhole(fault_file)
+    dropper = MessageFrameDropper(fault_file)
     try:
         server_reader, server_writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=10
@@ -404,6 +504,15 @@ async def handle(
                     "stalled_server_to_client",
                 ):
                     continue
+                if dropper.active():
+                    # The content-triggered message-frame drop: parse the
+                    # companion frames in this chunk and forward everything
+                    # except GET_MSG replies, so the handshake and the
+                    # liveness-probe replies pass and the message frames are
+                    # swallowed on this same connection.
+                    data = dropper.feed(data, connection)
+                    if not data:
+                        continue
                 if delay_ms:
                     STATS["delayed_ms_total"] += delay_ms
                     await asyncio.sleep(delay_ms / 1000)

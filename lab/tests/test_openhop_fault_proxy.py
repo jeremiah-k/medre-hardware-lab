@@ -34,7 +34,12 @@ spec.loader.exec_module(proxy)
 @pytest.fixture(autouse=True)
 def reset_splice_stats():
     """STATS is module-level state; each test starts from zero."""
-    for key in ("request_stall_opens", "request_stall_chunks_withheld"):
+    for key in (
+        "request_stall_opens",
+        "request_stall_chunks_withheld",
+        "message_frames_dropped",
+        "frame_resyncs",
+    ):
         proxy.STATS[key] = 0
     yield
 
@@ -135,3 +140,123 @@ def test_blackhole_discards_chunks_until_cleared(tmp_path):
     write_fault(path, {})
     assert not fault.drops(flag, 1, counter)
     assert proxy.STATS[counter] == before + 1
+
+
+# ---------------------------------------------------------------------------
+# The content-triggered message-frame drop (drop_message_frames).
+#
+# Frame format (server -> client): ">" (0x3E) + 2-byte LE length + data,
+# data[0] = packet type (the pinned PacketType enum).  The message frames
+# are the replies to the client's 0x0a sync command - CONTACT_MSG_RECV
+# 0x07, CHANNEL_MSG_RECV 0x08, their V3 forms 0x10/0x11, and the empty
+# drain's NO_MORE_MSGS 0x0a; the handshake reply is SELF_INFO 0x05, the
+# idle-link probe reply is DEVICE_INFO 0x0d, and MESSAGES_WAITING is the
+# 0x83 push.
+# ---------------------------------------------------------------------------
+
+
+def frame(data: bytes) -> bytes:
+    """Build one companion frame as the splice's server side emits it."""
+    return b">" + len(data).to_bytes(2, "little") + data
+
+
+HANDSHAKE_REPLY = frame(b"\x05" + b"\x00" * 8)
+PROBE_REPLY = frame(b"\x0d" + b"\x00" * 8)
+MESSAGE_FRAMES = (
+    frame(b"\x07" + b"\x00" * 8)
+    + frame(b"\x08" + b"\x00" * 8)
+    + frame(b"\x10" + b"\x00" * 8)
+    + frame(b"\x11" + b"\x00" * 8)
+)
+NO_MORE_MSGS_REPLY = frame(b"\x0a" + b"")
+MESSAGES_WAITING_PUSH = frame(b"\x83" + b"\x00" * 4)
+
+
+def make_dropper(tmp_path: Path, fault: dict | None = None):
+    path = tmp_path / "fault.json"
+    write_fault(
+        path,
+        fault if fault is not None else {proxy.DROP_MESSAGE_FRAMES_KEY: True},
+    )
+    return proxy.MessageFrameDropper(str(path)), path
+
+
+def test_dropper_is_inactive_without_the_fault_key(tmp_path):
+    dropper, path = make_dropper(tmp_path, {})
+    assert dropper.active() is False
+    write_fault(path, {proxy.DROP_MESSAGE_FRAMES_KEY: True})
+    assert dropper.active() is True
+
+
+def test_dropper_forwards_probes_and_handshake_drops_only_message_frames(
+    tmp_path, capsys
+):
+    dropper, _ = make_dropper(tmp_path)
+    out = dropper.feed(
+        HANDSHAKE_REPLY
+        + MESSAGE_FRAMES
+        + NO_MORE_MSGS_REPLY
+        + PROBE_REPLY
+        + MESSAGES_WAITING_PUSH,
+        connection=1,
+    )
+    assert HANDSHAKE_REPLY in out
+    assert PROBE_REPLY in out
+    assert MESSAGES_WAITING_PUSH not in out
+    for message_frame in (
+        frame(b"\x07" + b"\x00" * 8),
+        frame(b"\x08" + b"\x00" * 8),
+        frame(b"\x10" + b"\x00" * 8),
+        frame(b"\x11" + b"\x00" * 8),
+        NO_MORE_MSGS_REPLY,
+    ):
+        assert message_frame not in out
+    assert proxy.STATS["message_frames_dropped"] == 6
+    assert proxy.STATS["frame_resyncs"] == 0
+    # Every dropped frame logs its connection identity for the verdict's
+    # per-connection attribution.
+    events = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("{")
+    ]
+    assert [e["event"] for e in events].count("message_frame_dropped") == 6
+    assert {e["connection"] for e in events} == {1}
+
+
+def test_dropper_buffers_partial_frames_until_complete(tmp_path):
+    dropper, _ = make_dropper(tmp_path)
+    whole = MESSAGE_FRAMES[: 3 + 9] + PROBE_REPLY  # one V1 message frame + probe
+    first = dropper.feed(whole[:5], connection=1)
+    assert first == b""
+    second = dropper.feed(whole[5:], connection=1)
+    assert second == PROBE_REPLY
+    assert proxy.STATS["message_frames_dropped"] == 1
+
+
+def test_dropper_resyncs_past_bytes_that_cannot_start_a_frame(tmp_path):
+    dropper, _ = make_dropper(tmp_path)
+    before = proxy.STATS["frame_resyncs"]
+    out = dropper.feed(b"\x00\xff" + PROBE_REPLY, connection=1)
+    assert out == PROBE_REPLY
+    assert proxy.STATS["frame_resyncs"] == before + 2
+
+
+def test_dropper_keeps_dropping_across_chunks(tmp_path):
+    dropper, _ = make_dropper(tmp_path)
+    assert dropper.feed(MESSAGE_FRAMES[:12] + PROBE_REPLY, connection=1) == (
+        PROBE_REPLY
+    )
+    assert dropper.feed(MESSAGE_FRAMES[:12] + HANDSHAKE_REPLY, connection=1) == (
+        HANDSHAKE_REPLY
+    )
+    assert proxy.STATS["message_frames_dropped"] == 2
+
+
+def test_dropper_holds_a_tail_that_could_still_grow(tmp_path):
+    """A trailing 0x3E with no length yet must not be forwarded early."""
+    dropper, _ = make_dropper(tmp_path)
+    assert dropper.feed(PROBE_REPLY + b">", connection=1) == PROBE_REPLY
+    out = dropper.feed((3).to_bytes(2, "little") + b"\x07abc", connection=1)
+    assert out == b""
+    assert proxy.STATS["message_frames_dropped"] == 1

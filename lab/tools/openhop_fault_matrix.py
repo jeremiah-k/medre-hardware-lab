@@ -56,10 +56,14 @@ The matrix
                    handshake), and the close re-arms with every connection
                    for the rest of the window.  The window then ends and
                    the queued messages must be delivered.
-  saturation       a deep backlog waits behind a reply-stall window: the
-                   designed probe retirements of a link that answers
-                   nothing are expected, nothing may be consumed, and the
-                   whole backlog must be delivered once the window ends.
+  saturation       a deep backlog waits behind a reply-stall window
+                   sized to the batch (batch x measured peer pacing x
+                   1.5 + 10 s, fallback pacing 2 s/send), so the whole
+                   batch is accepted inside the window by construction:
+                   the designed probe retirements of a link that
+                   answers nothing are expected, nothing may be
+                   consumed, and the whole backlog must be delivered
+                   once the window ends.
   reply_stall_drain a TIME WINDOW armed while a backlog drain is in
                    flight: the frame the drain had on the wire when the
                    window opened is swallowed.  At most that one message
@@ -72,14 +76,22 @@ The matrix
                    duplicates.
   selective_drop   the PER-CONNECTION worst case the spec bounds: a link
                    that answers the probes and swallows the message
-                   frames.  Its verdict asserts the documented bound per
-                   connection - at most one consumed message per answered
-                   liveness probe on that connection beyond the unproven
-                   first fetch, every other accepted message delivered or
-                   preserved, zero duplicates - and PROVES the shape: the
-                   splice's own connection identity must attribute an
-                   answered probe and a lost frame to the SAME connection,
-                   not merely report aggregate counts.
+                   frames - CONSTRUCTED, not phased: the splice parses
+                   the companion frames and swallows exactly the
+                   message frames (the replies to the sync command and
+                   the empty drain; content-triggered,
+                   drop_message_frames), forwarding the handshake and
+                   the probe replies, so the answered probes and the
+                   swallowed message frames belong to the same
+                   connection every time.  Its
+                   verdict asserts the documented bound per connection -
+                   at most one consumed message per answered liveness
+                   probe on that connection beyond the unproven first
+                   fetch, every other accepted message delivered or
+                   preserved, zero duplicates - and PROVES the shape:
+                   the splice's own connection identity must attribute
+                   an answered probe and a lost frame to the SAME
+                   connection, not merely report aggregate counts.
   idle_blackhole   BOTH directions of an up, idle link are blackholed
                    (no close, armed by writing the splice's fault file):
                    the idle-link probe must retire the connection within
@@ -218,17 +230,22 @@ def nonce_index(text: str) -> int | None:
     return int(match.group("index")) if match else None
 
 
-def splice_stall_events(proxy_log: str) -> list[tuple[float, int]]:
-    """Return (timestamp, connection) for every stall the splice logged.
+def splice_stall_events(proxy_log: str) -> list[tuple[float, str, int]]:
+    """Return (timestamp, connection) for every frame boundary the splice logged.
 
-    The splice logs one JSON line per per-connection budget exhaustion
-    (``{"event": "stalled", "connection": N}``), and ``docker logs -t``
-    prefixes each line with the host's UTC time.  These events are the
-    splice's own connection identity: the boundaries that attribute
-    MEDRE's answered probes and the lost frames to the connection they
-    belonged to, instead of counting aggregates over the whole run.
+    The splice logs one JSON line per per-connection point where it
+    started swallowing server->client frames - the budget exhaustion
+    (``{"event": "stalled", "connection": N}``) and the content-triggered
+    message-frame drops (``{"event": "message_frame_dropped",
+    "connection": N}``) - and ``docker logs -t`` prefixes each line with
+    the host's UTC time.  These events are the splice's own connection
+    identity: the boundaries that attribute MEDRE's answered probes and
+    the lost frames to the connection they belonged to, instead of
+    counting aggregates over the whole run.  Returns (timestamp, event,
+    connection) triples.
     """
-    events: list[tuple[float, int]] = []
+    boundary_events = {"stalled", "message_frame_dropped"}
+    events: list[tuple[float, str, int]] = []
     for line in proxy_log.splitlines():
         start = line.find("{")
         if start < 0:
@@ -240,10 +257,10 @@ def splice_stall_events(proxy_log: str) -> list[tuple[float, int]]:
             payload = json.loads(line[start:])
         except ValueError:
             continue
-        if payload.get("event") == "stalled" and isinstance(
+        if payload.get("event") in boundary_events and isinstance(
             payload.get("connection"), int
         ):
-            events.append((stamp, payload["connection"]))
+            events.append((stamp, payload["event"], payload["connection"]))
     return sorted(events)
 
 
@@ -257,7 +274,7 @@ def connection_of(stamp: float, stalls: list[tuple[float, int]]) -> int | None:
     after it.  A stamp after the last stall belongs to a connection the
     splice never recorded stalling and cannot be attributed.
     """
-    for stall_stamp, connection in stalls:
+    for stall_stamp, _event, connection in stalls:
         if stamp <= stall_stamp:
             return connection
     return None
@@ -550,6 +567,38 @@ def window_stall_failures(
     return failures
 
 
+# The saturation case's batch and the window it is sized against.  The
+# precondition the window verdict asserts - the whole batch accepted
+# inside the window - holds BY CONSTRUCTION here: the window is the
+# batch's duration at the peer's measured send pacing, times a 1.5
+# safety factor, plus 10 s of headroom.  The fallback pacing covers a
+# standalone saturation run with no preceding measurement on this rig.
+SATURATION_BATCH = 60
+SATURATION_PACING_FALLBACK_S = 2.0
+SATURATION_PACING_FACTOR = 1.5
+SATURATION_WINDOW_HEADROOM_S = 10.0
+
+
+def saturation_window_for(batch: int, measured_pacing_s: float | None) -> float:
+    """Derive the saturation window from the peer's measured send pacing.
+
+    The claim is unchanged: a deep backlog builds behind the stalled
+    link, the designed probe retirements happen, nothing is consumed
+    while the window holds, and the whole backlog is delivered exactly
+    once afterwards.  Only the window's length is derived: the batch's
+    duration at the measured (or fallback 2 s/send) pacing, times a 1.5
+    safety factor, plus 10 s of headroom.
+    """
+    pacing = (
+        measured_pacing_s
+        if measured_pacing_s and measured_pacing_s > 0
+        else SATURATION_PACING_FALLBACK_S
+    )
+    return round(
+        batch * pacing * SATURATION_PACING_FACTOR + SATURATION_WINDOW_HEADROOM_S, 1
+    )
+
+
 def reconnect_case_failures(
     *,
     accepted: int,
@@ -772,6 +821,11 @@ class FaultMatrix:
         self.dir = evidence_dir
         self.dir.mkdir(parents=True, exist_ok=True)
         self.results: list[dict] = []
+        # The peer's measured per-send pacing (seconds between consecutive
+        # accepted send completions), refreshed by every peer_send call; the
+        # saturation window is derived from it.  The fallback pacing covers
+        # a standalone saturation run with no preceding measurement.
+        self.peer_pacing_s: float | None = None
 
     def write(self, name: str, payload: dict) -> None:
         payload.setdefault("label", "protocol-simulated")
@@ -938,7 +992,25 @@ class FaultMatrix:
                 "exit_status": rc,
             }
         data["exit_status"] = rc
+        self.record_peer_pacing(data)
         return data
+
+    def record_peer_pacing(self, probe_result: dict) -> None:
+        """Refresh the peer's measured per-send pacing from a batch.
+
+        The pacing is the mean gap between consecutive accepted sends'
+        completion stamps - the peer's own send round trip on companion B,
+        which the faults do not touch.
+        """
+        stamps = sorted(
+            stamp
+            for entry in probe_result.get("sends") or []
+            if entry.get("accepted") is True
+            and (stamp := wall_timestamp(entry.get("finished_at"))) is not None
+        )
+        gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+        if gaps:
+            self.peer_pacing_s = sum(gaps) / len(gaps)
 
     # -- cases -----------------------------------------------------------
     def run_case(
@@ -1006,10 +1078,25 @@ class FaultMatrix:
             preserved = len(set(persisted_indices))
             connection_evidence: dict = {}
             if verdict == "bounded":
-                # Per-connection attribution: the splice's own stall events
-                # carry the connection identity, so the answered probes and
-                # the lost frames are attributed to the connection they
-                # belonged to instead of being counted as run totals.
+                # The construction drops a message frame at the first
+                # probe-armed fetch after the batch is queued (the pump
+                # pops the oldest queued message and the splice swallows
+                # its reply).  The accounting window OBSERVES the splice's
+                # own drop event - content-triggered, never a fixed sleep -
+                # plus one probe interval of margin, so the reads span the
+                # deterministic drop; a run whose queue never yields a drop
+                # fails closed below (no proof, no pass).
+                drops_observed = self.wait_for(
+                    lambda: "message_frame_dropped" in container_logs(PROXY),
+                    120,
+                    interval=2.0,
+                )
+                time.sleep(16)
+                # Per-connection attribution: the splice's own frame-boundary
+                # events carry the connection identity, so the answered
+                # probes and the lost frames are attributed to the
+                # connection they belonged to instead of being counted as
+                # run totals.
                 stalls = splice_stall_events(timestamped_logs(PROXY))
                 stamped_medre_log = timestamped_logs(MEDRE_FAULT)
                 probe_stamps = [
@@ -1056,15 +1143,17 @@ class FaultMatrix:
                     same_connection_proven=same_connection_proven,
                 )
                 connection_evidence = {
-                    "splice_stall_events": [
+                    "splice_frame_events": [
                         {
-                            "connection": connection,
-                            "stalled_at": time.strftime(
-                                "%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(stall_stamp)
+                            "event": event,
+                            "connection": c,
+                            "at": time.strftime(
+                                "%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(s)
                             ),
                         }
-                        for stall_stamp, connection in stalls
+                        for s, event, c in stalls
                     ],
+                    "drop_event_observed": drops_observed,
                     "answered_probes_per_connection": answered_per_connection,
                     "consumed_per_connection": consumed_per_connection,
                     "unattributed_consumed": unattributed_consumed,
@@ -1075,11 +1164,17 @@ class FaultMatrix:
                     "that answers the probes and swallows the message frames "
                     "consumes at most one queued message per answered liveness "
                     "probe beyond the unproven first fetch, PER CONNECTION - "
-                    "the splice's own connection identity attributes each "
-                    "answered probe and each lost frame to the connection it "
-                    "belonged to, and the proof requires one connection with "
-                    "both; every other accepted message is delivered or still "
-                    "preserved at the companion; zero duplicates"
+                    "the injection is content-triggered (the splice parses the "
+                    "companion frames and swallows exactly the message frames - "
+                    "the replies to the sync command and the empty drain - "
+                    "forwarding the handshake and the probe replies), "
+                    "so the answered probes and the swallowed frames are the "
+                    "same connection's by construction; the splice's own "
+                    "connection identity attributes each answered probe and "
+                    "each lost frame to the connection it belonged to, and "
+                    "the proof requires one connection with both; every other "
+                    "accepted message is delivered or still preserved at the "
+                    "companion; zero duplicates"
                 )
             else:
                 failures = fault_case_failures(
@@ -1356,15 +1451,21 @@ class FaultMatrix:
         )
 
     def case_saturation(self) -> None:
-        """A deep backlog waits behind a reply-stall window; the whole
-        backlog must come across once the window ends."""
+        """A deep backlog waits behind a reply-stall window sized to the
+        peer's measured send pacing; the whole backlog must come across
+        once the window ends."""
+        window = saturation_window_for(SATURATION_BATCH, self.peer_pacing_s)
         self.run_window_case(
             "fault-saturation",
             {"stall_server_to_client_until": True},
-            60.0,
-            60,
+            window,
+            SATURATION_BATCH,
             "p4qs",
-            "60 s reply-stall window under a 60-message backlog",
+            f"reply-stall window sized to the batch ({SATURATION_BATCH} "
+            f"messages x peer pacing x 1.5 + 10 s = {window:.0f} s; pacing "
+            f"fallback {SATURATION_PACING_FALLBACK_S:.1f} s/send, measured "
+            f"{self.peer_pacing_s if self.peer_pacing_s else 'n/a'}), so the "
+            "whole batch is accepted inside the window by construction",
         )
 
     def case_reply_stall_during_drain(self) -> None:
@@ -1986,7 +2087,14 @@ class FaultMatrix:
 CASES = {
     "latency_under": ({"delay_ms": 900}, 6, "p4qu", 12.0, True, "mild"),
     "latency_over": ({"delay_ms": 4000}, 6, "p4qo", 25.0, False, "mild"),
-    "selective_drop": ({"stall_after_n": 3}, 6, "p4qd", 25.0, False, "bounded"),
+    "selective_drop": (
+        {"drop_message_frames": True},
+        6,
+        "p4qd",
+        25.0,
+        False,
+        "bounded",
+    ),
     "repeated_waiting": ({"delay_ms": 200}, 20, "p4qr", 25.0, True, "mild"),
 }
 

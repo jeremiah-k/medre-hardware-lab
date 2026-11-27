@@ -245,7 +245,24 @@ def test_splice_stall_events_carry_the_connection_identity():
     )
     events = fault_matrix.splice_stall_events(log)
     assert len(events) == 2
-    assert events[0][1] == 1 and events[1][1] == 2
+    assert events[0][2] == 1 and events[1][2] == 2
+    assert events[0][0] < events[1][0]
+
+
+def test_splice_events_include_the_content_triggered_frame_drops():
+    """The drop_message_frames rule logs the same connection identity."""
+    log = "\n".join(
+        [
+            '2026-11-26T18:00:05.000000000Z {"event": "message_frame_dropped", '
+            '"connection": 1, "packet_type": 10}',
+            '2026-11-26T18:00:19.000000000Z {"event": "message_frame_dropped", '
+            '"connection": 1, "packet_type": 7}',
+        ]
+    )
+    events = fault_matrix.splice_stall_events(log)
+    assert len(events) == 2
+    assert all(connection == 1 for _, _, connection in events)
+    assert all(event == "message_frame_dropped" for _, event, _ in events)
     assert events[0][0] < events[1][0]
 
 
@@ -513,3 +530,45 @@ def test_surviving_link_must_resume_inside_one_probe_interval():
 def test_reconnect_without_delivery_does_not_prove_drain_resumption():
     failures = judge_drain_stall(resume_seconds_after_window=None)
     assert any("no delivery was observed" in failure for failure in failures)
+
+
+# ---------------------------------------------------------------------------
+# The saturation window derived from the peer's measured send pacing: the
+# "batch must be accepted inside the window" precondition holds by
+# construction instead of racing a fixed window.
+# ---------------------------------------------------------------------------
+
+
+def test_saturation_window_scales_with_the_measured_pacing():
+    """Measured pacing 1.2 s/send: 60 x 1.2 x 1.5 + 10 = 118 s."""
+    window = fault_matrix.saturation_window_for(fault_matrix.SATURATION_BATCH, 1.2)
+    assert window == fault_matrix.SATURATION_BATCH * 1.2 * 1.5 + 10
+
+
+def test_saturation_window_falls_back_to_two_seconds_per_send():
+    """A standalone saturation run has no measurement: 60 x 2 x 1.5 + 10."""
+    assert (
+        fault_matrix.saturation_window_for(fault_matrix.SATURATION_BATCH, None)
+        == fault_matrix.SATURATION_BATCH * 2.0 * 1.5 + 10
+    )
+    assert (
+        fault_matrix.saturation_window_for(fault_matrix.SATURATION_BATCH, 0)
+        == fault_matrix.SATURATION_BATCH * 2.0 * 1.5 + 10
+    )
+
+
+def test_saturation_window_tolerates_one_and_a_half_times_the_pacing():
+    """The window holds the batch even if pacing runs 1.5x the measured
+    value, with the headroom still left over."""
+    measured = 1.3
+    window = fault_matrix.saturation_window_for(fault_matrix.SATURATION_BATCH, measured)
+    assert window >= fault_matrix.SATURATION_BATCH * measured * 1.5 + 10
+
+
+def test_the_recorded_wave19_overrun_is_impossible_by_construction():
+    """The wave19 run's batch lasted ~96 s inside a 60 s window; a window
+    built from a 1.6 s/s measurement (worst recorded) leaves ~50 s of
+    slack at the same pacing."""
+    window = fault_matrix.saturation_window_for(fault_matrix.SATURATION_BATCH, 1.6)
+    assert window >= 60 * 1.6 + 10
+    assert window - 60 * 1.6 >= fault_matrix.SATURATION_WINDOW_HEADROOM_S
