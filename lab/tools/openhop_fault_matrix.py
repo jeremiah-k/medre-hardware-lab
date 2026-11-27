@@ -148,6 +148,11 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 import openhop_case_summary as case_summary  # noqa: E402
 from openhop_fault_settings import write_fault  # noqa: E402
+from openhop_observe import (  # noqa: E402
+    empty_reply_after,
+    reconnect_after,
+    scoped_log_line,
+)
 
 LAB_ROOT = Path(__file__).resolve().parents[2]
 TOOLS = LAB_ROOT / "lab" / "tools"
@@ -171,6 +176,13 @@ PROXY_TRACE_ENV = "OPENHOP_FAULT_PROXY_TRACE"
 # the client's sync command (a swallowed one is a consumed message); the
 # probe reply type is DEVICE_INFO, which the link forwards.
 PROBE_INTERVAL_S = 15.0
+FETCH_WINDOW_S = 2.0
+# Allow a parked probe to get its answer and one following fetch to finish.
+PARK_BOUND_S = PROBE_INTERVAL_S + FETCH_WINDOW_S + 3.0
+# The TCP reconnect cap is 30 s, the gated probe can take 15 s, and
+# eight seconds allows a drain of 60 local messages plus Docker polling.
+RECOVERY_DRAIN_BOUND_S = 30.0 + PROBE_INTERVAL_S + 8.0
+
 MESSAGE_CARRYING_TYPES = frozenset({0x07, 0x08, 0x10, 0x11})
 PROBE_REPLY_TYPE = 0x0D
 DROP_MESSAGE_FRAMES_KEY = "drop_message_frames"
@@ -1271,6 +1283,37 @@ class FaultMatrix:
             time.sleep(interval)
         return False
 
+    def wait_for_parked_link(self) -> bool:
+        return self.wait_for(
+            lambda: empty_reply_after(timestamped_logs(PROXY), 0),
+            PARK_BOUND_S,
+            interval=0.5,
+        )
+
+    def wait_for_drain(
+        self,
+        prefix: str,
+        markers: set[str],
+        *,
+        since: float,
+        expected: int,
+        timeout: float = RECOVERY_DRAIN_BOUND_S,
+    ) -> bool:
+        def complete() -> bool:
+            events = state_in(MEDRE_FAULT, "medre", prefix)["canonical_events"]
+            matched = [
+                event
+                for event in events
+                if nonce_marker(json.dumps(event, sort_keys=True)) in markers
+            ]
+            if delivered_this_run(matched, markers) < expected:
+                return False
+            # The last fetched message can commit after the empty reply.
+            # Both observations must be newer than the fault boundary.
+            return empty_reply_after(timestamped_logs(PROXY), since)
+
+        return self.wait_for(complete, timeout, interval=0.5)
+
     def stop_fault_medre(self) -> None:
         run(["docker", "rm", "-f", MEDRE_FAULT], timeout=180)
 
@@ -1489,7 +1532,6 @@ class FaultMatrix:
         fault: dict,
         count: int,
         prefix: str,
-        settle: float,
         expect_recovery: bool,
         verdict: str = "mild",
     ) -> None:
@@ -1514,6 +1556,9 @@ class FaultMatrix:
                 for key, value in fault.items()
                 if key != DROP_MESSAGE_FRAMES_KEY
             }
+        delay_armed_at = None
+        fault_path = LAB_ROOT / "lab/state/openhop-fault/fault.json"
+        delay_on_established_link = verdict == "mild" and not expect_recovery
         try:
             queue_snapshots: list[dict] = []
             if verdict == "bounded":
@@ -1546,7 +1591,7 @@ class FaultMatrix:
                     return
             self.stop_bridge_medre()
             self.stop_fault_medre()
-            self.start_proxy(fault)
+            self.start_proxy({} if delay_on_established_link else fault)
             # The client resolves the proxy's NAME once, at connect time, so
             # the proxy must be up and resolvable before the client starts.
             if not self.wait_for(lambda: container_running(PROXY), 60, interval=1.0):
@@ -1556,7 +1601,15 @@ class FaultMatrix:
                 if not self.start_fault_medre():
                     self.not_run(name, "the fault MEDRE container did not start")
                     return
-                time.sleep(settle)
+                if not self.wait_for_parked_link():
+                    self.not_run(
+                        name,
+                        "the fault MEDRE did not connect and finish its initial drain",
+                    )
+                    return
+                if delay_on_established_link:
+                    delay_armed_at = time.time()
+                    write_fault(fault_path, {"live_delay_ms": fault["delay_ms"]})
                 send = self.peer_send(count, prefix)
                 if send.get("pass") is not True or len(sent_markers(send)) != count:
                     self.not_run(
@@ -1564,7 +1617,42 @@ class FaultMatrix:
                     )
                     return
                 accepted = int(send.get("accepted_count") or 0)
-                time.sleep(settle)
+                mine = sent_markers(send)
+                last_send = max(
+                    wall_timestamp(entry["finished_at"]) for entry in send["sends"]
+                )
+                drain_bound_s = RECOVERY_DRAIN_BOUND_S
+                if delay_armed_at is not None:
+                    delay_s = fault["delay_ms"] / 1000
+                    # Account for one queued message per delayed reply,
+                    # plus a notification, an empty response and a trailing
+                    # notification, then the fetch and scheduling margin.
+                    drain_bound_s = (accepted + 3) * delay_s + FETCH_WINDOW_S + 4.0
+                    if not self.wait_for(
+                        lambda: scoped_log_line(
+                            timestamped_logs(MEDRE_FAULT),
+                            "fetch window elapsed",
+                            delay_armed_at,
+                        ),
+                        2 * delay_s + FETCH_WINDOW_S + 4.0,
+                        interval=0.5,
+                    ):
+                        self.not_run(
+                            name,
+                            "no fetch window elapsed on the established delayed link",
+                        )
+                        return
+                if not self.wait_for_drain(
+                    prefix,
+                    mine,
+                    since=last_send,
+                    expected=accepted,
+                    timeout=drain_bound_s,
+                ):
+                    self.not_run(
+                        name, "the delayed link did not finish the traffic batch"
+                    )
+                    return
             else:
                 # (a) ORDER, bounded only: the link is armed but NO client
                 # is attached, so the peer queues the whole batch at
@@ -1574,7 +1662,6 @@ class FaultMatrix:
                 # window's start.  The BEFORE_BATCH snapshot is taken
                 # before the send, so it shows exactly what the queue
                 # held before this case's own rows arrived.
-                time.sleep(settle)
                 queue_snapshots.append(self.companion_queue_snapshot("before_batch"))
                 send = self.peer_send(count, prefix)
                 if send.get("pass") is not True or len(sent_markers(send)) != count:
@@ -1863,6 +1950,7 @@ class FaultMatrix:
                     "pass": not failures,
                     "failures": failures,
                     "fault": fault,
+                    "delay_armed_after_initial_drain": delay_armed_at,
                     "passthrough_control": self.selective_drop_passthrough,
                     "verdict_rule": verdict_rule,
                     "requested_messages": count,
@@ -1893,6 +1981,9 @@ class FaultMatrix:
                 self.capture_case_logs(name)
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+        finally:
+            if delay_armed_at is not None:
+                write_fault(fault_path, {})
 
     # -- the time-window stall cases --------------------------------------
     def run_window_case(
@@ -1952,9 +2043,11 @@ class FaultMatrix:
             ):
                 self.not_run(name, "the fault MEDRE never completed its first connect")
                 return
-            # Let the drain rounds finish and the pump park (~10 s of
-            # silence after the last round), plus a margin.
-            time.sleep(25)
+            if not self.wait_for_parked_link():
+                self.not_run(
+                    name, "the initial receive drain did not reach an empty queue"
+                )
+                return
             state_dir = LAB_ROOT / "lab/state/openhop-fault"
             armed_at = time.time()
             # The window keys carry unix deadlines: the fault is armed now
@@ -2014,14 +2107,12 @@ class FaultMatrix:
             if time.time() < window_end:
                 time.sleep(window_end - time.time())
             write_fault(state_dir / "fault.json", {})
-            self.wait_for(
-                lambda: reconnected_after_retirement(container_logs(MEDRE_FAULT)),
-                120,
-                interval=2.0,
-            )
-            # The drain after the reconnect: a 120-message backlog drains
-            # in ~4 s on this rig, so a generous margin is plenty.
-            time.sleep(30)
+            mine = sent_markers(send)
+            if not self.wait_for_drain(prefix, mine, since=window_end, expected=count):
+                self.not_run(
+                    name, "did not observe recovery and an empty companion queue"
+                )
+                return
             log = timestamped_logs(MEDRE_FAULT)
             churn = count_reconnects(log)
             mine = sent_markers(send)
@@ -2235,9 +2326,11 @@ class FaultMatrix:
             ):
                 self.not_run(name, "the fault MEDRE never completed its first connect")
                 return
-            # Let the start-up drain finish and the pump park before the
-            # backlog starts arriving.
-            time.sleep(25)
+            if not self.wait_for_parked_link():
+                self.not_run(
+                    name, "the initial receive drain did not reach an empty queue"
+                )
+                return
             send: dict = {}
             sending = threading.Event()
 
@@ -2284,14 +2377,14 @@ class FaultMatrix:
             if time.time() < window_end:
                 time.sleep(window_end - time.time())
             write_fault(state_dir / "fault.json", {})
-            self.wait_for(
-                lambda: reconnected_after_retirement(container_logs(MEDRE_FAULT)),
-                120,
-                interval=2.0,
-            )
-            # The resumed drain: a 60-message backlog drains in ~2 s on
-            # this rig, so a generous margin is plenty.
-            time.sleep(45)
+            mine = sent_markers(send)
+            if not self.wait_for_drain(
+                prefix, mine, since=window_end, expected=count - 1
+            ):
+                self.not_run(
+                    name, "did not observe the interrupted backlog drain finish"
+                )
+                return
             log = timestamped_logs(MEDRE_FAULT)
             churn = count_reconnects(log)
             mine = sent_markers(send)
@@ -2465,10 +2558,11 @@ class FaultMatrix:
             ):
                 self.not_run(name, "the fault MEDRE never completed its first connect")
                 return
-            # Let the drain rounds finish and the pump park before the
-            # window opens, so the first request it closes is the parked
-            # pump's own probe.
-            time.sleep(25)
+            if not self.wait_for_parked_link():
+                self.not_run(
+                    name, "the initial receive drain did not reach an empty queue"
+                )
+                return
             armed_at = time.time()
             window_end = armed_at + window_seconds
             fault_path = state_dir / "fault.json"
@@ -2486,40 +2580,28 @@ class FaultMatrix:
                 time.sleep(window_end - time.time())
             write_fault(state_dir / "fault.json", {})
 
-            def reconnected_after_window() -> bool:
-                for line in timestamped_logs(MEDRE_FAULT).splitlines():
-                    stamp = line_time(line)
-                    if (
-                        stamp is not None
-                        and stamp >= window_end
-                        and "reconnected successfully" in line
-                    ):
-                        return True
-                return False
-
-            self.wait_for(reconnected_after_window, 120, interval=2.0)
-            time.sleep(5)
+            if not self.wait_for(
+                lambda: reconnect_after(timestamped_logs(MEDRE_FAULT), window_end),
+                RECOVERY_DRAIN_BOUND_S,
+                interval=0.5,
+            ):
+                self.not_run(name, "did not observe a reconnect after the fault window")
+                return
             send = self.peer_send(count, prefix)
             mine = sent_markers(send)
             if send.get("pass") is not True or len(mine) != count:
                 self.not_run(name, "the peer did not accept the complete traffic batch")
                 return
             accepted = int(send.get("accepted_count") or 0)
-            # MEDRE's store is cumulative: count only THIS run's markers,
-            # or an earlier run's events would satisfy the wait.
-            self.wait_for(
-                lambda: delivered_this_run(
-                    state_in(MEDRE_FAULT, "medre", prefix).get("canonical_events")
-                    or [],
-                    mine,
-                )
-                >= accepted,
-                180,
-                interval=3.0,
+            last_send = max(
+                wall_timestamp(entry["finished_at"]) or window_end
+                for entry in send["sends"]
             )
-            # The drain: a 6-message batch delivers in seconds on this
-            # rig, so a short margin is plenty.
-            time.sleep(12)
+            if not self.wait_for_drain(prefix, mine, since=last_send, expected=count):
+                self.not_run(
+                    name, "the replacement connection did not drain the traffic batch"
+                )
+                return
             log = timestamped_logs(MEDRE_FAULT)
             churn = count_reconnects(log)
             events = (
@@ -2660,9 +2742,11 @@ class FaultMatrix:
             ):
                 self.not_run(name, "the fault MEDRE never completed its first connect")
                 return
-            # Let the drain rounds finish and the pump park (~10 s of
-            # silence after the last round), plus a margin.
-            time.sleep(25)
+            if not self.wait_for_parked_link():
+                self.not_run(
+                    name, "the initial receive drain did not reach an empty queue"
+                )
+                return
             armed_at = time.time()
             state_dir = LAB_ROOT / "lab/state/openhop-fault"
             fault_path = state_dir / "fault.json"
@@ -2692,15 +2776,31 @@ class FaultMatrix:
                 )
                 write_fault(state_dir / "fault.json", {})
                 return
-            time.sleep(4)
+
+            # The first TCP retry is scheduled immediately after retirement
+            # with a one-second base and up to 25% jitter.
+            def attempted_while_armed() -> bool:
+                return any(
+                    RECONNECT.search(line)
+                    and (at := line_time(line)) is not None
+                    and at >= armed_at
+                    for line in timestamped_logs(MEDRE_FAULT).splitlines()
+                )
+
+            if not self.wait_for(
+                attempted_while_armed, FETCH_WINDOW_S + 2, interval=0.5
+            ):
+                self.not_run(name, "no reconnect attempt was seen while the fault held")
+                return
             cleared_at = time.time()
             write_fault(state_dir / "fault.json", {})
-            self.wait_for(
-                lambda: reconnected_after_retirement(container_logs(MEDRE_FAULT)),
-                90,
-                interval=2.0,
-            )
-            time.sleep(12)
+            if not self.wait_for_drain(
+                prefix, sent_markers(send), since=cleared_at, expected=3
+            ):
+                self.not_run(
+                    name, "did not observe the blackholed batch drain after restoration"
+                )
+                return
             log = timestamped_logs(MEDRE_FAULT)
             churn = count_reconnects(log)
             mine = sent_markers(send)
@@ -2804,17 +2904,16 @@ class FaultMatrix:
 # which judge scores the run ("mild" healthy-link rule, "bounded" for the
 # per-connection worst case whose documented bound is asserted).
 CASES = {
-    "latency_under": ({"delay_ms": 900}, 6, "p4qu", 12.0, True, "mild"),
-    "latency_over": ({"delay_ms": 4000}, 6, "p4qo", 25.0, False, "mild"),
+    "latency_under": ({"delay_ms": 900}, 6, "p4qu", True, "mild"),
+    "latency_over": ({"delay_ms": 4000}, 6, "p4qo", False, "mild"),
     "selective_drop": (
         {"drop_message_frames": True},
         6,
         "p4qd",
-        25.0,
         False,
         "bounded",
     ),
-    "repeated_waiting": ({"delay_ms": 200}, 20, "p4qr", 25.0, True, "mild"),
+    "repeated_waiting": ({"delay_ms": 200}, 20, "p4qr", True, "mild"),
 }
 
 # The time-window cases run their own arm / queue / clear flow; the
@@ -2883,13 +2982,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             selected = [args.case]
     for key in selected:
-        fault, count, prefix, settle, expect_recovery, verdict = CASES[key]
+        fault, count, prefix, expect_recovery, verdict = CASES[key]
         matrix.run_case(
             f"fault-{key.replace('_', '-')}",
             fault,
             count,
             prefix,
-            settle,
             expect_recovery,
             verdict,
         )

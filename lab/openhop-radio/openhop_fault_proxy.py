@@ -608,15 +608,20 @@ async def handle(
                     data = dropper.feed(data, connection)
                     if not data:
                         continue
+                # The startup setting applies throughout a manual run.
+                # A case can separately arm the same delay on an attached link.
+                live_delay_ms = read_dynamic_fault(fault_file).get(
+                    "live_delay_ms", delay_ms
+                )
+                if type(live_delay_ms) is int and live_delay_ms > 0:
+                    STATS["delayed_ms_total"] += live_delay_ms
+                    await asyncio.sleep(live_delay_ms / 1000)
+                client_writer.write(data)
+                await client_writer.drain()
+                STATS["server_chunks_forwarded"] += 1
                 if trace_enabled():
                     for record in trace_forward_records(connection, data):
                         print(json.dumps(record), flush=True)
-                if delay_ms:
-                    STATS["delayed_ms_total"] += delay_ms
-                    await asyncio.sleep(delay_ms / 1000)
-                STATS["server_chunks_forwarded"] += 1
-                client_writer.write(data)
-                await client_writer.drain()
         except (ConnectionResetError, BrokenPipeError):
             pass
         finally:

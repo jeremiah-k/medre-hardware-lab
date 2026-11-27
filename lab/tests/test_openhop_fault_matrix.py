@@ -1002,7 +1002,6 @@ def test_the_bounded_record_carries_every_queue_snapshot_label_in_order(
         {"drop_message_frames": True},
         6,
         "p4qd",
-        0.0,
         False,
         "bounded",
     )
@@ -1037,7 +1036,6 @@ def test_before_batch_is_taken_before_the_batch(tmp_path, monkeypatch):
         {"drop_message_frames": True},
         6,
         "p4qd",
-        0.0,
         False,
         "bounded",
     )
@@ -1082,7 +1080,6 @@ def test_a_failed_wake_batch_fails_the_bounded_case_closed(tmp_path, monkeypatch
         {"drop_message_frames": True},
         6,
         "p4qd",
-        0.0,
         False,
         "bounded",
     )
@@ -1108,7 +1105,6 @@ def test_a_wake_batch_that_never_arrives_whole_stops_the_case(tmp_path, monkeypa
         {"drop_message_frames": True},
         6,
         "p4qd",
-        0.0,
         False,
         "bounded",
     )
@@ -1437,7 +1433,6 @@ def test_the_recorded_answered_probes_equal_the_per_connection_sum(
         {"drop_message_frames": True},
         6,
         "p4qd",
-        0.0,
         False,
         "bounded",
     )
@@ -1516,3 +1511,47 @@ def test_the_shell_entry_point_forwards_the_passthrough_control():
     assert "--selective-drop-passthrough" in script
     assert 'PASSTHROUGH="--selective-drop-passthrough"' in script
     assert "${PASSTHROUGH}" in script
+
+
+def test_latency_over_refuses_the_baseline_shape_that_never_times_out_a_fetch(
+    tmp_path, monkeypatch
+):
+    matrix = fault_matrix.FaultMatrix(tmp_path)
+    for name in ("stop_bridge_medre", "stop_fault_medre", "start_proxy"):
+        monkeypatch.setattr(matrix, name, lambda *args: None)
+    monkeypatch.setattr(matrix, "start_fault_medre", lambda: True)
+    monkeypatch.setattr(matrix, "wait_for_parked_link", lambda: True)
+    monkeypatch.setattr(fault_matrix, "container_running", lambda name: True)
+    writes = []
+    monkeypatch.setattr(
+        fault_matrix, "write_fault", lambda path, flags: writes.append(flags)
+    )
+    monkeypatch.setattr(
+        matrix, "wait_for", lambda predicate, *_args, **_kwargs: predicate()
+    )
+    monkeypatch.setattr(
+        fault_matrix,
+        "timestamped_logs",
+        lambda name: "2026-11-27T14:29:15Z reconnect failed: No response from MeshCore node",
+    )
+    monkeypatch.setattr(
+        matrix,
+        "peer_send",
+        lambda *_: {
+            "pass": True,
+            "accepted_count": 1,
+            "nonces": ["p4qo-0-abcdef"],
+            "sends": [
+                {
+                    "accepted": True,
+                    "nonce": "p4qo-0-abcdef",
+                    "finished_at": "2026-01-01T00:00:00Z",
+                }
+            ],
+        },
+    )
+    matrix.run_case("fault-latency-over", {"delay_ms": 4000}, 1, "p4qo", False)
+    record = json.loads((tmp_path / "fault-latency-over.json").read_text())
+    assert record["status"] == "NOT RUN"
+    assert "no fetch window elapsed" in record["reason"]
+    assert writes == [{"live_delay_ms": 4000}, {}]
