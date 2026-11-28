@@ -82,20 +82,10 @@ python3 lab/check_source_mounts.py "${LAB_SOURCE_MANIFEST_OPENHOP}" --host-only 
 if ((! SKIP_BUILD)); then
 	log "Building images (openhop repeater + medre openhop)"
 	"${COMPOSE[@]}" build openhop-repeater medre-openhop-bridge
-else
-	log "Verifying pinned packages in the existing repeater image"
-	docker run --rm --network none --entrypoint python3 medre-lab/openhop-repeater:latest -I -c '
-import json
-import sys
-from pathlib import Path
-from sysconfig import get_path
 
-stamp = json.loads((Path(get_path("purelib")) / "openhop-bake-pin.json").read_text())
-if [stamp[key]["ref"] for key in ("openhop_core", "openhop_repeater")] != sys.argv[1:]:
-    raise SystemExit("existing image does not match the selected openHop pins")
-' "${OPENHOP_CORE_REF}" "${OPENHOP_REPEATER_REF}" ||
-		die "rebuild the repeater image with the selected revisions"
 fi
+python3 lab/openhop_image_pins.py --repeater medre-lab/openhop-repeater:latest \
+	--medre medre-lab/medre-openhop-dev:latest
 
 # --- Generated configs ------------------------------------------------------
 log "Generating the bridge configs into lab/state/config/"
@@ -257,6 +247,10 @@ wait_healthy medre-lab-openhop-repeater-b 240
 wait_healthy medre-lab-mesh-c-medre 240
 wait_healthy medre-lab-mesh-c-peer 240
 wait_healthy medre-lab-medre-openhop-bridge 240
+python3 lab/openhop_image_pins.py --running --repeater medre-lab-openhop-repeater-a \
+	--repeater medre-lab-openhop-repeater-b --medre medre-lab-medre-openhop-bridge
+python3 lab/check_source_mounts.py "${LAB_SOURCE_MANIFEST_OPENHOP}" \
+	--openhop-bridge
 
 # Process liveness is weaker than adapter readiness. Use only log lines
 # from the current process, and wait for both endpoints to connect.
@@ -264,11 +258,12 @@ log "Waiting for the MEDRE adapter sessions to attach"
 bridge=medre-lab-medre-openhop-bridge
 started_at="$(docker inspect -f '{{.State.StartedAt}}' "${bridge}")"
 ready=0
-for attempt in $(seq 1 240); do
-	if startup="$(docker logs --since "${started_at}" "${bridge}" 2>&1)" &&
-		grep -Eq 'MeshCoreSession openhop-a( started .*connected=True|: reconnected successfully)' <<<"${startup}" &&
-		grep -q 'MeshtasticSession radio-c started (mode=tcp)' <<<"${startup}"; then
-		ready=1
+deadline=$((SECONDS + 240))
+while ((SECONDS < deadline)); do
+	if startup="$(timeout 5s docker logs --since "${started_at}" "${bridge}" 2>&1)" &&
+		PYTHONPATH=lab/tools python3 -c 'import sys; from openhop_observe import bridge_adapters_ready; sys.exit(not bridge_adapters_ready(sys.stdin.read()))' <<<"${startup}" &&
+		[[ "$(timeout 5s docker inspect -f '{{.State.Running}} {{.State.StartedAt}}' "${bridge}")" == "true ${started_at}" ]]; then
+		((SECONDS < deadline)) && ready=1
 		break
 	fi
 	sleep 1

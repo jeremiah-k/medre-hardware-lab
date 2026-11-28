@@ -99,6 +99,9 @@ x-openhop-repeater-build: &openhop-repeater-build
       OPENHOP_REPEATER_REF: ${OPENHOP_REPEATER_REF:-main}
       OPENHOP_CORE_VERSION: ${OPENHOP_CORE_VERSION:-1.1.3}
       OPENHOP_REPEATER_VERSION: ${OPENHOP_REPEATER_VERSION:-1.1.4}
+    labels:
+      io.medre.lab.pin.openhop-core: ${OPENHOP_CORE_REF:-}
+      io.medre.lab.pin.openhop-repeater: ${OPENHOP_REPEATER_REF:-}
   image: medre-lab/openhop-repeater:latest
 
 # x-medre-openhop-build: the SECOND MEDRE image (lab/medre-openhop/
@@ -113,6 +116,10 @@ x-medre-openhop-build: &medre-openhop-build
       medre-openhop-src: ${MEDRE_OPENHOP_SRC:?run medre-lab docker prepare}
       medre-meshcore-src: ${MEDRE_MESHCORE_SRC:?run medre-lab docker prepare}
       medre-meshtastic-openhop-src: ${MEDRE_MESHTASTIC_OPENHOP_SRC:?run medre-lab docker prepare}
+    labels:
+      io.medre.lab.pin.medre-openhop: ${MEDRE_OPENHOP_REF:-}
+      io.medre.lab.pin.medre-adapter-meshcore: ${MEDRE_MESHCORE_REF:-}
+      io.medre.lab.pin.medre-adapter-meshtastic-openhop: ${MEDRE_MESHTASTIC_OPENHOP_REF:-}
   image: medre-lab/medre-openhop-dev:latest
 
 x-mmrelay-common: &mmrelay-common

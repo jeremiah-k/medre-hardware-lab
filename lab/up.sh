@@ -355,6 +355,8 @@ if ((WITH_OPENHOP)); then
 	else
 		log "Skipping image build"
 	fi
+	python3 lab/openhop_image_pins.py --repeater medre-lab/openhop-repeater:latest \
+		--medre medre-lab/medre-openhop-dev:latest
 
 	# --- Generated openHop configs (identities + credentials) -------------
 	# Identities and credentials are generated into the GITIGNORED
@@ -380,7 +382,7 @@ values = {
     "OPENHOP_GUEST_PASSWORD": secrets.token_urlsafe(24),
     "OPENHOP_JWT_SECRET": secrets.token_hex(32),
 }
-with open(path, "w", encoding="utf-8") as handle:
+with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as handle:
     for key, value in values.items():
         handle.write(f"{key}={value}\n")
 os.chmod(path, 0o600)
@@ -461,6 +463,7 @@ PYGEN
 	openhop_wait_healthy medre-lab-mesh-c-medre 240
 	openhop_wait_healthy medre-lab-openhop-repeater 240
 	openhop_wait_healthy medre-lab-medre-openhop 240
+	python3 lab/openhop_image_pins.py --running --repeater medre-lab-openhop-repeater --medre medre-lab-medre-openhop
 
 	# --- Live source provenance -------------------------------------------
 	# Now that the containers are up, the openHop manifest is checked with
@@ -544,6 +547,8 @@ if ((WITH_OPENHOP_RADIO)); then
 	else
 		log "Skipping image build"
 	fi
+	python3 lab/openhop_image_pins.py --repeater medre-lab/openhop-repeater:latest \
+		--medre medre-lab/medre-openhop-dev:latest
 
 	# --- Generated repeater configs (identities + credentials) --------------
 	# Each repeater gets its OWN companion identity and credentials: the two
@@ -567,7 +572,7 @@ for instance in ("a", "b"):
     values[f"RADIO_{instance.upper()}_ADMIN_PASSWORD"] = secrets.token_urlsafe(24)
     values[f"RADIO_{instance.upper()}_GUEST_PASSWORD"] = secrets.token_urlsafe(24)
     values[f"RADIO_{instance.upper()}_JWT_SECRET"] = secrets.token_hex(32)
-with open(path, "w", encoding="utf-8") as handle:
+with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as handle:
     for key, value in values.items():
         handle.write(f"{key}={value}\n")
 os.chmod(path, 0o600)
@@ -643,6 +648,8 @@ PYGEN
 	openhop_radio_wait_healthy medre-lab-openhop-radio-relay 120
 	openhop_radio_wait_healthy medre-lab-openhop-repeater-a 240
 	openhop_radio_wait_healthy medre-lab-openhop-repeater-b 240
+	python3 lab/openhop_image_pins.py --running --repeater medre-lab-openhop-repeater-a --repeater medre-lab-openhop-repeater-b
+	python3 lab/check_source_mounts.py "${LAB_SOURCE_MANIFEST_OPENHOP}" --openhop-radio
 
 	log "Capturing openHop radio logs"
 	docker logs medre-lab-openhop-radio-relay >"${LOG_DIR}/openhop-radio-relay-${TS}.log" 2>&1 || true
