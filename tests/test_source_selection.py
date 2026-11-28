@@ -1,8 +1,11 @@
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from medre_lab import docker as rig
 from medre_lab import presets
 from medre_lab.docker import (
     DEFAULT_MANIFEST,
@@ -171,3 +174,242 @@ def test_a_library_without_the_current_pins_is_a_failure(tmp_path):
     (tmp_path / "lab" / "presets" / "base.json").write_text(json.dumps(data))
     with pytest.raises(ValueError, match="no preset records"):
         presets.validate_preset_library(tmp_path)
+
+
+# --- fetch materialization ------------------------------------------------------
+
+
+def test_baked_sources_are_exactly_the_build_context_sources():
+    """Every locked source feeds a Docker build context, so every checkout
+    must serve an image bake.
+
+    compose.yaml resolves each source's env var as a named build context and
+    the lab Dockerfiles COPY-install from those contexts; the matrix bake
+    installs via git+file FROM the copied checkout itself. A bake that meets
+    a blob:none partial clone dies on a cold build cache (upload-pack can
+    neither serve a clone from a partial clone nor lazy-fetch while
+    serving), so fetch materializes every baked checkout's object store.
+    """
+    compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    for name, info in SOURCES.items():
+        assert f"${{{info[0]}:?" in compose, f"{name} has no build context"
+        assert name in rig.BAKED_SOURCES
+    assert set(rig.BAKED_SOURCES) == set(SOURCES)
+
+
+def run_git(repo: Path, *args: str) -> str:
+    return subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Lab Test",
+            "-c",
+            "user.email=lab@example.invalid",
+            *args,
+        ],
+        text=True,
+        stderr=subprocess.STDOUT,
+    ).strip()
+
+
+def make_seed_repo(repos: Path, name: str) -> str:
+    """A tiny local history whose HEAD becomes the pin.
+
+    The main tip carries the module files the mount guard checks. A second
+    branch adds one blob a blob:none clone never materializes, so a partial
+    store is provable by object ids alone.
+    """
+    repo = repos / name
+    repo.mkdir(parents=True)
+    run_git(repo, "init", "-q", "-b", "main")
+    run_git(repo, "config", "uploadpack.allowFilter", "true")
+    for key, info in SOURCES.items():
+        file = repo / info[1]
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(f"# {key}\n", encoding="utf-8")
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-q", "-m", "module files")
+    run_git(repo, "checkout", "-q", "-b", "side")
+    (repo / "side.txt").write_text("side\n", encoding="utf-8")
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-q", "-m", "side")
+    run_git(repo, "checkout", "-q", "main")
+    return run_git(repo, "rev-parse", "HEAD")
+
+
+def store_ids(repo: Path) -> set[str]:
+    """Every object id physically present in a repository's store."""
+    out = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname)",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return set(out.stdout.split())
+
+
+def local_git_runner(repos: Path, calls: list):
+    """subprocess.run stand-in for rig.fetch: the fake lock URLs resolve to
+    the local seeds, so every clone is real plumbing minus the network.
+    Refetches need no rewrite: each checkout's origin already points at its
+    seed, exactly as production origins point at the reachable lock URL.
+    Calls are recorded verbatim, before the rewrite."""
+    real_run = subprocess.run
+
+    def run(argv, **kwargs):
+        calls.append(list(argv))
+        argv = list(argv)
+        if argv[:2] == ["git", "clone"]:
+            for index, arg in enumerate(argv):
+                if arg.startswith("https://github.com/fake/"):
+                    argv[index] = f"file://{repos / Path(arg).stem}"
+                    break
+        return real_run(argv, **kwargs)
+
+    return run
+
+
+def build_fetch_root(tmp_path: Path, pins: dict) -> Path:
+    """A minimal lab root: the given lock plus the real mount guard."""
+    root = tmp_path / "labroot"
+    root.mkdir()
+    (root / "sources.lock.json").write_text(json.dumps(pins, indent=2) + "\n")
+    (root / "lab").mkdir()
+    (root / "lab" / "config").mkdir()
+    shutil.copyfile(
+        ROOT / "lab/check_source_mounts.py", root / "lab/check_source_mounts.py"
+    )
+    return root
+
+
+def seed_pins(repos: Path) -> dict:
+    return {
+        name: {
+            "url": f"https://github.com/fake/{name}.git",
+            "ref": make_seed_repo(repos, name),
+        }
+        for name in SOURCES
+    }
+
+
+def partial_filter_config(checkout: Path):
+    return subprocess.run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "config",
+            "--get",
+            "remote.origin.partialclonefilter",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_fetch_clones_baked_sources_complete_and_keeps_others_partial(
+    tmp_path, monkeypatch
+):
+    """Baked checkouts materialize; non-baked checkouts stay partial.
+
+    rig.BAKED_SOURCES is narrowed to one source so both clone shapes are
+    exercised against the same seeds, and the baked checkout proves the
+    bake contract directly: a git clone FROM it (what a git+file install
+    does) succeeds.
+    """
+    seeds = tmp_path / "seeds"
+    seeds.mkdir()
+    pins = seed_pins(seeds)
+    root = build_fetch_root(tmp_path, pins)
+    calls: list = []
+    monkeypatch.setattr(rig.subprocess, "run", local_git_runner(seeds, calls))
+    monkeypatch.setattr(rig, "BAKED_SOURCES", frozenset({"medre-adapter-matrix"}))
+    rig.fetch(root)
+
+    clones = {
+        Path(argv[-1]).name: argv for argv in calls if argv[:2] == ["git", "clone"]
+    }
+    assert set(clones) == set(SOURCES)
+    assert "--filter=blob:none" not in clones["medre-adapter-matrix"]
+    assert all(
+        "--filter=blob:none" in clones[name]
+        for name in SOURCES
+        if name != "medre-adapter-matrix"
+    )
+
+    baked = root / "sources" / "medre-adapter-matrix"
+    assert not (store_ids(seeds / "medre-adapter-matrix") - store_ids(baked))
+    assert partial_filter_config(baked).returncode != 0
+    subprocess.run(
+        ["git", "clone", "-q", f"file://{baked}", str(tmp_path / "servable")],
+        check=True,
+    )
+
+    partial = root / "sources" / "mmrelay"
+    assert partial_filter_config(partial).stdout.strip() == "blob:none"
+    assert store_ids(seeds / "mmrelay") - store_ids(partial)
+
+
+def test_fetch_repairs_an_existing_partial_baked_checkout(tmp_path, monkeypatch):
+    """An existing blob:none checkout of a baked source is refetched
+    unfiltered in place, without being reset.
+
+    This is the defect's standing damage: checkouts provisioned by an older
+    fetch leave every cold bake dead on upload-pack exit 128. The repair
+    makes the presets era's manual object-store completion automatic.
+    """
+    seeds = tmp_path / "seeds"
+    seeds.mkdir()
+    pins = seed_pins(seeds)
+    root = build_fetch_root(tmp_path, pins)
+    checkout = root / "sources" / "medre-adapter-matrix"
+    checkout.parent.mkdir(parents=True)
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "-q",
+            "--no-checkout",
+            "--filter=blob:none",
+            f"file://{seeds / 'medre-adapter-matrix'}",
+            str(checkout),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "checkout",
+            "-q",
+            "--detach",
+            pins["medre-adapter-matrix"]["ref"],
+        ],
+        check=True,
+    )
+    seed_ids = store_ids(seeds / "medre-adapter-matrix")
+    assert seed_ids - store_ids(checkout), "fixture must start genuinely partial"
+
+    calls: list = []
+    monkeypatch.setattr(rig.subprocess, "run", local_git_runner(seeds, calls))
+    rig.fetch(root)
+
+    refetches = [argv for argv in calls if "--refetch" in argv]
+    assert refetches == [["git", "-C", str(checkout), "fetch", "--refetch", "origin"]]
+    assert not (seed_ids - store_ids(checkout))
+    assert partial_filter_config(checkout).returncode != 0
+    assert run_git(checkout, "rev-parse", "HEAD") == pins["medre-adapter-matrix"]["ref"]
+    subprocess.run(
+        ["git", "clone", "-q", f"file://{checkout}", str(tmp_path / "servable")],
+        check=True,
+    )

@@ -73,6 +73,18 @@ SOURCES = {
     ),
 }
 
+# Sources whose checkout feeds a Docker build context. compose.yaml resolves
+# every *_SRC variable below as a named build context, and the lab recipes
+# (lab/mmrelay/Dockerfile, lab/medre/Dockerfile, lab/openhop/Dockerfile,
+# lab/medre-openhop/Dockerfile) COPY-install from those contexts -- the
+# matrix bake installs via git+file FROM the copied checkout itself. An
+# image bake therefore installs from the checkout, so its object store must
+# be servable: serving an install from a blob:none partial clone fails
+# (upload-pack neither allows filters nor lazy-fetches while serving).
+# Today every locked source is baked; a future source that never enters a
+# build context can stay out of this set and keep its cheap partial clone.
+BAKED_SOURCES = frozenset(SOURCES)
+
 # Source groups are the sources each rig qualifies. The default rig keeps
 # the original five sources untouched; the openHop profile adds its own five
 # (a second medre/adapter stack plus the two openHop checkouts).
@@ -135,25 +147,74 @@ def lock(root):
     return data
 
 
+def clone_command(name, url, target):
+    """The clone argv for one locked source.
+
+    Baked sources are cloned WITHOUT the blob filter: an image build
+    installs from the checkout, so a partial clone would break every cold
+    bake. Non-baked sources never feed a build context; the filter keeps
+    their clones cheap.
+    """
+    command = ["git", "clone", "--no-checkout"]
+    if name not in BAKED_SOURCES:
+        command.append("--filter=blob:none")
+    return [*command, url, str(target)]
+
+
+def materialize(target):
+    """Complete a blob:none partial clone in place with an unfiltered refetch.
+
+    The filter is sticky: a plain fetch re-applies remote.origin
+    .partialclonefilter and the negotiation finds nothing to do for refs it
+    already has. Clear the filter, then --refetch downloads every ref's full
+    closure so the checkout can serve a git+file install. Idempotent: a
+    checkout without the filter (complete clone, or already materialized) is
+    left untouched.
+    """
+    partial = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(target),
+            "config",
+            "--get",
+            "remote.origin.partialclonefilter",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if partial.returncode != 0 or not partial.stdout.strip():
+        return
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(target),
+            "config",
+            "--unset",
+            "remote.origin.partialclonefilter",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(target), "fetch", "--refetch", "origin"], check=True
+    )
+
+
 def fetch(root):
     for name, entry in lock(root).items():
         target = root / "sources" / name
         if not target.exists():
-            subprocess.run(
-                [
-                    "git",
-                    "clone",
-                    "--no-checkout",
-                    "--filter=blob:none",
-                    entry["url"],
-                    str(target),
-                ],
-                check=True,
-            )
+            subprocess.run(clone_command(name, entry["url"], target), check=True)
             subprocess.run(
                 ["git", "-C", str(target), "checkout", "--detach", entry["ref"]],
                 check=True,
             )
+        if name in BAKED_SOURCES:
+            # A bake installs from this checkout, so its object store must
+            # be servable. This also repairs a partial clone left behind by
+            # an older fetch; existing checkouts are still never reset.
+            materialize(target)
         # Existing checkouts are deliberately never reset/rebased/cleaned.
     prepare(root)
 
