@@ -417,7 +417,6 @@ def test_fetch_repairs_an_existing_partial_baked_checkout(tmp_path, monkeypatch)
     )
 
 
-
 def test_materialize_failed_fetch_preserves_retry_marker(tmp_path, monkeypatch):
     repo = tmp_path / "checkout"
     repo.mkdir()
