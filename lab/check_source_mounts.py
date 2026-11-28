@@ -87,12 +87,26 @@ def check_container(container: str, entries: list[dict[str, str]]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
-    parser.add_argument("--host-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--host-only", action="store_true")
+    mode.add_argument("--openhop-bridge", action="store_true")
+    mode.add_argument("--openhop-radio", action="store_true")
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text())
     if not isinstance(manifest, dict) or not manifest:
         raise SystemExit("source manifest must name the containers under qualification")
     try:
+        if args.openhop_bridge or args.openhop_radio:
+            repeaters = manifest["medre-lab-openhop-repeater"]
+            selected = {
+                "medre-lab-openhop-repeater-a": repeaters,
+                "medre-lab-openhop-repeater-b": repeaters,
+            }
+            if args.openhop_bridge:
+                selected["medre-lab-medre-openhop-bridge"] = manifest[
+                    "medre-lab-medre-openhop"
+                ]
+            manifest = selected
         for container, entries in manifest.items():
             if not isinstance(entries, list) or not entries:
                 raise ValueError(f"{container}: empty source selection")

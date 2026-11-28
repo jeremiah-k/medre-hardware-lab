@@ -35,4 +35,9 @@ jobs:
           export MEDRE_MESHTASTIC_SRC="$PWD/sources/medre-adapter-meshtastic"
           export MEDRE_LXMF_SRC="$PWD/sources/medre-adapter-lxmf"
           export MMRELAY_BAKE_CORE_SRC="$MEDRE_CORE_SRC"
-          docker compose --profile normal --profile medre config --quiet
+          export MEDRE_OPENHOP_SRC="$PWD/sources/medre-openhop"
+          export MEDRE_MESHCORE_SRC="$PWD/sources/medre-adapter-meshcore"
+          export MEDRE_MESHTASTIC_OPENHOP_SRC="$PWD/sources/medre-adapter-meshtastic-openhop"
+          export OPENHOP_CORE_SRC="$PWD/sources/openhop-core"
+          export OPENHOP_REPEATER_SRC="$PWD/sources/openhop-repeater"
+          docker compose --profile normal --profile medre --profile openhop config --quiet

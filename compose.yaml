@@ -73,6 +73,55 @@ x-medre-build: &medre-build
       medre-lxmf-src: ${MEDRE_LXMF_SRC:?run medre-lab docker prepare}
   image: medre-lab/medre-dev:latest
 
+# ---------------------------------------------------------------------------
+# openHop profile build anchors.
+#
+# The openHop profile is OPT-IN and hardware-free: no radios, no /dev
+# mounts, no CAP_SYS_RAWIO, no GPIO/USB groups. It carries its OWN source
+# pins (see sources.lock.json): the default rig's medre 0.1.0 pin cannot
+# satisfy medre-adapter-meshcore 0.2.0 (`medre>=0.2.0,<0.3.0`), so the
+# openHop profile gets a second MEDRE build anchor and separate checkouts.
+#
+# x-openhop-repeater-build: the LAB-OWNED openHop image (lab/openhop/
+# Dockerfile). It installs the pinned local openhop_core and then the pinned
+# local openhop_repeater checkout, and stamps both commits into the image
+# (openhop-bake-pin.json) so the installed source is provable in-container.
+x-openhop-repeater-build: &openhop-repeater-build
+  build:
+    context: .
+    dockerfile: lab/openhop/Dockerfile
+    additional_contexts:
+      openhop-core-src: ${OPENHOP_CORE_SRC:?run medre-lab docker prepare}
+      openhop-repeater-src: ${OPENHOP_REPEATER_SRC:?run medre-lab docker prepare}
+    args:
+      # Exact HEAD SHAs, exported by lab/up.sh from the checkouts.
+      OPENHOP_CORE_REF: ${OPENHOP_CORE_REF:-main}
+      OPENHOP_REPEATER_REF: ${OPENHOP_REPEATER_REF:-main}
+      OPENHOP_CORE_VERSION: ${OPENHOP_CORE_VERSION:-1.1.3}
+      OPENHOP_REPEATER_VERSION: ${OPENHOP_REPEATER_VERSION:-1.1.4}
+    labels:
+      io.medre.lab.pin.openhop-core: ${OPENHOP_CORE_REF:-}
+      io.medre.lab.pin.openhop-repeater: ${OPENHOP_REPEATER_REF:-}
+  image: medre-lab/openhop-repeater:latest
+
+# x-medre-openhop-build: the SECOND MEDRE image (lab/medre-openhop/
+# Dockerfile): medre 0.2.3 + meshcore adapter 0.2.0 + meshtastic adapter
+# 0.2.1. No matrix and no lxmf adapter (the openHop profile does not use
+# Matrix rooms).
+x-medre-openhop-build: &medre-openhop-build
+  build:
+    context: .
+    dockerfile: lab/medre-openhop/Dockerfile
+    additional_contexts:
+      medre-openhop-src: ${MEDRE_OPENHOP_SRC:?run medre-lab docker prepare}
+      medre-meshcore-src: ${MEDRE_MESHCORE_SRC:?run medre-lab docker prepare}
+      medre-meshtastic-openhop-src: ${MEDRE_MESHTASTIC_OPENHOP_SRC:?run medre-lab docker prepare}
+    labels:
+      io.medre.lab.pin.medre-openhop: ${MEDRE_OPENHOP_REF:-}
+      io.medre.lab.pin.medre-adapter-meshcore: ${MEDRE_MESHCORE_REF:-}
+      io.medre.lab.pin.medre-adapter-meshtastic-openhop: ${MEDRE_MESHTASTIC_OPENHOP_REF:-}
+  image: medre-lab/medre-openhop-dev:latest
+
 x-mmrelay-common: &mmrelay-common
   <<: *mmrelay-build
   restart: unless-stopped
@@ -375,7 +424,11 @@ services:
   # -------------------------------------------------------------------------
   meshtasticd-c-medre:
     <<: *meshtasticd-common
-    profiles: [normal]
+    # `normal` owns this node for medre-normal; `openhop` owns it for
+    # medre-openhop. The two profiles are mutually exclusive (lab/up.sh
+    # refuses to run them together), so the one-api-client-per-node rule
+    # holds: exactly one MEDRE instance connects to this node at a time.
+    profiles: [normal, openhop, openhop-bridge]
     container_name: medre-lab-mesh-c-medre
     command: ["meshtasticd", "--fsdir=/data", "-p", "4403", "-h", "63"]
     ports:
@@ -390,7 +443,7 @@ services:
 
   meshtasticd-c-peer:
     <<: *meshtasticd-common
-    profiles: [normal]
+    profiles: [normal, openhop-bridge]
     container_name: medre-lab-mesh-c-peer
     command: ["meshtasticd", "--fsdir=/data", "-p", "4403", "-h", "74"]
     ports:
@@ -565,6 +618,598 @@ services:
       meshtasticd-b-medre:
         condition: service_healthy
 
+  # -------------------------------------------------------------------------
+  # openHop profile (OPT-IN; profile `openhop`).
+  #
+  # Hardware-free MEDRE<->openHop qualifier.
+  #
+  #   openhop-repeater  the openHop repeater with radio_type: null. It
+  #                     serves the MeshCore companion frame protocol over
+  #                     TCP 5000 on the private `openhop` network.
+  #   medre-openhop     the MEDRE runtime whose MeshCore adapter talks to
+  #                     that companion, plus the existing MeshC meshtastic
+  #                     sim endpoint.
+  #
+  # HARD RULES (owner-set):
+  #   * The companion TCP port is NEVER published to the host. It exists
+  #     only on the private `openhop` compose network.
+  #   * openHop's companion server accepts ONE client at a time and evicts
+  #     the previous one. Therefore NO healthcheck, readiness probe or
+  #     test may connect to port 5000 while MEDRE holds the companion.
+  #     Both healthchecks below are PROCESS LIVENESS ONLY.
+  #   * No /dev mounts, no devices:, no cap_add, no GPIO/USB groups: this
+  #     profile never touches radio hardware.
+  #   * The repeater's own identity and the companion's identity are
+  #     generated at bring-up into the gitignored lab/state/ tree; they
+  #     are credentials and never live in git.
+  # -------------------------------------------------------------------------
+  openhop-repeater:
+    <<: *openhop-repeater-build
+    profiles: [openhop]
+    container_name: medre-lab-openhop-repeater
+    restart: unless-stopped
+    stop_grace_period: 30s
+    user: "1000:1000"
+    command:
+      [
+        "python3",
+        "-m",
+        "repeater.plugins.container_supervisor",
+        "--config",
+        "/etc/openhop_repeater/config.yaml",
+      ]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TZ: UTC
+      # Persistent state: SQLite companion store + the repeater identity
+      # file. The volume survives `docker compose down`.
+      DATA_DIR: /var/lib/openhop_repeater
+    volumes:
+      # The generated config (from lab/config/openhop-repeater.yaml with
+      # the identity/credential placeholders substituted). Read-only: the
+      # repeater never rewrites the contract config.
+      - type: bind
+        source: ./lab/state/config/openhop-repeater.yaml
+        target: /etc/openhop_repeater/config.yaml
+        read_only: true
+      # Pinned local checkouts, mounted read-only and shadowing the baked
+      # install via PYTHONPATH (same dev-shadowing pattern as the MEDRE
+      # image): the running code IS the pinned checkout.
+      - type: bind
+        source: ${OPENHOP_CORE_SRC:?run medre-lab docker prepare}
+        target: /src/openhop-core
+        bind:
+          create_host_path: false
+        read_only: true
+      - type: bind
+        source: ${OPENHOP_REPEATER_SRC:?run medre-lab docker prepare}
+        target: /src/openhop-repeater
+        bind:
+          create_host_path: false
+        read_only: true
+      - openhop-repeater-data:/var/lib/openhop_repeater
+    # Process-liveness healthcheck via /proc only. NEVER probe the
+    # companion TCP port: the companion accepts one client at a time and
+    # evicts the standing one, so a port probe would evict MEDRE.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'for p in /proc/[0-9]*/cmdline; do tr \"\\0\" \"\\n\" < \"$$p\" | grep -qx \"repeater.main\" && exit 0; done; exit 1'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 30s
+    networks: [openhop]
+
+  medre-openhop:
+    <<: *medre-openhop-build
+    profiles: [openhop]
+    container_name: medre-lab-medre-openhop
+    restart: unless-stopped
+    stop_grace_period: 30s
+    user: "1000:1000"
+    command: ["medre", "run", "--config", "/config/medre-openhop.yaml"]
+    environment:
+      MEDRE_HOME: /data
+      PYTHONUNBUFFERED: "1"
+      TZ: UTC
+      # Core src FIRST so its pkgutil.extend_path medre/__init__.py wins
+      # the namespace import and merges the adapter portions.
+      PYTHONPATH: /src/core/src:/src/meshcore/src:/src/meshtastic/src
+    volumes:
+      - type: bind
+        source: ./lab/state/config
+        target: /config
+        read_only: true
+      - type: bind
+        source: ${MEDRE_OPENHOP_SRC:?run medre-lab docker prepare}
+        target: /src/core
+        bind:
+          create_host_path: false
+        read_only: true
+      - type: bind
+        source: ${MEDRE_MESHCORE_SRC:?run medre-lab docker prepare}
+        target: /src/meshcore
+        bind:
+          create_host_path: false
+        read_only: true
+      - type: bind
+        source: ${MEDRE_MESHTASTIC_OPENHOP_SRC:?run medre-lab docker prepare}
+        target: /src/meshtastic
+        bind:
+          create_host_path: false
+        read_only: true
+      - medre-openhop-state:/data
+    # Process-liveness healthcheck via /proc only (never TCP: a probe
+    # would evict the companion's single client).
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'for p in /proc/[0-9]*/cmdline; do tr \"\\0\" \"\\n\" < \"$$p\" | grep -qx \"/usr/local/bin/medre\" && exit 0; done; exit 1'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 30s
+    networks: [openhop, mesh-c]
+    depends_on:
+      openhop-repeater:
+        condition: service_healthy
+      meshtasticd-c-medre:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
+  # openHop VIRTUAL RADIO profile (OPT-IN; profile `openhop-radio`).
+  #
+  # Hardware-free proof that REAL MeshCore packets cross between two
+  # openHop repeaters. The RF MEDIUM is simulated by a lab-owned asyncio
+  # service speaking the openHop Modem protocol; the packets themselves are
+  # real (encrypted by one repeater, decrypted by the other).
+  #
+  #   openhop-radio-relay    the lab's virtual radio relay (asyncio TCP
+  #                          server, openHop Modem protocol). Lab-owned
+  #                          code; no openHop radio backend is touched.
+  #   openhop-repeater-a     openHop repeater with radio_type: modem_tcp,
+  #                          pointed at the relay. Mode `monitor`.
+  #   openhop-repeater-b     the peer repeater (same, own identity, own
+  #                          volume, own companion).
+  #   openhop-radio-probe    one-shot proof container (pinned meshcore
+  #                          2.3.15 SDK) that sends a channel-0 nonce at B
+  #                          and expects exactly one CHANNEL_MSG_RECV at A.
+  #
+  # HARD RULES (owner-set):
+  #   * NO host ports: the companion TCP ports and the relay live only on
+  #     the private `openhop-radio` network.
+  #   * The relay accepts EXACTLY two clients (the two repeaters' radios).
+  #     A TCP healthcheck would occupy a client slot and evict a repeater,
+  #     so every healthcheck below is PROCESS LIVENESS ONLY.
+  #   * No /dev mounts, no devices:, no cap_add, no GPIO/USB groups.
+  #   * The Phase 2 `openhop` profile is untouched by this one.
+  # -------------------------------------------------------------------------
+  openhop-radio-relay:
+    build:
+      context: .
+      dockerfile: lab/openhop-radio/Dockerfile
+    image: medre-lab/openhop-radio-relay:latest
+    profiles: [openhop-radio, openhop-bridge]
+    container_name: medre-lab-openhop-radio-relay
+    restart: unless-stopped
+    stop_grace_period: 15s
+    user: "1000:1000"
+    command:
+      [
+        "python3",
+        "/app/openhop_radio_relay.py",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "5055",
+      ]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TZ: UTC
+    # Process-liveness healthcheck via /proc only. NEVER TCP-probe the
+    # relay: it holds exactly two client slots (the two repeaters' radios)
+    # and a probe connection would evict a repeater.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'for p in /proc/[0-9]*/cmdline; do tr \"\\0\" \"\\n\" < \"$$p\" | grep -qx \"/app/openhop_radio_relay.py\" && exit 0; done; exit 1'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks: [openhop-radio]
+
+  openhop-repeater-a:
+    <<: *openhop-repeater-build
+    profiles: [openhop-radio, openhop-bridge]
+    container_name: medre-lab-openhop-repeater-a
+    restart: unless-stopped
+    stop_grace_period: 30s
+    user: "1000:1000"
+    command:
+      [
+        "python3",
+        "-m",
+        "repeater.plugins.container_supervisor",
+        "--config",
+        "/etc/openhop_repeater/config.yaml",
+      ]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TZ: UTC
+      DATA_DIR: /var/lib/openhop_repeater
+    volumes:
+      - type: bind
+        source: ./lab/state/config/openhop-radio-repeater-a.yaml
+        target: /etc/openhop_repeater/config.yaml
+        read_only: true
+      - type: bind
+        source: ${OPENHOP_CORE_SRC:?run medre-lab docker prepare}
+        target: /src/openhop-core
+        bind:
+          create_host_path: false
+        read_only: true
+      - type: bind
+        source: ${OPENHOP_REPEATER_SRC:?run medre-lab docker prepare}
+        target: /src/openhop-repeater
+        bind:
+          create_host_path: false
+        read_only: true
+      - openhop-radio-a-data:/var/lib/openhop_repeater
+    # Process-liveness healthcheck via /proc only: the companion TCP port
+    # accepts one client at a time and a probe would evict it.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'for p in /proc/[0-9]*/cmdline; do tr \"\\0\" \"\\n\" < \"$$p\" | grep -qx \"repeater.main\" && exit 0; done; exit 1'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 30s
+    networks: [openhop-radio]
+    depends_on:
+      openhop-radio-relay:
+        condition: service_healthy
+
+  openhop-repeater-b:
+    <<: *openhop-repeater-build
+    profiles: [openhop-radio, openhop-bridge]
+    container_name: medre-lab-openhop-repeater-b
+    restart: unless-stopped
+    stop_grace_period: 30s
+    user: "1000:1000"
+    command:
+      [
+        "python3",
+        "-m",
+        "repeater.plugins.container_supervisor",
+        "--config",
+        "/etc/openhop_repeater/config.yaml",
+      ]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TZ: UTC
+      DATA_DIR: /var/lib/openhop_repeater
+    volumes:
+      - type: bind
+        source: ./lab/state/config/openhop-radio-repeater-b.yaml
+        target: /etc/openhop_repeater/config.yaml
+        read_only: true
+      - type: bind
+        source: ${OPENHOP_CORE_SRC:?run medre-lab docker prepare}
+        target: /src/openhop-core
+        bind:
+          create_host_path: false
+        read_only: true
+      - type: bind
+        source: ${OPENHOP_REPEATER_SRC:?run medre-lab docker prepare}
+        target: /src/openhop-repeater
+        bind:
+          create_host_path: false
+        read_only: true
+      - openhop-radio-b-data:/var/lib/openhop_repeater
+    # Process-liveness healthcheck via /proc only (see repeater A).
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'for p in /proc/[0-9]*/cmdline; do tr \"\\0\" \"\\n\" < \"$$p\" | grep -qx \"repeater.main\" && exit 0; done; exit 1'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 30s
+    networks: [openhop-radio]
+    depends_on:
+      openhop-radio-relay:
+        condition: service_healthy
+
+  openhop-radio-probe:
+    <<: *medre-openhop-build
+    profiles: [openhop-radio]
+    # NO container_name: this service is run one-shot (`compose run`), and
+    # `run` cannot use a fixed container name.
+    restart: "no"
+    user: "1000:1000"
+    command:
+      [
+        "python3",
+        "/opt/openhop-radio/openhop_radio_probe.py",
+        "--host-a",
+        "openhop-repeater-a",
+        "--port-a",
+        "5000",
+        "--host-b",
+        "openhop-repeater-b",
+        "--port-b",
+        "5000",
+      ]
+    volumes:
+      - type: bind
+        source: ./lab/tools/openhop_radio_probe.py
+        target: /opt/openhop-radio/openhop_radio_probe.py
+        read_only: true
+    networks: [openhop-radio]
+    depends_on:
+      openhop-repeater-a:
+        condition: service_healthy
+      openhop-repeater-b:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
+  # openHop BRIDGE profile (OPT-IN; profile `openhop-bridge`).
+  #
+  # Phase 3B: MEDRE bridges the openHop radio overlay and MeshC:
+  #
+  #   virtual MC peer (SDK) --TCP 5000--> openhop-repeater-b --+
+  #                                                             | modem relay (lab)
+  #   MEDRE (meshcore) --TCP 5000--------> openhop-repeater-a --+
+  #                                                             | TCP 4403
+  #                             meshtasticd-c-medre -- MeshC -- meshtasticd-c-peer
+  #
+  #   medre-openhop-bridge  the MEDRE runtime whose meshcore adapter is
+  #                          the ONLY client of companion A and whose
+  #                          meshtastic adapter is the only API client of
+  #                          meshtasticd-c-medre. The bidirectional route
+  #                          openhop-a <-> radio-c is enabled ONLY in this
+  #                          profile's config (lab/config/
+  #                          medre-openhop-bridge.yaml).
+  #   openhop-bridge-probe  the one-shot proof container: the virtual
+  #                          MeshCore peer (only client of companion B)
+  #                          plus the independent MeshC observer/injector
+  #                          on meshtasticd-c-peer.
+  #
+  # HARD RULES (owner-set):
+  #   * NO host ports: the companion TCP ports, the relay and the MeshC
+  #     sim nodes live only on the private compose networks.
+  #   * The companion servers accept ONE client at a time and evict the
+  #     previous one: NO healthcheck, readiness probe or test may connect
+  #     to port 5000 while a client is attached. Every healthcheck here
+  #     is PROCESS LIVENESS ONLY.
+  #   * The mesh-c sim nodes accept ONE TCP API client at a time:
+  #     MEDRE owns meshtasticd-c-medre, the probe owns
+  #     meshtasticd-c-peer.
+  #   * No /dev mounts, no devices:, no cap_add, no GPIO/USB groups.
+  # -------------------------------------------------------------------------
+  medre-openhop-bridge:
+    <<: *medre-openhop-build
+    profiles: [openhop-bridge]
+    container_name: medre-lab-medre-openhop-bridge
+    restart: unless-stopped
+    stop_grace_period: 30s
+    user: "1000:1000"
+    command: ["medre", "run", "--config", "/config/medre-openhop-bridge.yaml"]
+    environment:
+      MEDRE_HOME: /data
+      PYTHONUNBUFFERED: "1"
+      TZ: UTC
+      # Core src FIRST so its pkgutil.extend_path medre/__init__.py wins
+      # the namespace import and merges the adapter portions.
+      PYTHONPATH: /src/core/src:/src/meshcore/src:/src/meshtastic/src
+    volumes:
+      - type: bind
+        source: ./lab/state/config
+        target: /config
+        read_only: true
+      - type: bind
+        source: ${MEDRE_OPENHOP_SRC:?run medre-lab docker prepare}
+        target: /src/core
+        bind:
+          create_host_path: false
+        read_only: true
+      - type: bind
+        source: ${MEDRE_MESHCORE_SRC:?run medre-lab docker prepare}
+        target: /src/meshcore
+        bind:
+          create_host_path: false
+        read_only: true
+      - type: bind
+        source: ${MEDRE_MESHTASTIC_OPENHOP_SRC:?run medre-lab docker prepare}
+        target: /src/meshtastic
+        bind:
+          create_host_path: false
+        read_only: true
+      - medre-openhop-bridge-state:/data
+    # Process-liveness healthcheck via /proc only (never TCP: a probe
+    # would evict the companion's single client).
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'for p in /proc/[0-9]*/cmdline; do tr \"\\0\" \"\\n\" < \"$$p\" | grep -qx \"/usr/local/bin/medre\" && exit 0; done; exit 1'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 30s
+    networks: [openhop-radio, mesh-c]
+    depends_on:
+      openhop-repeater-a:
+        condition: service_healthy
+      meshtasticd-c-medre:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
+  # MEDRE under the fault splice (OPT-IN; profile `openhop-fault`).
+  #
+  # This is the Phase 3B MEDRE runtime with ONE difference: its meshcore
+  # adapter's peer is the fault proxy, so the companion link can be made
+  # slow, lossy or broken without touching openHop's code.
+  #
+  # The companion still sees ONE client at a time: this container is the
+  # spliced client, and the bridge MEDRE must be stopped while it runs.
+  # -------------------------------------------------------------------------
+  medre-openhop-fault:
+    <<: *medre-openhop-build
+    profiles: [openhop-fault]
+    container_name: medre-lab-medre-openhop-fault
+    restart: unless-stopped
+    stop_grace_period: 30s
+    user: "1000:1000"
+    command: ["medre", "run", "--config", "/config/medre-openhop-fault.yaml"]
+    environment:
+      MEDRE_HOME: /data
+      PYTHONUNBUFFERED: "1"
+      TZ: UTC
+      PYTHONPATH: /src/core/src:/src/meshcore/src:/src/meshtastic/src
+    volumes:
+      - type: bind
+        source: ./lab/state/config
+        target: /config
+        read_only: true
+      - type: bind
+        source: ${MEDRE_OPENHOP_SRC:?run medre-lab docker prepare}
+        target: /src/core
+        bind:
+          create_host_path: false
+        read_only: true
+      - type: bind
+        source: ${MEDRE_MESHCORE_SRC:?run medre-lab docker prepare}
+        target: /src/meshcore
+        bind:
+          create_host_path: false
+        read_only: true
+      - type: bind
+        source: ${MEDRE_MESHTASTIC_OPENHOP_SRC:?run medre-lab docker prepare}
+        target: /src/meshtastic
+        bind:
+          create_host_path: false
+        read_only: true
+      - medre-openhop-fault-state:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'for p in /proc/[0-9]*/cmdline; do tr \"\\0\" \"\\n\" < \"$$p\" | grep -qx \"/usr/local/bin/medre\" && exit 0; done; exit 1'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 30s
+    networks: [openhop-radio, mesh-c]
+    depends_on:
+      openhop-repeater-a:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
+  # openHop FAULT PROXY profile (OPT-IN; profile `openhop-fault`).
+  #
+  # A TRANSPARENT single-connection TCP splice between the MEDRE client and
+  # openhop-repeater-a:5000.  It forwards every byte in both directions
+  # unchanged and can inject a bounded, scripted fault on the
+  # server -> client direction (delay, drop, close mid-fetch, stall).
+  #
+  # It is NOT a MeshCore client: it never speaks the companion protocol, so
+  # it cannot issue a GET_MSG and cannot stack one on another.  The companion
+  # sees exactly one client (the spliced MEDRE session) at a time.
+  #
+  # No host ports: the splice is reachable only on the private compose
+  # network.
+  # -------------------------------------------------------------------------
+  openhop-fault-proxy:
+    <<: *medre-openhop-build
+    profiles: [openhop-fault]
+    container_name: medre-lab-openhop-fault-proxy
+    restart: "no"
+    user: "${LAB_UID:-1000}:${LAB_GID:-1000}"
+    command:
+      [
+        "python3",
+        "/opt/openhop-fault/openhop_fault_proxy.py",
+        "--listen-host",
+        "0.0.0.0",
+        "--listen-port",
+        "5050",
+        "--upstream-host",
+        "openhop-repeater-a",
+        "--upstream-port",
+        "5000",
+        "--fault-file",
+        "/opt/openhop-fault/fault.json",
+      ]
+    volumes:
+      - type: bind
+        source: ./lab/openhop-radio/openhop_fault_proxy.py
+        target: /opt/openhop-fault/openhop_fault_proxy.py
+        read_only: true
+      # The fault arguments live in a file, not in the command line, so the
+      # proxy can be started by compose: a compose RUN would not give the
+      # container the service's network alias, and the MEDRE client could
+      # not resolve the proxy's name.
+      - type: bind
+        source: ./lab/state/openhop-fault
+        target: /opt/openhop-fault
+    networks: [openhop-radio]
+    depends_on:
+      openhop-repeater-a:
+        condition: service_healthy
+
+  openhop-bridge-probe:
+    <<: *medre-openhop-build
+    profiles: [openhop-bridge]
+    # NO container_name: this service is run one-shot (`compose run`), and
+    # `run` cannot use a fixed container name.
+    restart: "no"
+    user: "1000:1000"
+    environment:
+      # The expected '<node name>: ' prefix on the direction-2 arrival:
+      # repeater A's COMPANION node name (the sending side stamps it on
+      # the wire). bridge_up.sh exports it from the generated config.
+      OPENHOP_BRIDGE_EXPECT_PREFIX: "${OPENHOP_BRIDGE_EXPECT_PREFIX:-}"
+    command:
+      [
+        "python3",
+        "/opt/openhop-bridge/openhop_bridge_probe.py",
+        "--host-b",
+        "openhop-repeater-b",
+        "--port-b",
+        "5000",
+        "--host-peer",
+        "meshtasticd-c-peer",
+        "--port-peer",
+        "4403",
+      ]
+    volumes:
+      - type: bind
+        source: ./lab/tools/openhop_bridge_probe.py
+        target: /opt/openhop-bridge/openhop_bridge_probe.py
+        read_only: true
+    networks: [openhop-radio, mesh-c]
+    depends_on:
+      medre-openhop-bridge:
+        condition: service_healthy
+      meshtasticd-c-peer:
+        condition: service_healthy
+
   lab-tools:
     build:
       context: .
@@ -608,6 +1253,15 @@ networks:
     name: medre-lab-mesh-b
   mesh-c:
     name: medre-lab-mesh-c
+  # Private network for the openHop profile. The companion TCP port lives
+  # here and is never published to the host: only openhop-repeater and
+  # medre-openhop are attached to it.
+  openhop:
+    name: medre-lab-openhop
+  # Private network for the openHop VIRTUAL RADIO profile. The relay and
+  # both repeaters live here; nothing is published to the host.
+  openhop-radio:
+    name: medre-lab-openhop-radio
 
 volumes:
   synapse-data:
@@ -620,6 +1274,21 @@ volumes:
     name: medre-lab-medre-state
   medre-normal-state:
     name: medre-lab-medre-normal-state
+  openhop-repeater-data:
+    name: medre-lab-openhop-repeater-data
+  # Per-repeater state for the virtual radio profile: each repeater owns
+  # its own identity file and SQLite store, so the two nodes stay distinct.
+  openhop-radio-a-data:
+    name: medre-lab-openhop-radio-a-data
+  openhop-radio-b-data:
+    name: medre-lab-openhop-radio-b-data
+  medre-openhop-state:
+    name: medre-lab-medre-openhop-state
+  # The Phase 3B bridge runtime has its own state volume: it is a distinct
+  # MEDRE instance with its own canonical-event store.
+  medre-openhop-fault-state:
+  medre-openhop-bridge-state:
+    name: medre-lab-medre-openhop-bridge-state
   mesh-a-node:
     name: medre-lab-mesh-a-node
   mesh-a-peer-node:

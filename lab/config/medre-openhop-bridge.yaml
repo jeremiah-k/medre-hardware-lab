@@ -1,0 +1,77 @@
+# =============================================================================
+# MEDRE Phase 3B bridge runtime (openHop radio overlay) - contract template.
+#
+# This committed file is the canonical MEDRE configuration for the Phase 3B
+# bridge qualifier. lab/openhop-bridge/bridge_proof.sh copies it to
+# lab/state/config/medre-openhop-bridge.yaml (no substitutions - it carries
+# no secret) and the generated copy is the one mounted read-only into the
+# medre-openhop-bridge container.
+#
+# - ONE meshcore adapter, "openhop-a": the MEDRE <-> openHop companion link
+#   under qualification. MEDRE is the ONLY client of companion A
+#   (openhop-repeater-a:5000) while this config runs.
+# - ONE meshtastic adapter, "radio-c": the MeshC sim endpoint
+#   (meshtasticd-c-medre:4403). MEDRE is the only API client of that node.
+# - NO matrix adapter and NO lxmf adapter: this profile qualifies the
+#   MEDRE bridge between the openHop radio overlay and MeshC, not rooms.
+# - ONE route, "openhop-bridge": openhop-a <-> radio-c, bidirectional, and
+#   ENABLED ONLY HERE. The Phase 2 openhop profile keeps its route disabled
+#   (see lab/config/medre-openhop.yaml) and the default lab rig has no
+#   such route at all: a bidirectional openHop<->MeshC bridge exists only
+#   in this test config.
+# - source_channel/dest_channel are the channel INDEX strings the two
+#   adapters use on the wire ("0"). Pinning both ends keeps wrong-channel
+#   traffic from crossing (the negative case in the proof).
+# - relay_prefix is EXPLICITLY EMPTY on both adapters so the relayed bytes
+#   are exactly the canonical body. openHop's own "<node name>: " wire
+#   prefix is a transport fact of the MeshCore group-text protocol; the
+#   meshcore codec lifts it into native metadata (wire_text) instead of
+#   rewriting the body, so the proof can assert exact bytes.
+# =============================================================================
+
+runtime:
+  name: medre-lab-medre-openhop-bridge
+  shutdown_timeout_seconds: 30
+
+logging:
+  level: DEBUG
+  format: text
+
+storage:
+  backend: sqlite
+  path: "{state}/medre.sqlite"
+
+adapters:
+  meshcore:
+    openhop-a:
+      enabled: true
+      adapter_kind: real
+      connection_type: tcp
+      host: "openhop-repeater-a"
+      port: 5000
+      default_channel: 0
+      origin_label: "OpenHopBridge"
+      relay_prefix: ""
+      message_delay_seconds: 0.5
+
+  meshtastic:
+    radio-c:
+      enabled: true
+      adapter_kind: real
+      connection_type: tcp
+      host: "meshtasticd-c-medre"
+      port: 4403
+      origin_label: "GammaLab"
+      relay_prefix: ""
+      channel_mapping:
+        "0": "LabPrimC"
+        "2": "LabSecC"
+
+routes:
+  openhop-bridge:
+    source_adapters: ["openhop-a"]
+    dest_adapters: ["radio-c"]
+    directionality: bidirectional
+    enabled: true
+    source_channel: "0"
+    dest_channel: "0"

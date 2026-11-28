@@ -351,6 +351,38 @@ def main(argv=None):
         "init", help="copy local config template, without hardware writes"
     )
     commands.add_parser("doctor", help="read-only host/config inventory; no RF")
+    preset = commands.add_parser(
+        "preset", help="save, inspect and load named rig configurations"
+    ).add_subparsers(dest="action", required=True)
+    preset.add_parser("list", help="list the saved rig presets")
+    preset_show = preset.add_parser("show", help="print one preset's recorded choices")
+    preset_show.add_argument("name")
+    preset_save = preset.add_parser(
+        "save", help="record the current rig configuration as a preset"
+    )
+    preset_save.add_argument("name")
+    preset_save.add_argument(
+        "--description",
+        default=None,
+        help="one-line description (default: derived from the topology)",
+    )
+    preset_save.add_argument(
+        "--force", action="store_true", help="overwrite an existing preset of this name"
+    )
+    preset_load = preset.add_parser(
+        "load", help="switch the rig to a preset's recorded configuration"
+    )
+    preset_load.add_argument("name")
+    preset_load.add_argument(
+        "--up",
+        action="store_true",
+        help="bring the preset's recorded topology up after loading",
+    )
+    preset_load.add_argument(
+        "--force",
+        action="store_true",
+        help="discard the current pin set even when no saved preset records it",
+    )
     sources = commands.add_parser("sources").add_subparsers(
         dest="action", required=True
     )
@@ -360,7 +392,11 @@ def main(argv=None):
     docker = commands.add_parser("docker").add_subparsers(dest="action", required=True)
     docker.add_parser("prepare")
     up = docker.add_parser("up")
-    up.add_argument("--profile", choices=("base", "normal", "stress"), default="normal")
+    up.add_argument(
+        "--profile",
+        choices=("base", "normal", "stress", "openhop", "openhop-radio"),
+        default="normal",
+    )
     up.add_argument("--skip-build", action="store_true")
     suite = docker.add_parser("test")
     suite.add_argument("scenarios", nargs="*", default=[])
@@ -442,6 +478,18 @@ def main(argv=None):
             return 0
         if args.command == "doctor":
             return doctor(config)
+        if args.command == "preset":
+            from . import presets
+
+            if args.action == "list":
+                return presets.list_presets(root)
+            if args.action == "show":
+                return presets.show_preset(root, args.name)
+            if args.action == "save":
+                return presets.save_preset(
+                    root, args.name, args.description, args.force
+                )
+            return presets.load_preset(root, args.name, up=args.up, force=args.force)
         if args.command == "hardware":
             if args.action == "run":
                 return hardware(root, config, args.pair, args.role, args.run_root)
@@ -490,8 +538,10 @@ def main(argv=None):
         rig.assert_no_other_rig(root)
         if args.action == "up":
             command = ["bash", "lab/up.sh"]
-            if args.profile != "base":
-                command += ["--normal" if args.profile == "normal" else "--with-medre"]
+            # One topology-to-flag map for docker up and preset load.
+            from .presets import UP_FLAGS
+
+            command += list(UP_FLAGS[args.profile])
             if args.skip_build:
                 command += ["--skip-build"]
         else:
