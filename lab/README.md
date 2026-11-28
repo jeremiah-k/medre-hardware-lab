@@ -58,8 +58,7 @@ made of and nothing else:
   its own up/down transitions across the openHop topologies);
 - `name` and a one-line `description`.
 
-It deliberately records nothing generated. Tokens, PSKs and room ids rotate on
-every provision and live in private state (`lab/state/`,
+It deliberately records nothing generated. Tokens, PSKs and room ids are reused on provision when present and live in private state (`lab/state/`,
 `lab/config/meshnet.env`); `.env`, the manifests and `scenario.env` regenerate
 deterministically from pins + topology. Loading a preset therefore re-derives
 everything instead of copying stale or secret-bearing state.
@@ -75,9 +74,9 @@ Commands:
   by default. Refuses to overwrite an existing preset without `--force`, and
   refuses a bring-up recorded against different lock content: a preset must
   record a pairing that ran.
-- `medre-lab preset load NAME [--up] [--force]` — switch the rig: write
-  `sources.lock.json` from the preset, run `sources fetch` + `docker prepare`,
-  then verify every checkout HEAD against its pin and fail loudly on any
+- `medre-lab preset load NAME [--up] [--force]` — switch the rig: fetch missing
+  checkouts and verify every checkout HEAD against its pin before publishing
+  `sources.lock.json` and running `docker prepare`. Fail loudly on any
   mismatch (the lab never resets existing checkouts; a stale checkout is the
   operator's to fix). If the current lock's pin set differs from the target AND
   matches no saved preset, the load is refused — save the current configuration
@@ -97,7 +96,7 @@ both hold the same pins by design.
 
 A `lab/run-scenarios.sh` run (with at least one scenario that will actually
 execute) stamps a per-run evidence directory — `evidence/scenarios/<ts>` by
-default, or `--evidence-dir DIR` — with the same source-selection record the
+default, or a fresh `--evidence-dir DIR` — with the same source-selection record the
 openHop drivers use, BEFORE any scenario runs. Each executed scenario becomes a
 case file and the run writes an aggregate summary embedding the stamp; a bind
 refusal (dirty lab tree, moved content) stops the run before any scenario can

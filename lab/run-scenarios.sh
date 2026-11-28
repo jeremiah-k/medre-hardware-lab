@@ -23,6 +23,7 @@
 #   python3 lab/tools/openhop_case_summary.py --verify-selection <dir> --profile scenarios
 # =============================================================================
 set -uo pipefail
+umask 077
 
 LAB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCENARIO_DIR="${LAB_ROOT}/scenarios"
@@ -110,7 +111,14 @@ done
 declare -a RUNNABLE=()
 for name in "${SELECTED[@]}"; do
 	[[ -n ${DEFERRED_SCENARIOS[${name}]-} ]] && continue
-	[[ -f ${SCENARIO_DIR}/scenario-${name}.sh ]] && RUNNABLE+=("${name}")
+	if [[ ! ${name} =~ ^[a-zA-Z0-9_-]+$ ]]; then
+		echo "ERROR: invalid scenario name ${name}" >&2
+		exit 2
+	fi
+	if [[ -f ${SCENARIO_DIR}/scenario-${name}.sh ]]; then
+		git -C "${LAB_ROOT}" ls-files --error-unmatch "scenarios/scenario-${name}.sh" >/dev/null || exit 1
+		RUNNABLE+=("${name}")
+	fi
 done
 BOUND=0
 if ((${#RUNNABLE[@]} > 0)); then
@@ -124,6 +132,7 @@ if ((${#RUNNABLE[@]} > 0)); then
 	fi
 fi
 
+declare -a PASSED=()
 declare -a RESULT_NAMES=()
 declare -a RESULT_STATUS=()
 declare -a RESULT_LOGS=()
@@ -157,11 +166,16 @@ for name in "${SELECTED[@]}"; do
 	echo "--- scenario: ${name} ---"
 	set +e
 	"${script}" 2>&1 | tee "${log_file}"
-	status=${PIPESTATUS[0]}
+	pipeline_status=("${PIPESTATUS[@]}")
+	status=${pipeline_status[0]}
+	if ((pipeline_status[1] != 0)); then
+		status=1
+	fi
 	set -e
 	case "${status}" in
 	0)
 		verdict="PASS"
+		PASSED+=("${name}")
 		;;
 	2)
 		verdict="SKIP"
@@ -207,5 +221,8 @@ echo "==================================================================="
 
 if ((FAILED > 0)); then
 	exit 1
+fi
+if ((BOUND && ${#PASSED[@]} > 0)); then
+	python3 "${LAB_ROOT}/lab/scenario_evidence.py" --complete "${EVIDENCE_DIR}" "${PASSED[@]}" >/dev/null || exit 1
 fi
 exit 0

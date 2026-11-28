@@ -37,6 +37,7 @@ LAB_ROOT = Path(__file__).resolve().parents[2]
 SUMMARY_NAME = "summary.json"
 SCOPE_NAME = "source-selection.json"
 CARRY_FORWARD_NAME = "selection-carry-forward.json"
+SCENARIO_COMPLETE_NAME = "scenario-run-complete.json"
 
 # The stamp format the first fence wrote: identifiers only. Such stamps
 # are never rewritten; their selection is RECONSTRUCTED from the recorded
@@ -64,14 +65,26 @@ def _run_identifiers(lab_root: Path, revision: str) -> dict:
     return {"lab_revision": revision, "lock_sha256": lock_sha256}
 
 
+def _legacy_selection(lab_root: Path, stamp: dict) -> dict:
+    revision = stamp["lab_revision"]
+    if _run_identifiers(lab_root, revision)["lock_sha256"] != stamp["lock_sha256"]:
+        raise ValueError("recorded lock digest does not match recorded lab revision")
+    return selection.selection_record(lab_root, stamp["profile"], revision=revision)
+
+
 def _stamp_error(stamp: dict) -> str | None:
     """Describe a new-format stamp that is not self-consistent."""
-    if stamp.get("selection_sha256") != selection.selection_digest(stamp):
+    if stamp.get("selection_sha256") not in {
+        selection.selection_digest(stamp),
+        selection.selection_digest(stamp, legacy=True),
+    }:
         return "the recorded stamp is not self-consistent with its fields"
     return None
 
 
-def bind_source_selection(evidence_dir: Path, lab_root: Path, profile: str) -> None:
+def bind_source_selection(
+    evidence_dir: Path, lab_root: Path, profile: str, *, allow_reuse: bool = True
+) -> None:
     """Prevent merging cases produced under different source CONTENT.
 
     The fence binds evidence to the content the selection provides, never
@@ -86,15 +99,16 @@ def bind_source_selection(evidence_dir: Path, lab_root: Path, profile: str) -> N
         raise ValueError("lab source is dirty; commit the qualification harness first")
     revision = selection.head_revision(lab_root)
     record = selection.selection_record(lab_root, profile, revision=revision)
+    selection.assert_live_checkouts(lab_root, revision)
     scope = evidence_dir / SCOPE_NAME
     if scope.exists():
+        if not allow_reuse:
+            raise ValueError("scenario evidence requires a fresh directory")
         stamp = json.loads(scope.read_text(encoding="utf-8"))
         if set(stamp) == LEGACY_STAMP_KEYS:
             # Reconstruct the recorded selection from the recorded lab
             # revision; the stamp itself is never rewritten.
-            recorded = selection.selection_record(
-                lab_root, stamp["profile"], revision=stamp["lab_revision"]
-            )
+            recorded = _legacy_selection(lab_root, stamp)
         else:
             inconsistent = _stamp_error(stamp)
             if inconsistent:
@@ -137,9 +151,7 @@ def verify_selection(
         raise ValueError("the directory records no selection and no case evidence")
     stamp = json.loads(scope.read_text(encoding="utf-8"))
     if set(stamp) == LEGACY_STAMP_KEYS:
-        recorded = selection.selection_record(
-            lab_root, stamp["profile"], revision=stamp["lab_revision"]
-        )
+        recorded = _legacy_selection(lab_root, stamp)
         identifiers = {
             "lab_revision": stamp["lab_revision"],
             "lock_sha256": stamp["lock_sha256"],
@@ -164,7 +176,8 @@ def verify_selection(
     difference = selection.describe_difference(recorded, record)
     if difference is not None:
         raise ValueError(f"source selection differs: {difference}")
-    cases = collect_cases(evidence_dir)
+    built = build_summary(evidence_dir, profile=recorded["profile"])
+    cases = built["cases"]
     if not cases:
         raise ValueError("the directory holds no case evidence")
     names = {case["case"] for case in cases}
@@ -189,6 +202,14 @@ def verify_selection(
         raise ValueError(
             f"{len(failing)} of {len(cases)} cases are not passes ({named})"
         )
+    if recorded["profile"] == "scenarios":
+        completion = evidence_dir / SCENARIO_COMPLETE_NAME
+        if not completion.is_file():
+            raise ValueError("scenario run did not record successful completion")
+        if json.loads(completion.read_text(encoding="utf-8")) != {
+            "passed": sorted(names)
+        }:
+            raise ValueError("scenario completion does not match recorded cases")
     line = f"{len(cases)} cases: {len(cases) - len(failing)} pass"
     entry = {
         "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -201,9 +222,7 @@ def verify_selection(
     if carry.exists():
         history = json.loads(carry.read_text(encoding="utf-8"))
     history.append(entry)
-    write_summary(
-        evidence_dir, build_summary(evidence_dir, profile=recorded["profile"])
-    )
+    write_summary(evidence_dir, built)
     carry.write_text(
         json.dumps(history, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -233,7 +252,12 @@ def collect_cases(evidence_dir: Path, prefix: str = "") -> list[dict]:
     """
     entries: list[dict] = []
     for path in sorted(evidence_dir.glob(f"{prefix}*.json")):
-        if path.name in {SUMMARY_NAME, SCOPE_NAME, CARRY_FORWARD_NAME}:
+        if path.name in {
+            SUMMARY_NAME,
+            SCOPE_NAME,
+            CARRY_FORWARD_NAME,
+            SCENARIO_COMPLETE_NAME,
+        }:
             continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))

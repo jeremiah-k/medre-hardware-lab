@@ -223,11 +223,34 @@ def selection_record(
     return record
 
 
-def selection_digest(record: dict) -> str:
+def assert_live_checkouts(lab_root: Path, revision: str) -> None:
+    """Refuse a run whose checkout bytes do not match its committed pins."""
+    pins = json.loads(lock_bytes_at(lab_root, revision))
+    for key, entry in pins.items():
+        checkout = lab_root / "sources" / key
+        try:
+            top = Path(
+                _git_bytes(checkout, "rev-parse", "--show-toplevel").decode().strip()
+            )
+            if top.resolve() != checkout.resolve():
+                raise ValueError(f"{key}: not a checkout root")
+            if head_revision(checkout) != entry["ref"]:
+                raise ValueError(f"{key}: HEAD differs from qualification pin")
+            if not is_committed_clean(checkout):
+                raise ValueError(f"{key}: tracked source is dirty")
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError(f"{key}: cannot inspect qualification checkout") from exc
+
+
+def selection_digest(record: dict, *, legacy: bool = False) -> str:
     """SHA-256 of the canonical JSON of a record's three content fields."""
     fields = {
         "profile": record["profile"],
-        "pins": record["pins"],
+        "pins": (
+            record["pins"]
+            if legacy
+            else {key: pin["content_sha256"] for key, pin in record["pins"].items()}
+        ),
         "lab_tooling_sha256": record["lab_tooling_sha256"],
     }
     canonical = json.dumps(

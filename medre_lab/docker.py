@@ -109,7 +109,7 @@ OPENHOP_MANIFEST = {
 SOURCE_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+(?:\.git)?")
 
 
-def lock(root):
+def parse_lock(raw):
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -119,24 +119,31 @@ def lock(root):
         return result
 
     data = json.loads(
-        (root / "sources.lock.json").read_text(), object_pairs_hook=unique
+        raw, object_pairs_hook=unique
     )
-    if set(data) != set(SOURCES):
+    if not isinstance(data, dict) or set(data) != set(SOURCES):
         raise ValueError("source lock must name the Docker dependencies for both rigs")
     for name, entry in data.items():
-        if set(entry) != {"url", "ref"} or not re.fullmatch(
-            r"[0-9a-f]{40}", entry["ref"]
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"url", "ref"}
+            or not isinstance(entry["ref"], str)
+            or not re.fullmatch(r"[0-9a-f]{40}", entry["ref"])
         ):
             raise ValueError(f"{name}: exact full commit SHA required")
-        if not SOURCE_URL_RE.fullmatch(entry["url"]):
+        if not isinstance(entry["url"], str) or not SOURCE_URL_RE.fullmatch(entry["url"]):
             raise ValueError(
                 "source URLs must be public HTTPS GitHub URLs without credentials"
             )
     return data
 
 
-def fetch(root):
-    for name, entry in lock(root).items():
+def lock(root):
+    return parse_lock((root / "sources.lock.json").read_bytes())
+
+
+def fetch_checkouts(root, pins):
+    for name, entry in pins.items():
         target = root / "sources" / name
         if not target.exists():
             subprocess.run(
@@ -155,6 +162,10 @@ def fetch(root):
                 check=True,
             )
         # Existing checkouts are deliberately never reset/rebased/cleaned.
+
+
+def fetch(root):
+    fetch_checkouts(root, lock(root))
     prepare(root)
 
 

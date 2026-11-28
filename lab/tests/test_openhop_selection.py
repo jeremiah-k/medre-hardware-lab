@@ -196,8 +196,9 @@ def make_lab(
             "lab/tests/test_driver.py": "def test_driver():\n    assert True\n",
         },
     )
-    for key, (repo, _commit) in pins.items():
-        seed_checkout(lab, key, repo)
+    for key, (repo, commit) in pins.items():
+        checkout = seed_checkout(lab, key, repo)
+        run_git(checkout, "checkout", "--detach", commit)
     head = commit_all(lab, "lab base")
     return lab, head
 
@@ -434,6 +435,7 @@ def test_bind_refuses_a_changed_pin_and_names_the_key(tmp_path):
         },
     )
     commit_all(lab, "re-pin to a content change")
+    run_git(lab / "sources/key-a", "checkout", "--detach", commits["content"])
     with pytest.raises(ValueError, match=r"key-a.*content differs"):
         summary.bind_source_selection(directory, lab, "bridge")
 
@@ -654,3 +656,50 @@ def test_carry_forward_refuses_missing_backlog_cases(tmp_path, capsys):
     assert code == 1
     assert "missing planned cases: c3, c4, c5, c6" in capsys.readouterr().err
     assert not (directory / summary.CARRY_FORWARD_NAME).exists()
+
+
+def test_bind_refuses_wrong_live_head_even_when_pin_object_exists(tmp_path):
+    repo = tmp_path / "repo-a"
+    commits = make_source_repo(repo)
+    lab, _ = make_lab(tmp_path, {"key-a": (repo, commits["base"])})
+    run_git(lab / "sources/key-a", "checkout", "--detach", commits["content"])
+    with pytest.raises(ValueError, match="HEAD differs"):
+        summary.bind_source_selection(evidence_dir(lab), lab, "bridge")
+
+
+def test_selection_digest_ignores_commit_for_byte_identical_repin(tmp_path):
+    repo = tmp_path / "repo-a"
+    commits = make_source_repo(repo)
+    lab, first = make_lab(tmp_path, {"key-a": (repo, commits["base"])})
+    original = selection.selection_record(lab, "bridge", revision=first)
+    lock = json.loads((lab / "sources.lock.json").read_text())
+    lock["key-a"]["ref"] = commits["scaffold"]
+    (lab / "sources.lock.json").write_text(json.dumps(lock))
+    second = commit_all(lab, "equivalent pin")
+    changed = selection.selection_record(lab, "bridge", revision=second)
+    assert original["pins"] != changed["pins"]
+    assert original["selection_sha256"] == changed["selection_sha256"]
+
+
+def test_legacy_stamp_cannot_claim_a_different_lock(tmp_path):
+    lab, directory, _ = bound_legacy_directory(tmp_path)
+    path = directory / summary.SCOPE_NAME
+    stamp = json.loads(path.read_text())
+    stamp["lock_sha256"] = "0" * 64
+    path.write_text(json.dumps(stamp))
+    with pytest.raises(ValueError, match="lock digest"):
+        summary.verify_selection(directory, lab)
+
+
+def test_full_stamp_with_previous_digest_is_recognized(tmp_path):
+    repo = tmp_path / "repo-a"
+    commits = make_source_repo(repo)
+    lab, _ = make_lab(tmp_path, {"key-a": (repo, commits["base"])})
+    directory = evidence_dir(lab)
+    summary.bind_source_selection(directory, lab, "bridge")
+    path = directory / summary.SCOPE_NAME
+    stamp = json.loads(path.read_text())
+    stamp["selection_sha256"] = selection.selection_digest(stamp, legacy=True)
+    path.write_text(json.dumps(stamp))
+    summary.bind_source_selection(directory, lab, "bridge")
+    assert json.loads(path.read_text()) == stamp

@@ -240,8 +240,7 @@ def write_preset(root: Path, name: str, topology: str, pins: dict, suite: list) 
 def stub_fetch(root: Path, repos: Path):
     """rig.fetch minus the network: clone the pinned commits locally."""
 
-    def fetch(target_root):
-        pins = json.loads((Path(target_root) / "sources.lock.json").read_text())
+    def fetch(target_root, pins):
         for name, entry in pins.items():
             checkout = Path(target_root) / "sources" / name
             if checkout.exists():
@@ -252,7 +251,6 @@ def stub_fetch(root: Path, repos: Path):
             subprocess.check_call(
                 ["git", "-C", str(checkout), "checkout", "-q", "--detach", entry["ref"]]
             )
-        rig.prepare(target_root)
 
     return fetch
 
@@ -294,7 +292,7 @@ def test_load_refuses_unrecorded_pins_and_proceeds_through_membership(
     # Recording the live configuration makes the switch legitimate.
     record_bringup(root, "base", [])
     assert presets.save_preset(root, "live-state", None, False) == 0
-    monkeypatch.setattr(presets.rig, "fetch", stub_fetch(root, repos))
+    monkeypatch.setattr(presets.rig, "fetch_checkouts", stub_fetch(root, repos))
     assert presets.load_preset(root, "fake") == 0
     assert json.loads((root / "sources.lock.json").read_text()) == fake_pins
     for key in rig.SOURCES:
@@ -314,7 +312,7 @@ def test_load_is_idempotent_when_pins_already_match(tmp_path, monkeypatch, capsy
     (root / "sources.lock.json").write_text(json.dumps(fake_pins, indent=2) + "\n")
     record_bringup(root, "base", [])
     presets.save_preset(root, "same-pins", None, False)
-    monkeypatch.setattr(presets.rig, "fetch", stub_fetch(root, repos))
+    monkeypatch.setattr(presets.rig, "fetch_checkouts", stub_fetch(root, repos))
     assert presets.load_preset(root, "fake") == 0
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert summary["lock_changed"] is False
@@ -328,7 +326,7 @@ def test_load_force_discards_unrecorded_pins(tmp_path, monkeypatch):
     fake_pins = make_fake_pins(repos)
     root = build_lab_root(tmp_path)
     write_preset(root, "fake", "base", fake_pins, ["scenarios"])
-    monkeypatch.setattr(presets.rig, "fetch", stub_fetch(root, repos))
+    monkeypatch.setattr(presets.rig, "fetch_checkouts", stub_fetch(root, repos))
     assert presets.load_preset(root, "fake", force=True) == 0
     assert json.loads((root / "sources.lock.json").read_text()) == fake_pins
 
@@ -375,7 +373,41 @@ def test_cli_load_wiring_refuses_and_loads(tmp_path, monkeypatch, capsys):
     assert "matches no saved preset" in capsys.readouterr().err
     record_bringup(root, "base", [])
     assert presets.save_preset(root, "live-state", None, False) == 0
-    monkeypatch.setattr(presets.rig, "fetch", stub_fetch(root, repos))
+    monkeypatch.setattr(presets.rig, "fetch_checkouts", stub_fetch(root, repos))
     assert main(["--root", str(root), "preset", "load", "fake"]) == 0
     capsys.readouterr()
     assert json.loads((root / "sources.lock.json").read_text()) == fake_pins
+
+
+def test_rejected_preset_switch_preserves_previous_lock(tmp_path, monkeypatch):
+    repos = tmp_path / "repos"
+    fake_pins = make_fake_pins(repos)
+    root = build_lab_root(tmp_path)
+    original = (root / "sources.lock.json").read_bytes()
+    write_preset(root, "fake", "base", fake_pins, ["scenarios"])
+    monkeypatch.setattr(presets.rig, "fetch_checkouts", lambda *_: None)
+    monkeypatch.setattr(presets.rig, "prepare", lambda *_: pytest.fail("prepare ran"))
+    with pytest.raises(ValueError, match="checkout verification failed"):
+        presets.load_preset(root, "fake", force=True)
+    assert (root / "sources.lock.json").read_bytes() == original
+
+
+def test_failed_prepare_restores_selection_files(tmp_path, monkeypatch):
+    repos = tmp_path / "repos"
+    fake_pins = make_fake_pins(repos)
+    root = build_lab_root(tmp_path)
+    original = (root / "sources.lock.json").read_bytes()
+    write_preset(root, "fake", "base", fake_pins, ["scenarios"])
+    env = root / ".env"
+    env.write_text("original\n")
+    monkeypatch.setattr(presets.rig, "fetch_checkouts", stub_fetch(root, repos))
+
+    def broken_prepare(target):
+        (target / ".env").write_text("changed\n")
+        raise OSError("prepare failed")
+
+    monkeypatch.setattr(presets.rig, "prepare", broken_prepare)
+    with pytest.raises(OSError, match="prepare failed"):
+        presets.load_preset(root, "fake", force=True)
+    assert (root / "sources.lock.json").read_bytes() == original
+    assert env.read_text() == "original\n"

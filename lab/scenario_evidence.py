@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -54,8 +55,12 @@ LABEL = "compose-scenarios"
 def bind(evidence_dir: Path, lab_root: Path) -> Path:
     """Stamp a fresh evidence directory with the current selection."""
     evidence_dir = Path(evidence_dir)
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    case_summary.bind_source_selection(evidence_dir, lab_root, PROFILE)
+    evidence_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if any(evidence_dir.iterdir()):
+        raise ValueError("scenario evidence requires a fresh directory")
+    case_summary.bind_source_selection(
+        evidence_dir, lab_root, PROFILE, allow_reuse=False
+    )
     return evidence_dir / case_summary.SCOPE_NAME
 
 
@@ -66,6 +71,8 @@ def record_case(evidence_dir: Path, name: str, verdict: str, log: str) -> Path |
     (the aggregator requires the identity); SKIP and DEFERRED verdicts
     write nothing -- they did not measure anything.
     """
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+        raise ValueError("invalid scenario name")
     if verdict in ("SKIP", "DEFERRED"):
         return None
     if verdict not in ("PASS", "FAIL"):
@@ -83,6 +90,20 @@ def record_case(evidence_dir: Path, name: str, verdict: str, log: str) -> Path |
     path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    return path
+
+
+def complete(evidence_dir: Path, passed: list[str]) -> Path:
+    """Seal the executed pass set only after the runner finishes successfully."""
+    cases = case_summary.collect_cases(evidence_dir)
+    if not passed or sorted(passed) != sorted(case["case"] for case in cases):
+        raise ValueError("completed pass set differs from recorded cases")
+    if any(case["status"] != "PASS" for case in cases):
+        raise ValueError("cannot complete a failed scenario run")
+    path = evidence_dir / case_summary.SCENARIO_COMPLETE_NAME
+    with path.open("x", encoding="utf-8") as stream:
+        json.dump({"passed": sorted(passed)}, stream)
+        stream.write("\n")
     return path
 
 
@@ -115,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         metavar="EVIDENCE_DIR",
         help="build and write the run's summary from its case files",
     )
+    parser.add_argument("--complete", nargs="+", metavar="VALUE")
     args = parser.parse_args(argv)
     if args.bind is not None:
         print(bind(args.bind, args.lab_root))
@@ -123,6 +145,9 @@ def main(argv: list[str] | None = None) -> int:
         evidence_dir, name, verdict, log = args.record_case
         path = record_case(Path(evidence_dir), name, verdict, log)
         print(path if path is not None else f"{verdict} {name}: no case file")
+        return 0
+    if args.complete is not None:
+        print(complete(Path(args.complete[0]), args.complete[1:]))
         return 0
     if args.write_summary is not None:
         print(write_summary(args.write_summary))

@@ -232,3 +232,35 @@ def test_the_default_evidence_directory_is_per_run(tmp_path: Path):
     assert len(runs) == 1
     assert (runs[0] / "source-selection.json").is_file()
     assert (runs[0] / "summary.json").is_file()
+
+
+def test_a_reused_directory_is_refused_before_a_skipped_rerun(tmp_path):
+    lab = init_lab(tmp_path)
+    evidence = tmp_path / "evidence" / "run"
+    assert run_runner(lab, "--evidence-dir", str(evidence), "demo").returncode == 0
+    previous = (evidence / "demo.json").read_bytes()
+    rerun = run_runner(lab, "--evidence-dir", str(evidence), "skipping")
+    assert rerun.returncode == 1
+    assert "fresh directory" in rerun.stderr
+    assert (evidence / "demo.json").read_bytes() == previous
+    assert not list((lab / "lab/logs/scenarios").glob("skipping-*.log"))
+
+
+def test_untracked_scenario_cannot_produce_evidence(tmp_path):
+    lab = init_lab(tmp_path)
+    script = lab / "scenarios/scenario-untracked.sh"
+    script.write_text(SCENARIO_DEMO)
+    script.chmod(0o755)
+    evidence = tmp_path / "evidence" / "untracked"
+    assert run_runner(lab, "--evidence-dir", str(evidence), "untracked").returncode == 1
+    assert not evidence.exists()
+
+
+def test_partial_scenario_run_cannot_be_carried_forward(tmp_path):
+    lab = init_lab(tmp_path)
+    evidence = tmp_path / "evidence" / "interrupted"
+    assert run_runner(lab, "--evidence-dir", str(evidence), "demo").returncode == 0
+    (evidence / "scenario-run-complete.json").unlink()
+    result = verify(lab, evidence)
+    assert result.returncode == 1
+    assert "successful completion" in result.stderr

@@ -16,7 +16,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,6 +39,8 @@ def write_record(
     topology: str,
     flags: list[str],
     recorded_at: str | None = None,
+    *,
+    expected_lock_sha256: str | None = None,
 ) -> dict:
     """Write lab/state/last-bringup.json and return the record."""
     if topology not in TOPOLOGIES:
@@ -45,16 +49,26 @@ def write_record(
         )
     if not (Path(lab_root) / "sources.lock.json").is_file():
         raise ValueError("sources.lock.json is missing; the record describes no rig")
+    digest = lock_sha256(lab_root)
+    if expected_lock_sha256 is not None and digest != expected_lock_sha256:
+        raise ValueError("source lock changed during bring-up")
     record = {
         "topology": topology,
         "flags": list(flags),
         "recorded_at": recorded_at
         or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "sources_lock_sha256": lock_sha256(lab_root),
+        "sources_lock_sha256": digest,
     }
     target = Path(lab_root) / RECORD_RELPATH
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+    fd, name = tempfile.mkstemp(dir=target.parent, prefix=".last-bringup-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        os.replace(name, target)
+    finally:
+        Path(name).unlink(missing_ok=True)
     return record
 
 
@@ -70,8 +84,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--lab-root", type=Path, default=Path(__file__).resolve().parent.parent
     )
+    parser.add_argument("--expected-lock-sha256")
     args = parser.parse_args(argv)
-    record = write_record(args.lab_root, args.topology, args.flag)
+    record = write_record(
+        args.lab_root,
+        args.topology,
+        args.flag,
+        expected_lock_sha256=args.expected_lock_sha256,
+    )
     print(json.dumps(record, sort_keys=True))
     return 0
 
