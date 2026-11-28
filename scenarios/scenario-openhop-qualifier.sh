@@ -45,13 +45,12 @@ SCENARIO="openhop-qualifier"
 
 # The openHop profile is OPT-IN: without it this scenario is a SKIP, not a
 # failure. The rig must be up in compose profile `openhop`.
-if ! docker compose -f "${LAB_COMPOSE_FILE}" --profile openhop ps \
-	--status running --services 2>/dev/null | grep -Fxq openhop-repeater; then
+running_services="$(docker compose -f "${LAB_COMPOSE_FILE}" --profile openhop ps --status running --services)"
+if ! grep -Fxq openhop-repeater <<<"${running_services}"; then
 	SC_SKIP "openhop profile not running (openhop-repeater is down)" \
 		"REQUIREMENT FOR THE RIG: compose profile 'openhop' up (lab/up.sh --openhop); this scenario is opt-in and is not part of ALL_SCENARIOS"
 fi
-if ! docker compose -f "${LAB_COMPOSE_FILE}" --profile openhop ps \
-	--status running --services 2>/dev/null | grep -Fxq medre-openhop; then
+if ! grep -Fxq medre-openhop <<<"${running_services}"; then
 	SC_SKIP "openhop profile not running (medre-openhop is down)" \
 		"REQUIREMENT FOR THE RIG: compose profile 'openhop' up (lab/up.sh --openhop)"
 fi

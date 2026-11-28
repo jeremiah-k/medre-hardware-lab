@@ -20,7 +20,11 @@ BLE_ADAPTER_DEFAULT = "hci0"
 
 
 def resolve_ble_adapter(
-    hw: dict, error: type[ValueError] = ValueError, *, effective: bool = False
+    hw: dict,
+    error: type[ValueError] = ValueError,
+    *,
+    effective: bool = False,
+    default: str | None = BLE_ADAPTER_DEFAULT,
 ) -> None:
     """Resolve the effective BLE controller into ``hw["ble_adapter"]``.
 
@@ -39,8 +43,8 @@ def resolve_ble_adapter(
         if effective and override != configured:
             raise error(f"{BLE_ADAPTER_ENV} conflicts with the effective configuration")
         hw["ble_adapter"] = override
-    elif configured is None:
-        hw["ble_adapter"] = BLE_ADAPTER_DEFAULT
+    elif configured is None and default is not None and not effective:
+        hw["ble_adapter"] = default
 
 
 def path_from(base: Path, value: str) -> Path:
@@ -79,7 +83,9 @@ def load(path: Path, *, effective: bool = False) -> dict:
             or value <= 0
         ):
             raise ValueError(f"{key} must be finite and positive")
-    resolve_ble_adapter(hw, effective=effective)
+    resolve_ble_adapter(
+        hw, effective=effective, default=BLE_ADAPTER_DEFAULT if "meshcore" in hw else None
+    )
     for kind in TRANSPORTS:
         if kind not in hw:
             continue

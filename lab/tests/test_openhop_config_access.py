@@ -52,7 +52,7 @@ def test_an_effective_acl_entry_makes_the_file_readable(tmp_path, monkeypatch):
     monkeypatch.setattr(access.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def fake_run(command, **_kwargs):
-        assert command == ["/usr/bin/getfacl", "-p", str(path)]
+        assert command == ["/usr/bin/getfacl", "-n", "-p", str(path)]
         return SimpleNamespace(
             returncode=0,
             stdout=f"user:{access.REPEATER_UID}:rwx\t#effective:r--\n",
@@ -83,6 +83,7 @@ def test_an_acl_entry_without_effective_read_is_not_readable(tmp_path, monkeypat
 def test_grant_leaves_a_file_the_identity_already_reads(tmp_path, monkeypatch):
     path = tmp_path / "config.yaml"
     path.write_text("credentials\n", encoding="utf-8")  # owner read, mode 0644
+    path.chmod(0o644)
     mode_before = stat.S_IMODE(os.stat(path).st_mode)
 
     def fail_run(_command, **_kwargs):
@@ -121,7 +122,7 @@ def test_grant_runs_setfacl_and_confirms_the_entry(tmp_path, monkeypatch):
     def fake_run(command, **_kwargs):
         commands.append(command)
         if command[0] == "/usr/bin/setfacl":
-            assert command[1:] == ["-m", f"u:{access.REPEATER_UID}:r", str(path)]
+            assert command[1:] == ["--set", f"u::---,u:{access.REPEATER_UID}:r--,g::---,m::r--,o::---", str(path)]
             granted["now"] = True
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         listing = (
@@ -200,7 +201,7 @@ def test_a_real_acl_grant_on_a_real_file(tmp_path):
         pytest.skip("the filesystem rejects ACLs")
     access.grant(path, uid=reader_uid)
     listed = subprocess.run(
-        ["getfacl", "-p", str(path)], capture_output=True, text=True
+        ["getfacl", "-n", "-p", str(path)], capture_output=True, text=True
     )
     assert f"user:{reader_uid}:" in listed.stdout
     # Still private: the ACL adds the entry, never world access.
@@ -221,6 +222,7 @@ def test_compose_runs_the_repeaters_as_the_module_identity():
 def test_the_cli_checks_a_readable_file(tmp_path):
     readable = tmp_path / "config.yaml"
     readable.write_text("credentials\n", encoding="utf-8")
+    readable.chmod(0o644)
     done = subprocess.run(
         [sys.executable, str(TOOL), "check", str(readable)],
         capture_output=True,

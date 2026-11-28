@@ -99,8 +99,13 @@ write_last_bringup_record() {
 		topology="openhop-radio"
 	fi
 	log "Recording lab/state/last-bringup.json (topology ${topology})"
+	local -a record_args=()
+	local flag
+	for flag in "${FLAGS[@]}"; do
+		record_args+=("--flag=${flag}")
+	done
 	python3 lab/last_bringup.py --topology "${topology}" \
-		${FLAGS[@]+"${FLAGS[@]}"} >/dev/null ||
+		--expected-lock-sha256 "${BRINGUP_LOCK_SHA256}" "${record_args[@]}" >/dev/null ||
 		die "could not record lab/state/last-bringup.json"
 }
 
@@ -262,11 +267,16 @@ fi
 # on absent containers, so this is idempotent. (Raw `docker compose` with both
 # profiles active is NOT guarded here - this enforcement is an up.sh
 # orchestration guarantee, not a compose-level one.)
-log "Ensuring both medre modes' containers are DOWN (single-instance rule)"
-docker compose --profile medre stop medre-relay >/dev/null 2>&1 || true
-docker compose --profile medre stop meshtasticd-a-medre meshtasticd-b-medre >/dev/null 2>&1 || true
-docker compose --profile normal stop medre-normal >/dev/null 2>&1 || true
-docker compose --profile normal stop meshtasticd-c-medre meshtasticd-c-peer >/dev/null 2>&1 || true
+BRINGUP_LOCK_SHA256="$(python3 -c 'import hashlib; from pathlib import Path; print(hashlib.sha256(Path("sources.lock.json").read_bytes()).hexdigest())')"
+rm -f lab/state/last-bringup.json
+log "Ensuring previous MEDRE owners are DOWN (single-instance rule)"
+docker compose --profile openhop-fault stop medre-openhop-fault >/dev/null
+docker compose --profile openhop-bridge stop medre-openhop-bridge >/dev/null
+docker compose --profile openhop stop medre-openhop >/dev/null
+docker compose --profile medre stop medre-relay >/dev/null
+docker compose --profile medre stop meshtasticd-a-medre meshtasticd-b-medre >/dev/null
+docker compose --profile normal stop medre-normal >/dev/null
+docker compose --profile normal stop meshtasticd-c-medre meshtasticd-c-peer >/dev/null
 
 mkdir -p lab/state/config "${LOG_DIR}/scenarios"
 
@@ -426,9 +436,9 @@ PYGEN
 	log "Starting the MeshC sim node (meshtasticd-c-medre)"
 	"${COMPOSE[@]}" up -d meshtasticd-c-medre
 	log "Starting the openHop repeater (radio_type: null)"
-	"${COMPOSE[@]}" up -d openhop-repeater
+	"${COMPOSE[@]}" up -d --force-recreate openhop-repeater
 	log "Starting medre-openhop (meshcore adapter -> openhop-repeater:5000)"
-	"${COMPOSE[@]}" up -d medre-openhop
+	"${COMPOSE[@]}" up -d --force-recreate medre-openhop
 
 	openhop_wait_healthy() {
 		local container=$1 limit=$2 waited=0 state
@@ -610,7 +620,7 @@ PYGEN
 	log "Starting the virtual radio relay"
 	"${COMPOSE[@]}" up -d openhop-radio-relay
 	log "Starting the two openHop repeaters (radio_type: modem_tcp -> the relay)"
-	"${COMPOSE[@]}" up -d openhop-repeater-a openhop-repeater-b
+	"${COMPOSE[@]}" up -d --force-recreate openhop-repeater-a openhop-repeater-b
 
 	openhop_radio_wait_healthy() {
 		local container=$1 limit=$2 waited=0 state

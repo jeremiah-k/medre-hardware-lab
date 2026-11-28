@@ -166,7 +166,7 @@ def load_mixed(config_path: Path, matrix_path: Path) -> dict:
             or value <= 0
         ):
             raise MixedConfigError(f"{key} must be finite and positive")
-    resolve_ble_adapter(hw, error=MixedConfigError)
+    resolve_ble_adapter(hw, error=MixedConfigError, default=None)
 
     mesh = hw["meshcore"]
     if not isinstance(mesh, dict) or set(mesh) != {"addresses", "channel"}:

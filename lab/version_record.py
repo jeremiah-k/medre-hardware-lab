@@ -34,7 +34,7 @@ from pathlib import Path
 
 DEFAULT_FILE = Path("lab/VERSION")
 # A top-level key: at column 0, "name:" optionally followed by a value.
-KEY_RE = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_]*):(?P<value>.*)$")
+KEY_RE = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?P<value>.*)$")
 INDENT = "  "
 
 LOCAL_CANDIDATE = "local-candidate"
@@ -93,6 +93,8 @@ def write(path: Path, preamble: list[str], blocks: list[tuple[str, list[str]]]) 
 
 def set_section(path: Path, section: str, body: list[str]) -> None:
     """REPLACE the named section with the given body (append if it is new)."""
+    if not KEY_RE.fullmatch(f"{section}:") or ":" in section:
+        raise ValueError(f"invalid section name {section!r}")
     preamble, blocks = read(path)
     blocks = [(key, lines) for key, lines in blocks if key != section]
     blocks.append((section, [f"{section}:"] + body))
@@ -105,6 +107,8 @@ def cmd_set(section: str, path: Path, body: list[str]) -> int:
 
 
 def cmd_remove(section: str, path: Path) -> int:
+    if not KEY_RE.fullmatch(f"{section}:") or ":" in section:
+        raise ValueError(f"invalid section name {section!r}")
     preamble, blocks = read(path)
     blocks = [(key, lines) for key, lines in blocks if key != section]
     write(path, preamble, blocks)
@@ -194,6 +198,10 @@ def main(argv: list[str]) -> int:
         print(__doc__, file=sys.stderr)
         return 2
     command = argv[1]
+    if command in {"set", "remove", "show"} and len(argv) >= 3:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", argv[2]):
+            print("invalid section name", file=sys.stderr)
+            return 2
     if command == "set":
         if len(argv) < 3:
             print("set needs a section name", file=sys.stderr)

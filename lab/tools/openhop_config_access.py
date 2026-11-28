@@ -19,6 +19,7 @@ to proceed.
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 import shutil
 import stat
@@ -54,7 +55,7 @@ def acl_readable(path: Path, uid: int) -> bool:
     if getfacl is None:
         return False
     result = subprocess.run(
-        [getfacl, "-p", str(path)],
+        [getfacl, "-n", "-p", str(path)],
         check=False,
         capture_output=True,
         text=True,
@@ -78,7 +79,17 @@ def uid_can_read(path: Path, uid: int = REPEATER_UID) -> bool:
         st = path.stat()
     except OSError:
         return False
-    return stat_readable(st, uid) or acl_readable(path, uid)
+    if st.st_uid == uid:
+        return bool(st.st_mode & stat.S_IRUSR)
+    try:
+        os.getxattr(path, "system.posix_acl_access")
+    except OSError as exc:
+        if exc.errno in {errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP}:
+            return stat_readable(st, uid) or acl_readable(path, uid)
+        return False
+    # Extended ACL group bits are the mask, not group:: permissions.
+    # Require a positive named-user grant (conservative for other entries).
+    return acl_readable(path, uid)
 
 
 def refusal(path: Path, uid: int = REPEATER_UID) -> str:
@@ -94,12 +105,24 @@ def refusal(path: Path, uid: int = REPEATER_UID) -> str:
     )
 
 
+def _owner_perms(path: Path) -> str:
+    mode = path.stat().st_mode
+    return "".join(
+        letter if mode & bit else "-"
+        for letter, bit in (
+            ("r", stat.S_IRUSR),
+            ("w", stat.S_IWUSR),
+            ("x", stat.S_IXUSR),
+        )
+    )
+
+
 def grant(path: Path, uid: int = REPEATER_UID) -> None:
     """Give the repeater identity read access to a written config.
 
     Called right after the chmod that makes the file private.  A file
-    the identity already reads is left untouched; otherwise a single
-    ``setfacl -m u:UID:r`` entry is granted and confirmed effective, or
+    the identity already reads is left untouched; otherwise the private
+    base ACL plus the intended named-reader entry is installed and confirmed, or
     AccessRefused states the file, its owner and mode and the remedies.
     """
     if uid_can_read(path, uid):
@@ -108,7 +131,12 @@ def grant(path: Path, uid: int = REPEATER_UID) -> None:
     if setfacl is None:
         raise AccessRefused(refusal(path, uid))
     result = subprocess.run(
-        [setfacl, "-m", f"u:{uid}:r", str(path)],
+        [
+            setfacl,
+            "--set",
+            f"u::{_owner_perms(path)},u:{uid}:r--,g::---,m::r--,o::---",
+            str(path),
+        ],
         check=False,
         capture_output=True,
         text=True,

@@ -124,6 +124,7 @@ for entry in "${CANDIDATES[@]}"; do
 	fi
 
 	if [[ -n ${bundle} ]]; then
+		[[ ${bundle} == /* ]] || bundle="${LAB_ROOT}/${bundle}"
 		[[ -f ${bundle} ]] || {
 			echo "ERROR: bundle ${bundle} for ${key} does not exist" >&2
 			status=1
@@ -139,6 +140,7 @@ for entry in "${CANDIDATES[@]}"; do
 		fi
 		git -C "${target}" fetch --no-tags "${bundle}" "${ref}"
 	else
+		[[ ${repo} == /* ]] || repo="${LAB_ROOT}/${repo}"
 		[[ -e "${repo}/.git" ]] || {
 			echo "ERROR: local candidate repository ${repo} is missing" >&2
 			status=1

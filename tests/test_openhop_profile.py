@@ -240,6 +240,9 @@ def test_scenario_skips_when_the_profile_is_absent(tmp_path):
         "    image: busybox\n"
         "    command: ['true']\n"
     )
+    docker = tmp_path / "docker"
+    docker.write_text("#!/bin/sh\nprintf 'unrelated\\n'\n")
+    docker.chmod(0o755)
     scenario = ROOT / "scenarios/scenario-openhop-qualifier.sh"
     assert scenario.exists()
     result = subprocess.run(
@@ -249,7 +252,8 @@ def test_scenario_skips_when_the_profile_is_absent(tmp_path):
         cwd=ROOT,
         timeout=120,
         check=False,
-        env={**os.environ, "LAB_COMPOSE_FILE": str(compose_file)},
+        env={**os.environ, "LAB_COMPOSE_FILE": str(compose_file),
+             "PATH": f"{tmp_path}:{os.environ['PATH']}"},
     )
     assert result.returncode == 2, result.stdout + result.stderr
     assert "SKIP" in (result.stdout + result.stderr)

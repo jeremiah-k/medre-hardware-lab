@@ -175,6 +175,7 @@ python3 lab/tools/openhop_config_access.py grant \
 
 # The MEDRE bridge config carries no secret: it is copied verbatim.
 cp lab/config/medre-openhop-bridge.yaml lab/state/config/medre-openhop-bridge.yaml
+chmod 0644 lab/state/config/medre-openhop-bridge.yaml
 echo "  lab/state/config/medre-openhop-bridge.yaml generated"
 
 # The expected openHop wire prefix on the direction-2 arrival is repeater
@@ -293,9 +294,9 @@ python3 lab/openhop_pins.py "${LAB_SOURCE_MANIFEST_OPENHOP}" \
 
 # The image IDs are the ones that actually ran; the build args are the ones
 # the images were built with.
-OPENHOP_IMAGE_ID="$(docker image inspect --format '{{.Id}}' medre-lab/openhop-repeater:latest 2>/dev/null || echo unknown)"
-MEDRE_IMAGE_ID="$(docker image inspect --format '{{.Id}}' medre-lab/medre-openhop-dev:latest 2>/dev/null || echo unknown)"
-RELAY_IMAGE_ID="$(docker image inspect --format '{{.Id}}' medre-lab/openhop-radio-relay:latest 2>/dev/null || echo unknown)"
+OPENHOP_IMAGE_ID="$(docker inspect --format '{{.Image}}' medre-lab-openhop-repeater-a)"
+MEDRE_IMAGE_ID="$(docker inspect --format '{{.Image}}' medre-lab-medre-openhop-bridge)"
+RELAY_IMAGE_ID="$(docker inspect --format '{{.Image}}' medre-lab-openhop-radio-relay)"
 
 python3 lab/version_record.py set openhop_bridge <<EOF
   source_pins: see the openhop_sources section (the SAME checkouts this rig builds and runs from)
