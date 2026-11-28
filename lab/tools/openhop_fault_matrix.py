@@ -138,9 +138,9 @@ import os
 import re
 import subprocess
 import sys
-import threading
 import time
 import uuid
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 
@@ -152,10 +152,13 @@ if _TOOLS_DIR not in sys.path:
 import openhop_case_summary as case_summary  # noqa: E402
 from openhop_fault_settings import write_fault  # noqa: E402
 from openhop_observe import (  # noqa: E402
+    command_budget,
     empty_reply_after,
     reconnect_after,
     scoped_log_line,
+    wait_until,
 )
+from openhop_peer_send import PeerSender, peer_send_command  # noqa: E402
 
 LAB_ROOT = Path(__file__).resolve().parents[2]
 TOOLS = LAB_ROOT / "lab" / "tools"
@@ -202,7 +205,9 @@ def utcnow() -> str:
 
 
 def run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=command_budget(timeout)
+    )
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -220,7 +225,7 @@ def run_merged(cmd: list[str], timeout: int = 600) -> tuple[int, str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        timeout=timeout,
+        timeout=command_budget(timeout),
     )
     return proc.returncode, proc.stdout
 
@@ -231,7 +236,9 @@ def container_running(name: str) -> bool:
 
 
 def container_logs(name: str) -> str:
-    _, merged = run_merged(["docker", "logs", name], timeout=120)
+    rc, merged = run_merged(["docker", "logs", name], timeout=120)
+    if rc:
+        raise RuntimeError(f"could not read logs from {name} (exit {rc})")
     return merged
 
 
@@ -244,7 +251,9 @@ def timestamped_logs(name: str) -> str:
     read through one merged pipe, so the timestamps order the lines as
     the container wrote them.
     """
-    _, merged = run_merged(["docker", "logs", "-t", name], timeout=120)
+    rc, merged = run_merged(["docker", "logs", "-t", name], timeout=120)
+    if rc:
+        raise RuntimeError(f"could not read timestamped logs from {name} (exit {rc})")
     return merged
 
 
@@ -972,6 +981,7 @@ def reconnect_case_failures(
         )
     return failures
 
+
 def selective_order_failures(events: list[dict]) -> list[str]:
     """A future probe reply cannot authorize an earlier destructive fetch."""
     credits: dict[int, int] = {}
@@ -1306,12 +1316,7 @@ class FaultMatrix:
             raise RuntimeError("the fault splice did not announce a listening socket")
 
     def wait_for(self, predicate, timeout: float, interval: float = 1.0) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if predicate():
-                return time.monotonic() <= deadline
-            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
-        return False
+        return wait_until(predicate, timeout, interval)
 
     def observe(self, name: str, predicate, timeout: float) -> bool:
         started = time.monotonic()
@@ -1356,6 +1361,55 @@ class FaultMatrix:
             return empty_reply_after(timestamped_logs(PROXY), since)
 
         return self.observe("delivery-and-empty-queue", complete, timeout)
+
+    def freeze_fault_medre(self, prefix: str) -> tuple[float, str, list[dict]]:
+        """Stop the client and keep its volume available for a final read."""
+        if run(["docker", "stop", MEDRE_FAULT], timeout=45)[0]:
+            raise RuntimeError("could not stop the fault client for accounting")
+        rc, inspected, _ = run(
+            ["docker", "inspect", "--type", "container", MEDRE_FAULT], timeout=15
+        )
+        if rc:
+            raise RuntimeError("could not inspect the stopped fault client")
+        container = json.loads(inspected)[0]
+        state = container["State"]
+        frozen_at = line_time(f"{state['FinishedAt']} stopped")
+        if state["Running"] is not False or frozen_at is None or frozen_at <= 0:
+            raise RuntimeError("Docker did not attest that the fault client stopped")
+        logs = timestamped_logs(container["Id"])
+        rc, output, _ = run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--user",
+                "1000:1000",
+                "--volumes-from",
+                f"{container['Id']}:ro",
+                "-v",
+                f"{STATE_TOOL}:/opt/lab-store-snapshot.py:ro",
+                "--entrypoint",
+                "python3",
+                container["Image"],
+                "/opt/lab-store-snapshot.py",
+                "--mode",
+                "medre",
+                "--needle",
+                prefix,
+            ],
+            timeout=45,
+        )
+        if rc:
+            raise RuntimeError("could not read the stopped fault client's store")
+        snapshot = json.loads(output)
+        events = (
+            snapshot.get("canonical_events") if isinstance(snapshot, dict) else None
+        )
+        if not isinstance(events, list) or "error" in snapshot:
+            raise RuntimeError("invalid stopped fault-client store snapshot")
+        return frozen_at, logs, events
 
     def stop_fault_medre(self) -> None:
         run(["docker", "rm", "-f", MEDRE_FAULT], timeout=180)
@@ -1783,20 +1837,10 @@ class FaultMatrix:
                 # so a second consumed message (the next probe's fetch) is
                 # spanned too.
                 time.sleep(PROBE_INTERVAL_S)
-                # FREEZE before accounting: the observation ends when the
-                # fault MEDRE stops.  Capture its log and its store while
-                # it is up, stop it, take the store snapshot that ends the
-                # observation, and read the splice log ONCE; every count
-                # below derives from those reads, and splice events after
-                # the freeze are not accounted.  Accounting from reads
-                # taken at the attach would miss everything the link
-                # consumed DURING the observation.
-                stamped_medre_log = timestamped_logs(MEDRE_FAULT)
-                events = (
-                    state_in(MEDRE_FAULT, "medre", prefix).get("canonical_events") or []
-                )
-                freeze_at = time.time()
-                self.stop_fault_medre()
+                # Use Docker's actual exit boundary and read the client
+                # store after its final writes. Keep the stopped container
+                # until the reader has used its exact image and volume.
+                freeze_at, stamped_medre_log, events = self.freeze_fault_medre(prefix)
                 observation_end = self.companion_queue_snapshot("observation_end")
                 queue_snapshots.append(observation_end)
                 link_events = [
@@ -1871,6 +1915,7 @@ class FaultMatrix:
                 )
                 failures.extend(selective_order_failures(link_events))
                 connection_evidence = {
+                    "client_stopped_at_epoch": freeze_at,
                     "link_definition": (
                         "the splice forwards the handshake and the "
                         "liveness-probe (device-query) replies and swallows "
@@ -2272,8 +2317,9 @@ class FaultMatrix:
                 },
             )
         except Exception as exc:  # pragma: no cover - defensive
-            self.capture_case_logs(name)
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+            with suppress(OSError, RuntimeError, subprocess.SubprocessError):
+                self.capture_case_logs(name)
         finally:
             if fault_path is not None:
                 write_fault(fault_path, {})
@@ -2348,6 +2394,7 @@ class FaultMatrix:
         state_dir = LAB_ROOT / "lab/state/openhop-fault"
         state_dir.mkdir(parents=True, exist_ok=True)
         fault_path = None
+        sender: PeerSender | None = None
         try:
             self.stop_bridge_medre()
             self.stop_fault_medre()
@@ -2376,15 +2423,12 @@ class FaultMatrix:
                     name, "the initial receive drain did not reach an empty queue"
                 )
                 return
-            send: dict = {}
-            sending = threading.Event()
-
-            def queue_backlog() -> None:
-                sending.set()
-                send.update(self.peer_send(count, prefix))
-
-            sender = threading.Thread(target=queue_backlog, daemon=True)
-            sender.start()
+            sender = PeerSender()
+            sender.start(
+                peer_send_command(
+                    "openhop-bridge", count, prefix, 4.0, "openhop-repeater-b"
+                )
+            )
             # Arm at the first OBSERVED delivery.  Whether a fetch is in
             # flight at that instant is not observable, so the verdict
             # asserts the bound instead of naming the swallowed frame.
@@ -2418,7 +2462,8 @@ class FaultMatrix:
                 )
                 return
             # The rest of the backlog queues while the fault holds.
-            sender.join(timeout=600)
+            send = sender.collect(timeout=600)
+            self.record_peer_pacing(send)
             if time.time() < window_end:
                 time.sleep(window_end - time.time())
             write_fault(state_dir / "fault.json", {})
@@ -2559,11 +2604,14 @@ class FaultMatrix:
                 },
             )
         except Exception as exc:  # pragma: no cover - defensive
-            self.capture_case_logs(name)
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+            with suppress(OSError, RuntimeError, subprocess.SubprocessError):
+                self.capture_case_logs(name)
 
         # -- the silent dead-link case ---------------------------------------
         finally:
+            if sender is not None:
+                sender.close()
             if fault_path is not None:
                 write_fault(fault_path, {})
 
@@ -2752,8 +2800,9 @@ class FaultMatrix:
                 },
             )
         except Exception as exc:  # pragma: no cover - defensive
-            self.capture_case_logs(name)
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+            with suppress(OSError, RuntimeError, subprocess.SubprocessError):
+                self.capture_case_logs(name)
         finally:
             if fault_path is not None:
                 write_fault(fault_path, {})
@@ -2945,8 +2994,9 @@ class FaultMatrix:
                 },
             )
         except Exception as exc:  # pragma: no cover - defensive
-            self.capture_case_logs(name)
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+            with suppress(OSError, RuntimeError, subprocess.SubprocessError):
+                self.capture_case_logs(name)
         finally:
             if fault_path is not None:
                 write_fault(fault_path, {})
@@ -3008,7 +3058,10 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="stop after the first case that does not pass",
     )
+    parser.add_argument("--validate-only", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.validate_only:
+        return 0
 
     matrix = FaultMatrix(Path(args.evidence_dir))
     matrix.selective_drop_passthrough = args.selective_drop_passthrough

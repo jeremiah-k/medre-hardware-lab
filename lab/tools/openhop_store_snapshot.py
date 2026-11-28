@@ -27,6 +27,7 @@ import hashlib
 import json
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
 
 REPEATER_DB = Path("/var/lib/openhop_repeater/repeater.db")
@@ -64,10 +65,10 @@ def repeater_state(args) -> dict:
         messages = rows(
             conn,
             "SELECT id, companion_hash, text, is_channel, channel_idx, "
-            "packet_hash, created_at FROM companion_messages ORDER BY id",
+            "packet_hash, created_at FROM companion_messages "
+            "WHERE instr(coalesce(text, ''), ?) > 0 OR ? = '' ORDER BY id",
+            (args.needle, args.needle),
         )
-        if args.needle:
-            messages = [m for m in messages if args.needle in str(m.get("text") or "")]
         out["companion_message_count"] = len(messages)
         out["companion_messages"] = messages
         out["companion_message_total"] = rows(
@@ -91,17 +92,26 @@ def medre_state(args) -> dict:
 
     conn = open_ro(MEDRE_DB)
     try:
+        # The pinned MEDRE schema uses an ordinary SQLite rowid table
+        # and leaves its rowid unset on insert. Use the observed insertion
+        # order within the snapshot, independent of clock ties or reversal.
         events = rows(
             conn,
             "SELECT event_id, event_kind, source_adapter, source_channel_id, "
             "source_transport_id, source_native_adapter, source_native_channel_id, "
             "source_native_message_id, payload, metadata, created_at "
-            "FROM canonical_events ORDER BY created_at",
+            "FROM canonical_events ORDER BY rowid",
         )
         if args.since:
-            events = [e for e in events if str(e.get("created_at") or "") >= args.since]
+            since = datetime.fromisoformat(args.since)
+            events = [
+                e for e in events if datetime.fromisoformat(e["created_at"]) >= since
+            ]
         if args.until:
-            events = [e for e in events if str(e.get("created_at") or "") <= args.until]
+            until = datetime.fromisoformat(args.until)
+            events = [
+                e for e in events if datetime.fromisoformat(e["created_at"]) <= until
+            ]
         if args.needle:
             events = [e for e in events if args.needle in json.dumps(e, sort_keys=True)]
         out["canonical_event_count"] = len(events)
@@ -110,13 +120,14 @@ def medre_state(args) -> dict:
             conn, "SELECT COUNT(*) AS n FROM canonical_events"
         )[0]["n"]
 
+        event_ids = (json.dumps([event["event_id"] for event in events]),)
         refs = rows(
             conn,
             "SELECT event_id, adapter, native_channel_id, native_message_id, "
-            "direction, created_at FROM native_message_refs ORDER BY created_at",
+            "direction, created_at FROM native_message_refs "
+            "WHERE event_id IN (SELECT value FROM json_each(?)) ORDER BY created_at",
+            event_ids,
         )
-        event_ids = {event["event_id"] for event in events}
-        refs = [ref for ref in refs if ref["event_id"] in event_ids]
         out["native_message_ref_count"] = len(refs)
         out["native_message_refs"] = refs
 
@@ -124,9 +135,10 @@ def medre_state(args) -> dict:
             conn,
             "SELECT receipt_id, event_id, route_id, target_adapter, target_channel, "
             "status, receipt_kind, adapter_message_id, capability_level, "
-            "delivery_strategy, created_at FROM delivery_receipts ORDER BY created_at",
+            "delivery_strategy, created_at FROM delivery_receipts "
+            "WHERE event_id IN (SELECT value FROM json_each(?)) ORDER BY created_at",
+            event_ids,
         )
-        receipts = [receipt for receipt in receipts if receipt["event_id"] in event_ids]
         out["delivery_receipt_count"] = len(receipts)
         out["delivery_receipts"] = receipts
     finally:
@@ -144,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         out = repeater_state(args) if args.mode == "repeater" else medre_state(args)
-    except (OSError, sqlite3.Error) as exc:
+    except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
         out = {
             "mode": args.mode,
             "error": f"store snapshot failed: {type(exc).__name__}",

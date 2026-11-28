@@ -116,6 +116,7 @@ while (($# > 0)); do
 		;;
 	esac
 done
+python3 lab/tools/openhop_fault_matrix.py --validate-only --case "${CASE}" ${PASSTHROUGH}
 umask 077
 mkdir -p "${EVIDENCE_DIR}"
 

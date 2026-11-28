@@ -33,7 +33,7 @@ def test_nonce_index_extracts_the_marker_index():
 def test_nonce_marker_keeps_the_unique_tail():
     """The unique tail is what makes one message one message."""
     assert matrix.nonce_marker("p4c1-17-9f2ab1") == "p4c1-17-9f2ab1"
-    assert matrix.nonce_marker("p4c1-17-other") != "p4c1-17-9f2ab1"
+    assert matrix.nonce_marker("p4c1-17-aaaa11") == "p4c1-17-aaaa11"
 
 
 def test_nonce_index_ignores_text_without_a_marker():
@@ -45,7 +45,7 @@ def test_nonce_index_ignores_text_without_a_marker():
 def test_count_nonce_rows_counts_corrupted_duplicates():
     rows = [
         {"text": "p4c1-0-aaaa"},
-        {"text": "p4c1-0-aaaa"},  # a duplicate, rendered the same
+        {"text": "altered: p4c1-0-aaaa"},  # a duplicate with a bad rendering
         {"text": "p4c1-1-cccc"},
         {"text": "unrelated"},
     ]

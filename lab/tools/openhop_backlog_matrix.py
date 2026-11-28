@@ -84,7 +84,6 @@ import select
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import uuid
 from datetime import datetime
@@ -97,7 +96,14 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 import openhop_case_summary as case_summary  # noqa: E402
 from openhop_fault_settings import write_fault  # noqa: E402
-from openhop_observe import empty_reply_after  # noqa: E402
+from openhop_observe import (  # noqa: E402
+    command_budget,
+    empty_reply_after,
+    scoped_log_line,
+    wait_until,
+    withheld_markers,
+)
+from openhop_peer_send import PeerSender, peer_send_command  # noqa: E402
 
 LAB_ROOT = Path(__file__).resolve().parents[2]
 TOOLS = LAB_ROOT / "lab" / "tools"
@@ -133,7 +139,9 @@ def utcnow() -> str:
 
 
 def run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=command_budget(timeout)
+    )
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -671,11 +679,13 @@ def container_logs(name: str, *, timestamps: bool = False) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=120,
+            timeout=command_budget(120),
             check=True,
         )
         return result.stdout
-    _, out, err = run(["docker", "logs", name], timeout=120)
+    rc, out, err = run(["docker", "logs", name], timeout=120)
+    if rc:
+        raise RuntimeError(f"could not read logs from {name} (exit {rc})")
     return out + err
 
 
@@ -688,32 +698,7 @@ def peer_send(
     timeout: int = 1800,
 ) -> dict:
     """Send N unique nonces from a one-shot SDK client on the peer companion."""
-    cmd = [
-        "docker",
-        "compose",
-        "--profile",
-        profile,
-        "run",
-        "--rm",
-        "--no-deps",
-        "-v",
-        f"{PEER_PROBE}:/opt/openhop-peer-probe/openhop_peer_probe.py:ro",
-        "openhop-bridge-probe",
-        "python3",
-        "/opt/openhop-peer-probe/openhop_peer_probe.py",
-        "--mode",
-        "send",
-        "--host-b",
-        host,
-        "--port-b",
-        "5000",
-        "--count",
-        str(count),
-        "--prefix",
-        prefix,
-        "--settle",
-        str(settle),
-    ]
+    cmd = peer_send_command(profile, count, prefix, settle, host)
     rc, out, err = run(cmd, timeout=timeout)
     text = out.strip()
     start = text.find("{")
@@ -830,12 +815,7 @@ class Matrix:
         }
 
     def wait_for(self, predicate, timeout: float, interval: float = 1.0) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if predicate():
-                return time.monotonic() <= deadline
-            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
-        return False
+        return wait_until(predicate, timeout, interval)
 
     def medre_events(
         self,
@@ -1009,7 +989,9 @@ class Matrix:
             a_rx_after = container_logs(REPEATER_A).count("RX GRP_TXT")
             failures: list[str] = []
             if send.get("pass") is not True or accepted != count or len(mine) != count:
-                failures.append("the peer did not accept the complete requested workload")
+                failures.append(
+                    "the peer did not accept the complete requested workload"
+                )
             if persisted_count == 0:
                 failures.append(
                     "the repeater persisted no nonce-bearing message "
@@ -1087,6 +1069,7 @@ class Matrix:
         restore_bridge = False
         splice_up = False
         config_backup = None
+        live_sender: PeerSender | None = None
         try:
             if not container_running(MEDRE_BRIDGE):
                 self.not_run(name, "the MEDRE bridge container is not running")
@@ -1113,7 +1096,9 @@ class Matrix:
             back_send = peer_send(self.profile, backlog, back_prefix, settle=3.0)
             back_markers = sent_markers(back_send)
             rows, _ = self.repeater_queue(REPEATER_A, back_prefix)
-            persisted_count, persisted_markers = count_nonce_rows(rows, only=back_markers)
+            persisted_count, persisted_markers = count_nonce_rows(
+                rows, only=back_markers
+            )
             # Wire the client link through the splice BEFORE MEDRE starts:
             # the client resolves the peer's name once, at connect time.
             self.start_splice({"delay_ms": delay_ms})
@@ -1139,31 +1124,26 @@ class Matrix:
             # then delivers the live messages after the backlog, in arrival
             # order - which is exactly the order contract the verdict
             # asserts.
-            live_send: dict = {}
-            live_armed = threading.Event()
-
-            def queue_live() -> None:
-                live_armed.set()
-                live_send.update(peer_send(self.profile, live, live_prefix, settle=8.0))
-
             live_armed_at = None
-            live_sender = None
             deadline = time.monotonic() + 600
             while time.monotonic() < deadline:
                 if len(self.medre_events(back_prefix, only=back_markers)) > 0:
                     live_armed_at = time.time()
-                    live_sender = threading.Thread(target=queue_live, daemon=True)
-                    live_sender.start()
+                    live_sender = PeerSender()
+                    live_sender.start(
+                        peer_send_command(
+                            self.profile, live, live_prefix, 8.0, "openhop-repeater-b"
+                        )
+                    )
                     break
                 time.sleep(0.5)
-            if live_armed_at is None:
+            if live_sender is None:
                 self.not_run(
                     name,
                     "no backlog delivery was observed at MEDRE; no live "
                     "traffic to overlap the drain with",
                 )
                 return
-            live_armed.wait(timeout=10)
             # The backlog keeps draining while the live batch sends.
             self.wait_for(
                 lambda: len(self.medre_events(back_prefix, only=back_markers))
@@ -1174,7 +1154,7 @@ class Matrix:
             # The live batch must be COMPLETE before the markers are read,
             # or the delivery waits and the recorded order would miss the
             # batch's late messages.
-            live_sender.join(timeout=600)
+            live_send = live_sender.collect(timeout=600)
             live_markers_sent = sent_markers(live_send)
             self.wait_for(
                 lambda: len(self.medre_events(back_prefix, only=back_markers))
@@ -1187,9 +1167,8 @@ class Matrix:
                 self.not_run(name, "the peer did not accept the complete live batch")
                 return
             # One combined snapshot keeps the recorded arrival order across
-            # both kinds: the order contract reads this order (the store
-            # returns canonical_events ORDER BY created_at), so two
-            # separately-ordered reads would not do.
+            # both kinds. The store returns SQLite insertion order, so two
+            # separately-ordered reads would not establish a merged order.
             mine = back_markers | live_markers_sent
             events = self.medre_events("p4c2", only=mine)
             markers = [
@@ -1300,6 +1279,8 @@ class Matrix:
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
         finally:
+            if live_sender is not None:
+                live_sender.close()
             if config_backup is not None:
                 bridge_config.write_text(config_backup, encoding="utf-8")
             if splice_up:
@@ -1608,8 +1589,11 @@ class Matrix:
                 self.not_run(name, "the fault MEDRE never completed its first connect")
                 return
             phasing_started = time.monotonic()
+            phasing_at = time.time()
             fresh_probe_phasing = self.wait_for(
-                lambda: PROBE_LINE in container_logs(MEDRE_FAULT),
+                lambda: scoped_log_line(
+                    container_logs(MEDRE_FAULT, timestamps=True), PROBE_LINE, phasing_at
+                ),
                 C5_PROBE_PHASE_BOUND_S,
                 interval=0.25,
             )
@@ -1733,6 +1717,15 @@ class Matrix:
                 queue_samples=queue_samples,
                 hold_seconds=hold_seconds,
             )
+            withheld = withheld_markers(
+                container_logs(PROXY, timestamps=True),
+                armed_at=armed_at,
+                killed_at=killed_at,
+            )
+            if len(missing) != 1 or withheld != missing:
+                failures.append(
+                    "the splice did not record exactly the missing message as withheld"
+                )
             self.write(
                 name,
                 {
@@ -1758,7 +1751,8 @@ class Matrix:
                         else None
                     ),
                     "delivered_before_kill": delivered_before_kill,
-                    "in_flight_at_kill": 1 if accepted > 0 else None,
+                    "in_flight_at_kill": len(withheld),
+                    "withheld_markers": withheld,
                     "kill_to_arm_seconds": (
                         killed_at - armed_at if accepted > 0 else None
                     ),
@@ -1801,7 +1795,10 @@ class Matrix:
             if fault_owned:
                 cleanup.extend(
                     (
-                        ("clear fault", lambda: write_fault(FAULT_STATE_DIR / "fault.json", {})),
+                        (
+                            "clear fault",
+                            lambda: write_fault(FAULT_STATE_DIR / "fault.json", {}),
+                        ),
                         ("remove fault MEDRE", self.remove_fault_medre),
                         ("remove splice", self.remove_splice),
                     )

@@ -211,6 +211,7 @@ def test_empty_and_missing_store_sections_do_not_crash():
 def test_nonce_in_the_payload_column_is_also_selected():
     """A payload placement matches too: the selection is row-wide."""
     row = meshcore_row()
+    row["metadata"] = "{}"
     row["payload"] = json.dumps({"text": NONCE_MC})
     result = store_select.select_nonce_events(
         {

@@ -451,8 +451,12 @@ class MessageFrameDropper:
                 break
             frame = self.buf[: 3 + length]
             self.buf = self.buf[3 + length :]
-            if self.active() and len(frame) > 3 and (
-                frame[3] in MESSAGE_FRAME_TYPES or frame[3] == MESSAGES_WAITING_PUSH
+            if (
+                self.active()
+                and len(frame) > 3
+                and (
+                    frame[3] in MESSAGE_FRAME_TYPES or frame[3] == MESSAGES_WAITING_PUSH
+                )
             ):
                 STATS["message_frames_dropped"] += 1
                 print(
@@ -548,12 +552,15 @@ async def handle(
         client_writer.close()
         return
 
-    print(json.dumps({"event": "connection_open", "connection": connection}), flush=True)
+    print(
+        json.dumps({"event": "connection_open", "connection": connection}), flush=True
+    )
 
     async def server_to_client() -> None:
         nonlocal drop_after_n, close_after_n, stall_after_n
         seen = 0
         trace = FrameTrace(FRAME_OUT_START)
+        withheld = FrameTrace(FRAME_OUT_START)
         try:
             while True:
                 data = await server_reader.read(65536)
@@ -594,7 +601,12 @@ async def handle(
                     # withheld while the stall holds (re-read per chunk,
                     # so clearing the flag restores forwarding at once).
                     STATS["request_stall_chunks_withheld"] += 1
+                    if trace_enabled():
+                        for record in withheld.feed(connection, data):
+                            record["event"] = "request_stall_frame_withheld"
+                            print(json.dumps(record), flush=True)
                     continue
+                withheld.buf = b""
                 if blackhole.drops(
                     "stall_server_to_client",
                     connection,

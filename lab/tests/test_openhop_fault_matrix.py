@@ -955,6 +955,15 @@ def make_bounded_fakes(monkeypatch, tmp_path, preserved_markers, drain_report=No
             return MEDRE_LOG_ONE_ANSWERED_PROBE
         return PROXY_LOG_WITH_PROOF
 
+    monkeypatch.setattr(
+        fault_matrix.FaultMatrix,
+        "freeze_fault_medre",
+        lambda self, prefix: (
+            fault_matrix.time.time(),
+            MEDRE_LOG_ONE_ANSWERED_PROBE,
+            [],
+        ),
+    )
     monkeypatch.setattr(fault_matrix, "timestamped_logs", fake_timestamped_logs)
     monkeypatch.setattr(fault_matrix.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(
@@ -1215,6 +1224,19 @@ def make_window_fakes(
             ],
         }
 
+    class FakeSender:
+        def start(self, command):
+            self.count = int(command[command.index("--count") + 1])
+            self.prefix = command[command.index("--prefix") + 1]
+
+        def collect(self, *, timeout):
+            return fake_peer_send(None, self.count, self.prefix)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(fault_matrix, "PeerSender", FakeSender)
+
     def fake_write_fault(path, fault):
         fault_writes.append(dict(fault))
 
@@ -1361,10 +1383,10 @@ def test_the_drain_stall_case_captures_logs_once_on_completion(tmp_path, monkeyp
     make_window_fakes(monkeypatch, tmp_path, 60, "p4qsd", [5, 6, 7], success_offset=52)
     matrix = fault_matrix.FaultMatrix(tmp_path / "evidence")
     matrix.peer_pacing_s = None
-    # The drain case sends in a background thread; with the fake peer_send
-    # returning instantly the thread is done before the join.
+    # The detached probe returns a complete batch through the sender seam.
     matrix.case_reply_stall_during_drain()
     assert captured == ["fault-reply-stall-drain"]
+    assert "fault" in read_case_record(tmp_path, "fault-reply-stall-drain")
 
 
 def test_the_drain_stall_record_states_the_bound_not_the_exact_frame(
@@ -1595,4 +1617,38 @@ def test_selective_drop_credit_cannot_arrive_after_loss_or_cross_connections():
     reply = {"event": "probe_reply_forwarded", "connection": 1}
     assert fault_matrix.selective_order_failures([drop, reply, drop]) == []
     assert fault_matrix.selective_order_failures([drop, drop, reply])
-    assert fault_matrix.selective_order_failures([drop, dict(reply, connection=2), drop])
+    assert fault_matrix.selective_order_failures(
+        [drop, dict(reply, connection=2), drop]
+    )
+
+
+def test_selective_drop_reads_final_client_store_after_docker_stop(
+    tmp_path, monkeypatch
+):
+    commands = []
+    monkeypatch.setattr(fault_matrix, "timestamped_logs", lambda name: "final log")
+    inspected = [
+        {
+            "Id": "exact-client",
+            "Image": "sha256:actual-image",
+            "State": {"Running": False, "FinishedAt": "2026-11-26T18:00:25.000000000Z"},
+        }
+    ]
+
+    def fake_run(command, timeout):
+        commands.append(command)
+        if command[1] == "inspect":
+            return 0, json.dumps(inspected), ""
+        if command[1] == "run":
+            return 0, json.dumps({"canonical_events": [{"event_id": "last-write"}]}), ""
+        return 0, "", ""
+
+    monkeypatch.setattr(fault_matrix, "run", fake_run)
+    matrix = fault_matrix.FaultMatrix(tmp_path)
+    frozen, logs, events = matrix.freeze_fault_medre("p4qd")
+    assert frozen == fault_matrix.line_time("2026-11-26T18:00:25.000000000Z stopped")
+    assert logs == "final log"
+    assert events == [{"event_id": "last-write"}]
+    assert [command[1] for command in commands] == ["stop", "inspect", "run"]
+    assert "exact-client:ro" in commands[-1]
+    assert "sha256:actual-image" in commands[-1]
