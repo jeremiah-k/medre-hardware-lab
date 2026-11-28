@@ -228,7 +228,9 @@ def qualify(evidence: Path, *, skip_build: bool, lock_path: Path | None = None) 
                     try:
                         cleanup_status = run_command(DOWN, sys.stderr)
                     except OSError as cleanup_error:
-                        print(f"cleanup could not run: {cleanup_error}", file=sys.stderr)
+                        print(
+                            f"cleanup could not run: {cleanup_error}", file=sys.stderr
+                        )
                         cleanup_status = 1
                 if cleanup_status:
                     print(f"cleanup failed (exit {cleanup_status})", file=sys.stderr)

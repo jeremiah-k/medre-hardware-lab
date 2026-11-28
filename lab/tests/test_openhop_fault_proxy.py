@@ -409,7 +409,9 @@ def test_policy_clear_between_reads_preserves_complete_probe(tmp_path):
     assert proxy.STATS["frame_resyncs"] == 0
 
 
-@pytest.mark.parametrize("start,packet", [(0x3C, b"<\x01\x00\x0a"), (0x3E, NO_MORE_MSGS_REPLY)])
+@pytest.mark.parametrize(
+    "start,packet", [(0x3C, b"<\x01\x00\x0a"), (0x3E, NO_MORE_MSGS_REPLY)]
+)
 def test_trace_buffers_every_fragment(start, packet):
     trace = proxy.FrameTrace(start)
     assert trace.feed(1, packet[:1]) == []

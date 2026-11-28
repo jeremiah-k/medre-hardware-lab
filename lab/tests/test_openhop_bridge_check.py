@@ -34,7 +34,9 @@ def _proof(**overrides):
         "reason": "both bridge directions delivered the exact nonce once each",
         "direction_mc_to_mesh": {
             "nonce": NONCE_1,
-            "observer_arrivals": [{"text": NONCE_1, "received_at": "t1", "channel_index": 0}],
+            "observer_arrivals": [
+                {"text": NONCE_1, "received_at": "t1", "channel_index": 0}
+            ],
             "arrival_count": 1,
             "distinct_arrival_count": 1,
             "duplicate_client_events": 0,
@@ -43,7 +45,9 @@ def _proof(**overrides):
         "direction_mesh_to_mc": {
             "nonce": NONCE_2,
             "expected_text": PREFIX + NONCE_2,
-            "mc_peer_arrivals": [{"text": PREFIX + NONCE_2, "received_at": "t2", "channel_idx": 0}],
+            "mc_peer_arrivals": [
+                {"text": PREFIX + NONCE_2, "received_at": "t2", "channel_idx": 0}
+            ],
             "arrival_count": 1,
             "distinct_arrival_count": 1,
             "duplicate_client_events": 0,

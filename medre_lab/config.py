@@ -84,7 +84,9 @@ def load(path: Path, *, effective: bool = False) -> dict:
         ):
             raise ValueError(f"{key} must be finite and positive")
     resolve_ble_adapter(
-        hw, effective=effective, default=BLE_ADAPTER_DEFAULT if "meshcore" in hw else None
+        hw,
+        effective=effective,
+        default=BLE_ADAPTER_DEFAULT if "meshcore" in hw else None,
     )
     for kind in TRANSPORTS:
         if kind not in hw:

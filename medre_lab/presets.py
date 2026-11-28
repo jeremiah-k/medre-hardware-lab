@@ -103,9 +103,10 @@ def validate_suite(root: Path, suite) -> None:
                 )
         elif entry.startswith(SCENARIO_PREFIX):
             name = entry[len(SCENARIO_PREFIX) :]
-            if not re.fullmatch(r"[a-zA-Z0-9_-]+", name) or not (
-                Path(root) / "scenarios" / f"scenario-{name}.sh"
-            ).is_file():
+            if (
+                not re.fullmatch(r"[a-zA-Z0-9_-]+", name)
+                or not (Path(root) / "scenarios" / f"scenario-{name}.sh").is_file()
+            ):
                 raise ValueError(
                     f"suite entry {entry!r}: scenarios/scenario-{name}.sh does not exist"
                 )
@@ -359,7 +360,9 @@ def load_preset(root: Path, name: str, *, up: bool = False, force: bool = False)
         Path(root) / "lab/state/sources.json",
         Path(root) / "lab/state/sources-openhop.json",
     ]
-    previous = {path: path.read_bytes() if path.exists() else None for path in generated}
+    previous = {
+        path: path.read_bytes() if path.exists() else None for path in generated
+    }
     try:
         if lock_changed:
             _replace_bytes(lock_path, (json.dumps(pins, indent=2) + "\n").encode())
@@ -427,7 +430,12 @@ def verify_checkouts(root: Path, pins: dict) -> None:
         else:
             status = subprocess.run(
                 [
-                    "git", "-C", str(checkout), "status", "--porcelain", "--untracked-files=no"
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=no",
                 ],
                 capture_output=True,
                 text=True,

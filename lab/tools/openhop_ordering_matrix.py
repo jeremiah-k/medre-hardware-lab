@@ -432,7 +432,8 @@ class OrderingMatrix:
             drain_started = time.monotonic()
             self.start_medre()
             self.wait_for(
-                lambda: len(set(self.markers_from_store("p4o1", mine))) >= older + newer,
+                lambda: len(set(self.markers_from_store("p4o1", mine)))
+                >= older + newer,
                 timeout=180,
                 interval=3.0,
             )
@@ -650,7 +651,8 @@ class OrderingMatrix:
             drain_started = time.monotonic()
             self.start_medre()
             self.wait_for(
-                lambda: len(set(self.markers_from_store("p4o4", mine))) >= older + newer,
+                lambda: len(set(self.markers_from_store("p4o4", mine)))
+                >= older + newer,
                 timeout=180,
                 interval=3.0,
             )
@@ -829,7 +831,8 @@ class OrderingMatrix:
             drain_started = time.monotonic()
             self.start_medre()
             self.wait_for(
-                lambda: len(set(self.markers_from_store("p4o2", mine))) >= backlog_count + 1,
+                lambda: len(set(self.markers_from_store("p4o2", mine)))
+                >= backlog_count + 1,
                 timeout=180,
                 interval=3.0,
             )

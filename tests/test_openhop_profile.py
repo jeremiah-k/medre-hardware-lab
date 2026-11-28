@@ -252,8 +252,11 @@ def test_scenario_skips_when_the_profile_is_absent(tmp_path):
         cwd=ROOT,
         timeout=120,
         check=False,
-        env={**os.environ, "LAB_COMPOSE_FILE": str(compose_file),
-             "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+        env={
+            **os.environ,
+            "LAB_COMPOSE_FILE": str(compose_file),
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        },
     )
     assert result.returncode == 2, result.stdout + result.stderr
     assert "SKIP" in (result.stdout + result.stderr)

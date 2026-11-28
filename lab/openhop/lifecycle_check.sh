@@ -136,6 +136,8 @@ docker compose --profile openhop ps >/dev/null 2>&1 ||
 # the companion at the same time.
 initial_running="$(docker inspect -f '{{.State.Running}}' "${MEDRE_CONTAINER}")" ||
 	fail "cannot inspect initial MEDRE state"
+# ShellCheck cannot see this function being called by the EXIT trap.
+# shellcheck disable=SC2329
 restore_medre() {
 	local rc=$?
 	trap - EXIT

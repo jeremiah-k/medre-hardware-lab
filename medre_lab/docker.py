@@ -118,9 +118,7 @@ def parse_lock(raw):
             result[key] = value
         return result
 
-    data = json.loads(
-        raw, object_pairs_hook=unique
-    )
+    data = json.loads(raw, object_pairs_hook=unique)
     if not isinstance(data, dict) or set(data) != set(SOURCES):
         raise ValueError("source lock must name the Docker dependencies for both rigs")
     for name, entry in data.items():
@@ -131,7 +129,9 @@ def parse_lock(raw):
             or not re.fullmatch(r"[0-9a-f]{40}", entry["ref"])
         ):
             raise ValueError(f"{name}: exact full commit SHA required")
-        if not isinstance(entry["url"], str) or not SOURCE_URL_RE.fullmatch(entry["url"]):
+        if not isinstance(entry["url"], str) or not SOURCE_URL_RE.fullmatch(
+            entry["url"]
+        ):
             raise ValueError(
                 "source URLs must be public HTTPS GitHub URLs without credentials"
             )

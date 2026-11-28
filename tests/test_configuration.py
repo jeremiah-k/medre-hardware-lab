@@ -60,9 +60,12 @@ def test_ble_adapter_env_overrides_configured_controller(tmp_path, monkeypatch):
 
 def test_ble_adapter_is_not_injected_without_meshcore(tmp_path, monkeypatch):
     monkeypatch.delenv("MEDRE_LAB_BLE_ADAPTER", raising=False)
-    assert "ble_adapter" not in load(
-        _write_hardware(tmp_path, "[hardware]\nsend_timeout=5\n")
-    )["hardware"]
+    assert (
+        "ble_adapter"
+        not in load(_write_hardware(tmp_path, "[hardware]\nsend_timeout=5\n"))[
+            "hardware"
+        ]
+    )
 
 
 def test_ble_adapter_keeps_configured_controller_without_override(
