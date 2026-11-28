@@ -95,7 +95,7 @@ class MeshCObserver:
                     {
                         "received_at": utcnow(),
                         "text": decoded.get("text", ""),
-                        "channel_index": packet.get("channel"),
+                        "channel_index": packet.get("channel", 0),
                         "from_id": packet.get("fromId"),
                         "packet_id": packet.get("id"),
                         "to_id": packet.get("toId"),

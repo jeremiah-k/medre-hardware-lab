@@ -127,15 +127,36 @@ probe_passed() {
 # ---------------------------------------------------------------------------
 log "Phase 0: preconditions"
 # ---------------------------------------------------------------------------
-require_container "${REPEATER_CONTAINER}" 2>/dev/null || true
+require_container "${REPEATER_CONTAINER}"
 docker compose --profile openhop ps >/dev/null 2>&1 ||
 	fail "docker compose --profile openhop is not usable"
 
 # Phase 0a: MEDRE must be STOPPED for the protocol probe (single-client
 # rule). If MEDRE is up, stop it first: the probe and MEDRE may never hold
 # the companion at the same time.
+initial_running="$(docker inspect -f '{{.State.Running}}' "${MEDRE_CONTAINER}")" ||
+	fail "cannot inspect initial MEDRE state"
+restore_medre() {
+	local rc=$?
+	trap - EXIT
+	if [[ ${initial_running} == true ]]; then
+		"${COMPOSE[@]}" up -d "${MEDRE_SERVICE}" >/dev/null || { ((rc != 0)) || rc=1; }
+	else
+		"${COMPOSE[@]}" stop "${MEDRE_SERVICE}" >/dev/null || { ((rc != 0)) || rc=1; }
+	fi
+	exit "${rc}"
+}
+trap restore_medre EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+stop_for_probe() {
+	"${COMPOSE[@]}" stop "${MEDRE_SERVICE}" >/dev/null || fail "cannot stop MEDRE"
+	[[ $(docker inspect -f '{{.State.Running}}' "${MEDRE_CONTAINER}") == false ]] || fail "MEDRE is still running"
+}
+
 log "Phase 0a: stop MEDRE (the companion accepts one client at a time)"
-"${COMPOSE[@]}" stop "${MEDRE_SERVICE}" >/dev/null 2>&1 || true
+stop_for_probe
 sleep 2
 
 log "Phase 1: protocol handshake against the companion (APP_START/SELF_INFO/channel read)"
@@ -221,7 +242,7 @@ log "Phase 4: stable identity and default channel across the repeater restart"
 # ---------------------------------------------------------------------------
 # Stop MEDRE again so the probe can be the sole client, then re-probe: the
 # companion's SELF_INFO identity must be IDENTICAL to the pre-restart one.
-"${COMPOSE[@]}" stop "${MEDRE_SERVICE}" >/dev/null 2>&1 || true
+stop_for_probe
 sleep 2
 PROBE_AFTER="${EVIDENCE_DIR}/probe-after-restart.json"
 run_probe "after-restart"
@@ -274,9 +295,11 @@ grep -q "MEDRE stopped" "${EVIDENCE_DIR}/medre-openhop-stopped.log" ||
 
 # Restore the rig to the state the check found it in (MEDRE running): the
 # check must not leave the rig torn down for the next case.
-log "Phase 5a: restoring the rig (MEDRE back up)"
-"${COMPOSE[@]}" up -d "${MEDRE_SERVICE}" >/dev/null
-wait_healthy "${MEDRE_CONTAINER}" "${MEDRE_WAIT_SECONDS}"
+if [[ ${initial_running} == true ]]; then
+	log "Phase 5a: restoring the rig (MEDRE back up)"
+	"${COMPOSE[@]}" up -d "${MEDRE_SERVICE}" >/dev/null
+	wait_healthy "${MEDRE_CONTAINER}" "${MEDRE_WAIT_SECONDS}"
+fi
 
 # ---------------------------------------------------------------------------
 cat >"${EVIDENCE_DIR}/verdict.json" <<EOF

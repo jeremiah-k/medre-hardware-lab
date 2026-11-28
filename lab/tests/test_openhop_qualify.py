@@ -26,7 +26,11 @@ def hold_lock(path):
     """Take the lock the way a second process would: a fresh open() is a
     new file description, so it is a real contender for the flock."""
     handle = open(path, "a+")
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise
     return handle
 
 
@@ -174,9 +178,17 @@ def test_the_ordinary_flow_holds_the_isolated_lock(tmp_path, monkeypatch):
     """The ordinary qualify() flow, called the way the command calls it,
     must hold its lock under the test's tree, never under the checkout's
     lab/state, whose file a running campaign owns."""
-    fresh_qualification(tmp_path, monkeypatch)
+    stage = fresh_qualification(tmp_path, monkeypatch)
+    held = tmp_path / "openhop-qualification.lock"
+
+    def assert_held(*_args):
+        assert Path(qualify._qualification_lock.name) == held
+        with pytest.raises(BlockingIOError):
+            hold_lock(held)
+        return 0
+
+    stage.side_effect = assert_held
     assert qualify.qualify(tmp_path / "run", skip_build=True) == 0
-    held = Path(qualify._qualification_lock.name)
-    assert held == tmp_path / "openhop-qualification.lock"
-    assert held.is_relative_to(tmp_path)
-    assert not held.is_relative_to(qualify.ROOT / "lab/state")
+    assert qualify._qualification_lock is None
+    with hold_lock(held):
+        pass

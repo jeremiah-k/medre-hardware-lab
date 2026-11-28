@@ -214,6 +214,18 @@ def hold_exclusive_lock(
             proc.wait()
 
 
+def release_lock(proc: subprocess.Popen, timeout: int) -> None:
+    """Release interactive holds, or wait for the in-container timed hold."""
+    if proc.stdin is not None and not proc.stdin.closed:
+        proc.stdin.close()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise RuntimeError("SQLite lock owner did not exit within its hold budget")
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers (offline-testable)
 # ---------------------------------------------------------------------------
@@ -821,8 +833,8 @@ class Matrix:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if predicate():
-                return True
-            time.sleep(interval)
+                return time.monotonic() <= deadline
+            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
         return False
 
     def medre_events(
@@ -996,8 +1008,8 @@ class Matrix:
             report = ordering_report(markers)
             a_rx_after = container_logs(REPEATER_A).count("RX GRP_TXT")
             failures: list[str] = []
-            if accepted == 0:
-                failures.append("the peer sent no accepted message")
+            if send.get("pass") is not True or accepted != count or len(mine) != count:
+                failures.append("the peer did not accept the complete requested workload")
             if persisted_count == 0:
                 failures.append(
                     "the repeater persisted no nonce-bearing message "
@@ -1101,7 +1113,7 @@ class Matrix:
             back_send = peer_send(self.profile, backlog, back_prefix, settle=3.0)
             back_markers = sent_markers(back_send)
             rows, _ = self.repeater_queue(REPEATER_A, back_prefix)
-            persisted_count, _ = count_nonce_rows(rows, only=back_markers)
+            persisted_count, persisted_markers = count_nonce_rows(rows, only=back_markers)
             # Wire the client link through the splice BEFORE MEDRE starts:
             # the client resolves the peer's name once, at connect time.
             self.start_splice({"delay_ms": delay_ms})
@@ -1214,7 +1226,12 @@ class Matrix:
             )
             order = backlog_live_order_report(markers, back_markers, live_markers_sent)
             failures: list[str] = []
-            if back_send.get("pass") is not True or persisted_count != backlog:
+            if (
+                back_send.get("pass") is not True
+                or len(back_markers) != backlog
+                or persisted_count != backlog
+                or set(persisted_markers) != back_markers
+            ):
                 failures.append(
                     "the case needs a full persisted backlog before MEDRE starts"
                 )
@@ -1304,6 +1321,7 @@ class Matrix:
     def case_c3(self, count: int = 10) -> None:
         name = "c3-client-sync-during-persist"
         prefix = "p4c3"
+        lock_proc = None
         try:
             if not container_running(MEDRE_BRIDGE):
                 self.not_run(name, "the MEDRE bridge container is not running")
@@ -1352,6 +1370,7 @@ class Matrix:
                 lock_proc.kill()
                 lock_proc.wait()
                 raise
+            lock_proc = None
             lock_hold_seconds = time.monotonic() - lock_started
             rows, _ = self.repeater_queue(REPEATER_A, prefix)
             persisted_count, persisted = count_nonce_rows(rows, only=mine)
@@ -1419,6 +1438,9 @@ class Matrix:
             )
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+        finally:
+            if lock_proc is not None:
+                release_lock(lock_proc, 50)
 
     def case_c4(self) -> None:
         name = "c4-replaced-client"
@@ -1548,6 +1570,8 @@ class Matrix:
         # see THIS run's messages, never the stale rows an earlier run left
         # in the companion or MEDRE stores.
         prefix = f"p4c5{uuid.uuid4().hex[:8]}"
+        restore_bridge = False
+        fault_owned = False
         first_connect = re.compile(
             r"started \(mode=tcp, connected=True\)|reconnected successfully",
             re.IGNORECASE,
@@ -1563,7 +1587,11 @@ class Matrix:
             # splice, so the bridge MEDRE is stopped first (the companion
             # serves ONE client at a time) and restored at the end.
             if container_running(MEDRE_BRIDGE):
-                run(["docker", "stop", MEDRE_BRIDGE], timeout=180)
+                restore_bridge = True
+                checked_docker("stop", MEDRE_BRIDGE)
+                if container_running(MEDRE_BRIDGE):
+                    raise RuntimeError("bridge did not stop before fault client attach")
+            fault_owned = True
             self.remove_fault_medre()
             self.start_splice({})
             if not self.wait_for(lambda: container_running(PROXY), 60, interval=1.0):
@@ -1769,16 +1797,27 @@ class Matrix:
             # Leave the rig as the case found it: the splice and its MEDRE
             # instance go, the fault file clears, and the bridge MEDRE
             # (stopped at the start of the case) runs again.
-            if FAULT_STATE_DIR.exists():
-                write_fault(FAULT_STATE_DIR / "fault.json", {})
-            self.remove_fault_medre()
-            self.remove_splice()
-            if (
-                container_exists(MEDRE_BRIDGE)
-                and not container_running(MEDRE_BRIDGE)
-                and container_running(REPEATER_A)
-            ):
-                checked_docker("start", MEDRE_BRIDGE)
+            cleanup = []
+            if fault_owned:
+                cleanup.extend(
+                    (
+                        ("clear fault", lambda: write_fault(FAULT_STATE_DIR / "fault.json", {})),
+                        ("remove fault MEDRE", self.remove_fault_medre),
+                        ("remove splice", self.remove_splice),
+                    )
+                )
+            if restore_bridge:
+                cleanup.append(
+                    ("restore bridge", lambda: checked_docker("start", MEDRE_BRIDGE))
+                )
+            failures = []
+            for label, action in cleanup:
+                try:
+                    action()
+                except Exception as exc:
+                    failures.append(f"{label}: {exc}")
+            if failures:
+                self.not_run(name, "cleanup failed: " + "; ".join(failures))
 
     def case_c6(self, count: int = 20) -> None:
         name = "c6-repeater-restart-persisted-queue"
@@ -1833,7 +1872,9 @@ class Matrix:
             report = ordering_report(markers)
             failures: list[str] = []
             if (
-                not mine
+                send.get("pass") is not True
+                or len(mine) != count
+                or persisted_before != count
                 or set(indices_before) != mine
                 or set(indices_after) != mine
                 or set(markers) != mine

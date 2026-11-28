@@ -351,6 +351,7 @@ class OrderingMatrix:
         name = "o1-older-persisted-newer-memory"
         old_prefix, new_prefix = "p4o1a", "p4o1b"
         restore_bridge = False
+        lock_proc = None
         try:
             if not backlog.container_running(MEDRE_BRIDGE):
                 self.not_run(name, "the MEDRE bridge container is not running")
@@ -409,6 +410,7 @@ class OrderingMatrix:
                 lock_proc.kill()
                 lock_proc.wait()
                 raise
+            lock_proc = None
             lock_hold_seconds = round(time.monotonic() - lock_started, 3)
             if send_elapsed_s > MEMORY_SEND_BUDGET_S:
                 self.not_run(
@@ -430,7 +432,7 @@ class OrderingMatrix:
             drain_started = time.monotonic()
             self.start_medre()
             self.wait_for(
-                lambda: len(self.markers_from_store("p4o1", mine)) >= older + newer,
+                lambda: len(set(self.markers_from_store("p4o1", mine))) >= older + newer,
                 timeout=180,
                 interval=3.0,
             )
@@ -527,6 +529,11 @@ class OrderingMatrix:
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
         finally:
+            if lock_proc is not None:
+                try:
+                    backlog.release_lock(lock_proc, MEMORY_LOCK_SECONDS + 5)
+                except Exception as exc:
+                    self.not_run(name, f"could not release store lock: {exc}")
             if restore_bridge and not backlog.container_running(MEDRE_BRIDGE):
                 try:
                     self.start_medre()
@@ -552,6 +559,7 @@ class OrderingMatrix:
         name = "o4-older-memory-newer-persisted"
         old_prefix, new_prefix = "p4o4a", "p4o4b"
         restore_bridge = False
+        lock_proc = None
         try:
             if not backlog.container_running(MEDRE_BRIDGE):
                 self.not_run(name, "the MEDRE bridge container is not running")
@@ -601,6 +609,7 @@ class OrderingMatrix:
                 lock_proc.kill()
                 lock_proc.wait()
                 raise
+            lock_proc = None
             lock_hold_seconds = round(time.monotonic() - lock_started, 3)
             if send_elapsed_s > MEMORY_SEND_BUDGET_S:
                 self.not_run(
@@ -641,7 +650,7 @@ class OrderingMatrix:
             drain_started = time.monotonic()
             self.start_medre()
             self.wait_for(
-                lambda: len(self.markers_from_store("p4o4", mine)) >= older + newer,
+                lambda: len(set(self.markers_from_store("p4o4", mine))) >= older + newer,
                 timeout=180,
                 interval=3.0,
             )
@@ -746,6 +755,11 @@ class OrderingMatrix:
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
         finally:
+            if lock_proc is not None:
+                try:
+                    backlog.release_lock(lock_proc, MEMORY_LOCK_SECONDS + 5)
+                except Exception as exc:
+                    self.not_run(name, f"could not release store lock: {exc}")
             if restore_bridge and not backlog.container_running(MEDRE_BRIDGE):
                 try:
                     self.start_medre()
@@ -815,7 +829,7 @@ class OrderingMatrix:
             drain_started = time.monotonic()
             self.start_medre()
             self.wait_for(
-                lambda: len(self.markers_from_store("p4o2", mine)) >= backlog_count + 1,
+                lambda: len(set(self.markers_from_store("p4o2", mine))) >= backlog_count + 1,
                 timeout=180,
                 interval=3.0,
             )
@@ -894,6 +908,7 @@ class OrderingMatrix:
     def case_o3(self, count: int = 8, lock_seconds: int = 40) -> None:
         name = "o3-store-locked-memory-served"
         prefix = "p4o3"
+        lock_proc = None
         try:
             if not backlog.container_running(MEDRE_BRIDGE):
                 self.not_run(name, "the MEDRE bridge container is not running")
@@ -916,6 +931,8 @@ class OrderingMatrix:
             persisted_while_locked, _ = backlog.count_nonce_rows(
                 rows_while_locked, only=mine
             )
+            if lock_proc.poll() is not None:
+                served_while_locked = 0
             assert lock_proc.stdin is not None
             lock_proc.stdin.close()
             try:
@@ -924,6 +941,7 @@ class OrderingMatrix:
                 lock_proc.kill()
                 lock_proc.wait()
                 raise
+            lock_proc = None
             lock_hold_seconds = time.monotonic() - lock_started
             # After the lock lifts: nothing new may appear and nothing may
             # duplicate; everything accepted must have been delivered or
@@ -986,7 +1004,7 @@ class OrderingMatrix:
                     "served_while_store_locked": served_while_locked,
                     "persisted_while_store_locked": persisted_while_locked,
                     "lock_hold_seconds": lock_hold_seconds,
-                    "delivered_after_unlock": report["arrivals"],
+                    "total_delivered_observed_after_unlock": report["arrivals"],
                     "distinct_at_medre": report["distinct"],
                     "duplicate_arrivals": report["duplicate_arrivals"],
                     "arrival_order_indices": [
@@ -1000,12 +1018,9 @@ class OrderingMatrix:
                     "fallback_promise": (
                         "the store is WAL, so an exclusive lock blocks writes "
                         "but not reads: messages accepted during the lock are "
-                        "served from memory while it holds, a failed persist is "
-                        "retried at a bounded pace so the row lands when the "
-                        "lock lifts, and a store that cannot be read at all "
-                        "warns once per episode, not once per sync. The case "
-                        "asserts the memory service during the lock, the "
-                        "once-per-episode warning contract, and that the "
+                        "served from memory while it holds. The case asserts "
+                        "memory service during contention, zero unreadable-store "
+                        "warnings, and that the "
                         "episode ends with every accepted message delivered "
                         "with no duplicate and nothing left behind"
                     ),
@@ -1019,6 +1034,13 @@ class OrderingMatrix:
             )
         except Exception as exc:  # pragma: no cover - defensive
             self.not_run(name, f"{type(exc).__name__}: {exc}")
+
+        finally:
+            if lock_proc is not None:
+                try:
+                    backlog.release_lock(lock_proc, lock_seconds + 5)
+                except Exception as exc:
+                    self.not_run(name, f"could not release store lock: {exc}")
 
 
 CASES = {

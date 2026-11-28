@@ -122,6 +122,11 @@ def check_proof(proof: dict[str, Any]) -> list[str]:
         expected_text=str(d1.get("nonce")),
         arrival_texts=[str(entry.get("text")) for entry in d1_arrivals],
     )
+    if any(
+        type(entry.get("channel_index")) is not int or entry["channel_index"] != 0
+        for entry in d1_arrivals
+    ):
+        failures.append("direction 1: arrival was not on channel 0")
     if not isinstance(d1.get("echo_at_b"), list):
         failures.append("direction 1: missing echo observation")
     elif d1.get("echo_at_b"):
@@ -137,11 +142,13 @@ def check_proof(proof: dict[str, Any]) -> list[str]:
     if not isinstance(d2_expected, str) or d2["nonce"] not in d2_expected:
         failures.append("direction 2: expected text must contain the nonce")
         return failures
-    d2_arrivals = [
-        str(entry.get("text"))
-        for entry in (d2.get("mc_peer_arrivals") or [])
-        if d2["nonce"] in str(entry.get("text") or "")
-    ]
+    d2_records = d2.get("mc_peer_arrivals") or []
+    d2_arrivals = [str(entry.get("text")) for entry in d2_records]
+    if any(
+        type(entry.get("channel_idx")) is not int or entry["channel_idx"] != 0
+        for entry in d2_records
+    ):
+        failures.append("direction 2: arrival was not on channel 0")
     failures += _check_direction(
         "direction 2 (meshc-peer -> MEDRE -> mc-peer)",
         d2,

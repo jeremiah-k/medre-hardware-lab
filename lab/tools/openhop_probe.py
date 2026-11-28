@@ -144,7 +144,12 @@ async def probe(host: str, port: int) -> dict:
             ),
         }
         event_type = str(getattr(channel_event, "type", ""))
-        if "CHANNEL_INFO" not in event_type:
+        if (
+            "CHANNEL_INFO" not in event_type
+            or not isinstance(payload, dict)
+            or type(payload.get("channel_idx")) is not int
+            or payload["channel_idx"] != 0
+        ):
             return {
                 **evidence,
                 "reason": f"channel 0 read returned {event_type!r}",

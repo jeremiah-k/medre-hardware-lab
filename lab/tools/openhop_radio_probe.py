@@ -99,6 +99,7 @@ class _Drain:
         self.name = name
         self.messages: list[dict] = []
         self.last_queue_reply = 0.0
+        self.failed = False
 
     async def run(self, client, deadline: float) -> None:
         import meshcore
@@ -109,19 +110,17 @@ class _Drain:
                 event = await client.commands.get_msg(
                     timeout=min(DRAIN_POLL_SECONDS, remaining)
                 )
-            except asyncio.TimeoutError:
-                continue
-            except Exception:  # pragma: no cover - transport hiccup
-                await asyncio.sleep(0.2)
-                continue
+            except Exception:
+                self.failed = True
+                return
             event_type = str(getattr(event, "type", ""))
             if event_type == str(meshcore.EventType.NO_MORE_MSGS):
                 self.last_queue_reply = time.monotonic()
                 await asyncio.sleep(0.1)
                 continue
             if event_type == str(meshcore.EventType.ERROR):
-                await asyncio.sleep(0.1)
-                continue
+                self.failed = True
+                return
             if event_type != str(meshcore.EventType.CHANNEL_MSG_RECV):
                 continue
             self.last_queue_reply = time.monotonic()
@@ -225,6 +224,9 @@ async def proof(args) -> dict:
         send_drain.last_queue_reply >= sent_at
     )
 
+    if sub_drain.failed or send_drain.failed:
+        evidence["reason"] = "a peer queue observation failed before the window ended"
+        return evidence
     if len(delivered) != 1 or len(sub_drain.messages) != 1:
         evidence["reason"] = "A did not observe exactly one matching channel message"
         return evidence

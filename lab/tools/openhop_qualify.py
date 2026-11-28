@@ -46,14 +46,14 @@ _qualification_lock = None
 
 
 def acquire_qualification_lock(path: Path | None = None):
-    """Hold an exclusive advisory lock for the life of the process.
+    """Hold an exclusive advisory lock until the campaign is torn down.
 
     A second qualification stops here with an error naming the lock
     file; the rig-down check runs only after the lock is ours.
     """
     global _qualification_lock
     if _qualification_lock is not None:
-        return _qualification_lock
+        raise ValueError("another qualification is active in this process")
     target = LOCK_PATH if path is None else Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     handle = target.open("a+", encoding="utf-8")
@@ -155,8 +155,14 @@ def run_command(command: list[str], log) -> int:
             except ProcessLookupError:
                 pass
             except subprocess.TimeoutExpired:
+                pass
+            # The shell may exit before its descendants. Signal the whole
+            # owned process group even when the direct child was reaped.
+            try:
                 os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            except ProcessLookupError:
+                pass
+            process.wait()
             return 130
     return result if result >= 0 else 128 - result
 
@@ -197,14 +203,13 @@ def run_stage(evidence: Path, name: str, command: list[str]) -> int:
 
 
 def qualify(evidence: Path, *, skip_build: bool, lock_path: Path | None = None) -> int:
-    acquire_qualification_lock(lock_path)
-    assert_rig_down()
-    evidence.mkdir(mode=0o700, parents=True)
+    global _qualification_lock
+    handle = acquire_qualification_lock(lock_path)
     needs_down = False
     try:
+        assert_rig_down()
+        evidence.mkdir(mode=0o700, parents=True)
         for name, command in stages(evidence, skip_build):
-            # Before the stage starts anything: the refusal must not
-            # leave a rig of ours that teardown has to chase.
             assert_configs_readable(name)
             if name.endswith("-up"):
                 needs_down = True
@@ -214,8 +219,22 @@ def qualify(evidence: Path, *, skip_build: bool, lock_path: Path | None = None) 
             if command is DOWN:
                 needs_down = False
     finally:
-        if needs_down:
-            run_stage(evidence, "cleanup", DOWN)
+        try:
+            if needs_down:
+                try:
+                    cleanup_status = run_stage(evidence, "cleanup", DOWN)
+                except OSError as exc:
+                    print(f"cleanup evidence unavailable: {exc}", file=sys.stderr)
+                    try:
+                        cleanup_status = run_command(DOWN, sys.stderr)
+                    except OSError as cleanup_error:
+                        print(f"cleanup could not run: {cleanup_error}", file=sys.stderr)
+                        cleanup_status = 1
+                if cleanup_status:
+                    print(f"cleanup failed (exit {cleanup_status})", file=sys.stderr)
+        finally:
+            handle.close()
+            _qualification_lock = None
     return 0
 
 

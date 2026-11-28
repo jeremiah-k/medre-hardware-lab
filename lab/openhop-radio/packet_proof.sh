@@ -46,6 +46,7 @@ while (($# > 0)); do
 		;;
 	esac
 done
+umask 077
 mkdir -p "${EVIDENCE_DIR}"
 rm -f "${EVIDENCE_DIR}/verdict.json"
 
@@ -142,9 +143,9 @@ print("  packet proof PASSED")
 PY
 
 log "Phase 2: capturing relay and repeater logs"
-docker logs "${RELAY_CONTAINER}" >"${EVIDENCE_DIR}/relay.log" 2>&1 || true
-docker logs "${REPEATER_A}" >"${EVIDENCE_DIR}/repeater-a.log" 2>&1 || true
-docker logs "${REPEATER_B}" >"${EVIDENCE_DIR}/repeater-b.log" 2>&1 || true
+docker logs "${RELAY_CONTAINER}" >"${EVIDENCE_DIR}/relay.log" 2>&1
+docker logs "${REPEATER_A}" >"${EVIDENCE_DIR}/repeater-a.log" 2>&1
+docker logs "${REPEATER_B}" >"${EVIDENCE_DIR}/repeater-b.log" 2>&1
 
 log "Phase 3: exactly ONE packet crossed the medium (relay transmission log)"
 # The relay logs every transmission it forwards. The proof's nonce crossed

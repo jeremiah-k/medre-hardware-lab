@@ -292,7 +292,6 @@ verdict = {
                 {
                     entry.get("text")
                     for entry in (d2.get("mc_peer_arrivals") or [])
-                    if entry.get("text") == d2.get("expected_text")
                 }
                 == {d2.get("expected_text")}
             ),
