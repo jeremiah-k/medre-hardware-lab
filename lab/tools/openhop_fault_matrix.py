@@ -972,6 +972,26 @@ def reconnect_case_failures(
         )
     return failures
 
+def selective_order_failures(events: list[dict]) -> list[str]:
+    """A future probe reply cannot authorize an earlier destructive fetch."""
+    credits: dict[int, int] = {}
+    failures = []
+    for event in events:
+        connection = event["connection"]
+        credit = credits.setdefault(connection, 1)
+        if event["event"] == "probe_reply_forwarded":
+            credits[connection] = credit + 1
+        elif (
+            event["event"] == "message_frame_dropped"
+            and event.get("packet_type") in MESSAGE_CARRYING_TYPES
+        ):
+            credits[connection] = credit - 1
+            if credit <= 0:
+                failures.append(
+                    f"connection {connection}: message dropped before a probe credit"
+                )
+    return failures
+
 
 def selective_drop_failures(
     *,
@@ -1289,8 +1309,8 @@ class FaultMatrix:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if predicate():
-                return True
-            time.sleep(interval)
+                return time.monotonic() <= deadline
+            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
         return False
 
     def observe(self, name: str, predicate, timeout: float) -> bool:
@@ -1832,6 +1852,7 @@ class FaultMatrix:
                         consumed_per_connection[connection] = (
                             consumed_per_connection.get(connection, 0) + 1
                         )
+                proof_report = selective_drop_proof_report(link_events)
                 cross_check = selective_drop_cross_check(link_events, lost_messages)
                 # ONE proof field, from the splice's own events: one
                 # connection both forwarded a probe reply and swallowed a
@@ -1848,6 +1869,7 @@ class FaultMatrix:
                     same_connection_proof=proof_report["same_connection_proof"],
                     accounting_cross_check=cross_check,
                 )
+                failures.extend(selective_order_failures(link_events))
                 connection_evidence = {
                     "link_definition": (
                         "the splice forwards the handshake and the "
@@ -1955,7 +1977,7 @@ class FaultMatrix:
                     "cases must deliver everything without churn"
                 )
             lost_wakes = (
-                len(lost_messages)
+                len(persisted_markers - set(indices))
                 if verdict == "bounded"
                 else max(0, preserved - distinct)
             )

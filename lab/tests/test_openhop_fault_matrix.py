@@ -1588,3 +1588,11 @@ def test_latency_over_refuses_the_baseline_shape_that_never_times_out_a_fetch(
     assert record["status"] == "NOT RUN"
     assert "no fetch window elapsed" in record["reason"]
     assert writes == [{"live_delay_ms": 4000}, {}]
+
+
+def test_selective_drop_credit_cannot_arrive_after_loss_or_cross_connections():
+    drop = {"event": "message_frame_dropped", "connection": 1, "packet_type": 7}
+    reply = {"event": "probe_reply_forwarded", "connection": 1}
+    assert fault_matrix.selective_order_failures([drop, reply, drop]) == []
+    assert fault_matrix.selective_order_failures([drop, drop, reply])
+    assert fault_matrix.selective_order_failures([drop, dict(reply, connection=2), drop])

@@ -269,6 +269,37 @@ class VirtualRadioRelay:
         # A short grace period lets a genuinely closed peer be reaped first
         # (its EOF removes it), so a healthy peer is never evicted in favour
         # of a stale one.
+        client = RelayClient(-1, reader, writer)
+        pending = []
+        if self.token:
+
+            async def authenticate():
+                while not client.authenticated:
+                    data = await reader.read(4096)
+                    if not data:
+                        return False
+                    for cmd, payload in client.decoder.feed(data):
+                        if client.authenticated:
+                            pending.append((cmd, payload))
+                        elif cmd == CMD_AUTH:
+                            self._handle_auth(client, payload)
+                        elif cmd == CMD_PING:
+                            client.enqueue(CMD_PONG)
+                        else:
+                            client.enqueue(CMD_ERROR, bytes([ERR_UNAUTHORIZED]))
+                    # Send pre-authentication replies without occupying a slot.
+                    while not client.queue.empty():
+                        writer.write(client.queue.get_nowait())
+                    await writer.drain()
+                return True
+
+            try:
+                if not await asyncio.wait_for(authenticate(), timeout=5.0):
+                    writer.close()
+                    return
+            except (TimeoutError, OSError, ConnectionError):
+                writer.close()
+                return
         if len(self.clients) >= MAX_CLIENTS:
             await asyncio.sleep(RECONNECT_GRACE_SECONDS)
         while len(self.clients) >= MAX_CLIENTS:
@@ -280,11 +311,17 @@ class VirtualRadioRelay:
                 stale.index,
             )
             stale.close()
-        client = RelayClient(len(self.clients), reader, writer)
+        client.index = next(
+            index
+            for index in range(MAX_CLIENTS)
+            if all(c.index != index for c in self.clients)
+        )
         self.clients.append(client)
         writer_task = asyncio.create_task(client.writer_loop())
         LOGGER.info("client %d connected (clients=%d)", client.index, len(self.clients))
         try:
+            for cmd, payload in pending:
+                await self.handle_command(client, cmd, payload)
             while True:
                 data = await reader.read(4096)
                 if not data:

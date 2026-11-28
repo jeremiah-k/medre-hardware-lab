@@ -46,7 +46,11 @@ def empty_reply_after(log: str, since: float) -> bool:
             and frame.get("packet_type") == "0x0a"
         ):
             empty = at >= since
-        elif frame.get("event") in {"closed_by_fault", "closed_by_fault_window"}:
+        elif frame.get("event") in {
+            "closed_by_fault",
+            "closed_by_fault_window",
+            "connection_close",
+        }:
             empty = False
     return empty
 

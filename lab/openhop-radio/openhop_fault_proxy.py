@@ -347,51 +347,63 @@ def _marker_in(payload: bytes) -> str | None:
     return match.group(0).decode("ascii", "replace") if match else None
 
 
-def trace_c2s_records(connection: int, data: bytes) -> list[dict]:
-    """Observational only: describe the client→server command frames.
+class FrameTrace:
+    """Observe complete frames across arbitrary TCP read boundaries."""
 
-    Frame format (client → server): "<" (0x3C) + 2-byte LE length + data,
-    where data[0] is the command byte (APP_START 0x01, DEVICE_QUERY 0x16,
-    the 0x0A sync/GET_MSG drain command).
-    """
-    records: list[dict] = []
-    buf = data
-    while len(buf) >= 3 and buf[0] == FRAME_IN_START:
-        length = int.from_bytes(buf[1:3], "little")
-        if len(buf) < 3 + length:
-            break
-        payload = buf[3 : 3 + length]
-        buf = buf[3 + length :]
-        records.append(
-            {
-                "event": "c2s_frame",
-                "connection": connection,
-                "command": "0x%02x" % (payload[0] if payload else 0),
-                "marker": _marker_in(payload),
-            }
-        )
-    return records
+    def __init__(self, start: int) -> None:
+        self.start = start
+        self.buf = b""
+
+    def feed(self, connection: int, data: bytes) -> list[dict]:
+        self.buf += data
+        records = []
+        while len(self.buf) >= 3:
+            if self.buf[0] != self.start:
+                self.buf = self.buf[1:]
+                continue
+            length = int.from_bytes(self.buf[1:3], "little")
+            if len(self.buf) < 3 + length:
+                break
+            payload = self.buf[3 : 3 + length]
+            self.buf = self.buf[3 + length :]
+            c2s = self.start == FRAME_IN_START
+            records.append(
+                {
+                    "event": "c2s_frame" if c2s else "frame_forwarded",
+                    "connection": connection,
+                    "command" if c2s else "packet_type": "0x%02x"
+                    % (payload[0] if payload else 0),
+                    "marker": _marker_in(payload),
+                }
+            )
+        return records
+
+
+def trace_c2s_records(connection: int, data: bytes) -> list[dict]:
+    return FrameTrace(FRAME_IN_START).feed(connection, data)
 
 
 def trace_forward_records(connection: int, data: bytes) -> list[dict]:
-    """Observational only: describe the frames inside a forwarded chunk."""
-    records: list[dict] = []
-    buf = data
-    while len(buf) >= 3 and buf[0] == FRAME_OUT_START:
-        length = int.from_bytes(buf[1:3], "little")
-        if len(buf) < 3 + length:
-            break
-        payload = buf[3 : 3 + length]
-        buf = buf[3 + length :]
-        records.append(
-            {
-                "event": "frame_forwarded",
-                "connection": connection,
-                "packet_type": "0x%02x" % (payload[0] if payload else 0),
-                "marker": _marker_in(payload),
-            }
-        )
-    return records
+    return FrameTrace(FRAME_OUT_START).feed(connection, data)
+
+
+def record_forwarded(records: list[dict], *, selective: bool) -> None:
+    """Called only after the client's writer has drained successfully."""
+    for record in records:
+        if selective and record["packet_type"] == f"0x{PROBE_REPLY_TYPE:02x}":
+            STATS["probe_replies_forwarded"] += 1
+            print(
+                json.dumps(
+                    {
+                        "event": "probe_reply_forwarded",
+                        "connection": record["connection"],
+                        "packet_type": PROBE_REPLY_TYPE,
+                    }
+                ),
+                flush=True,
+            )
+        if trace_enabled():
+            print(json.dumps(record), flush=True)
 
 
 class MessageFrameDropper:
@@ -439,7 +451,7 @@ class MessageFrameDropper:
                 break
             frame = self.buf[: 3 + length]
             self.buf = self.buf[3 + length :]
-            if len(frame) > 3 and (
+            if self.active() and len(frame) > 3 and (
                 frame[3] in MESSAGE_FRAME_TYPES or frame[3] == MESSAGES_WAITING_PUSH
             ):
                 STATS["message_frames_dropped"] += 1
@@ -455,21 +467,6 @@ class MessageFrameDropper:
                     flush=True,
                 )
                 continue
-            if len(frame) > 3 and frame[3] == PROBE_REPLY_TYPE:
-                # The link's proof evidence: a liveness-probe reply this
-                # connection FORWARDED, recorded right next to the message
-                # frames it swallows.
-                STATS["probe_replies_forwarded"] += 1
-                print(
-                    json.dumps(
-                        {
-                            "event": "probe_reply_forwarded",
-                            "connection": connection,
-                            "packet_type": frame[3],
-                        }
-                    ),
-                    flush=True,
-                )
             out += frame
         return bytes(out)
 
@@ -486,14 +483,12 @@ async def pipe(
 ) -> None:
     flag = "stall_client_to_server"
     counter = "stalled_client_to_server"
+    trace = FrameTrace(FRAME_IN_START)
     try:
         while True:
             data = await reader.read(65536)
             if not data:
                 break
-            if trace_enabled():
-                for record in trace_c2s_records(connection, data):
-                    print(json.dumps(record), flush=True)
             STATS[f"{direction}_chunks"] += 1
             # The request-opened reply stall: the request itself keeps
             # passing; the stall opens on it and withholds the replies.
@@ -512,6 +507,10 @@ async def pipe(
                 continue
             writer.write(data)
             await writer.drain()
+            records = trace.feed(connection, data)
+            if trace_enabled():
+                for record in records:
+                    print(json.dumps(record), flush=True)
     except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
         pass
     finally:
@@ -549,9 +548,12 @@ async def handle(
         client_writer.close()
         return
 
+    print(json.dumps({"event": "connection_open", "connection": connection}), flush=True)
+
     async def server_to_client() -> None:
         nonlocal drop_after_n, close_after_n, stall_after_n
         seen = 0
+        trace = FrameTrace(FRAME_OUT_START)
         try:
             while True:
                 data = await server_reader.read(65536)
@@ -577,7 +579,7 @@ async def handle(
                         flush=True,
                     )
                     # Hold the connection open but send nothing further.
-                    await asyncio.sleep(3600)
+                    continue
                 if window.stall_s2c_active():
                     # The reply-stall window: every server->client frame -
                     # a handshake reply, a liveness-probe reply, a fetched
@@ -599,15 +601,11 @@ async def handle(
                     "stalled_server_to_client",
                 ):
                     continue
-                if dropper.active():
-                    # The content-triggered message-frame drop: parse the
-                    # companion frames in this chunk and forward everything
-                    # except GET_MSG replies, so the handshake and the
-                    # liveness-probe replies pass and the message frames are
-                    # swallowed on this same connection.
-                    data = dropper.feed(data, connection)
-                    if not data:
-                        continue
+                selective = dropper.active()
+                # Maintain frame boundaries across policy changes.
+                data = dropper.feed(data, connection)
+                if not data:
+                    continue
                 # The startup setting applies throughout a manual run.
                 # A case can separately arm the same delay on an attached link.
                 live_delay_ms = read_dynamic_fault(fault_file).get(
@@ -619,9 +617,7 @@ async def handle(
                 client_writer.write(data)
                 await client_writer.drain()
                 STATS["server_chunks_forwarded"] += 1
-                if trace_enabled():
-                    for record in trace_forward_records(connection, data):
-                        print(json.dumps(record), flush=True)
+                record_forwarded(trace.feed(connection, data), selective=selective)
         except (ConnectionResetError, BrokenPipeError):
             pass
         finally:
@@ -652,6 +648,10 @@ async def handle(
         client_writer.close()
         server_writer.close()
         await asyncio.gather(*tasks, return_exceptions=True)
+        print(
+            json.dumps({"event": "connection_close", "connection": connection}),
+            flush=True,
+        )
 
 
 async def main() -> None:

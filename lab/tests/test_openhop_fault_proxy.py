@@ -200,8 +200,7 @@ def test_dropper_forwards_probes_and_handshake_drops_only_message_frames(
         + MESSAGES_WAITING_PUSH,
         connection=1,
     )
-    assert HANDSHAKE_REPLY in out
-    assert PROBE_REPLY in out
+    assert out == HANDSHAKE_REPLY + PROBE_REPLY
     assert MESSAGES_WAITING_PUSH not in out
     for message_frame in (
         frame(b"\x07" + b"\x00" * 8),
@@ -248,6 +247,8 @@ def test_dropper_logs_forwarded_probe_replies_per_connection(tmp_path, capsys):
     before = proxy.STATS["probe_replies_forwarded"]
     out = dropper.feed(PROBE_REPLY + MESSAGE_FRAMES[:12], connection=3)
     assert out == PROBE_REPLY  # the probe reply is forwarded, the frame dropped
+    assert proxy.STATS["probe_replies_forwarded"] == before
+    proxy.record_forwarded(proxy.trace_forward_records(3, out), selective=True)
     assert proxy.STATS["probe_replies_forwarded"] == before + 1
     events = [
         json.loads(line)
@@ -274,7 +275,8 @@ def test_dropper_holds_a_tail_that_could_still_grow(tmp_path):
     """A trailing 0x3E with no length yet must not be forwarded early."""
     dropper, _ = make_dropper(tmp_path)
     assert dropper.feed(PROBE_REPLY + b">", connection=1) == PROBE_REPLY
-    out = dropper.feed((3).to_bytes(2, "little") + b"\x07abc", connection=1)
+    out = dropper.feed(frame(b"\x07abc")[1:], connection=1)
+    assert proxy.STATS["frame_resyncs"] == 0
     assert out == b""
     assert proxy.STATS["message_frames_dropped"] == 1
 
@@ -394,3 +396,25 @@ def test_the_drop_event_marker_uses_the_same_extraction_as_the_trace():
     assert proxy._marker_in(payload) == "p4qs-11-abc123def"
     records = proxy.trace_forward_records(1, frame(payload))
     assert records[0]["marker"] == "p4qs-11-abc123def"
+
+
+def test_policy_clear_between_reads_preserves_complete_probe(tmp_path):
+    dropper, path = make_dropper(tmp_path)
+    assert dropper.feed(PROBE_REPLY[:2], connection=1) == b""
+    write_fault(path, {})
+    assert dropper.feed(PROBE_REPLY[2:] + MESSAGE_FRAMES, connection=1) == (
+        PROBE_REPLY + MESSAGE_FRAMES
+    )
+    assert not dropper.buf
+    assert proxy.STATS["frame_resyncs"] == 0
+
+
+@pytest.mark.parametrize("start,packet", [(0x3C, b"<\x01\x00\x0a"), (0x3E, NO_MORE_MSGS_REPLY)])
+def test_trace_buffers_every_fragment(start, packet):
+    trace = proxy.FrameTrace(start)
+    assert trace.feed(1, packet[:1]) == []
+    assert trace.feed(1, packet[1:3]) == []
+    record = trace.feed(1, packet[3:])
+    assert len(record) == 1
+    assert record[0]["connection"] == 1
+    assert record[0].get("command", record[0].get("packet_type")) == "0x0a"
