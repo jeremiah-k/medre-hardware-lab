@@ -45,7 +45,10 @@ die() {
 [[ -f .env ]] || die "Run 'medre-lab docker prepare' first"
 # shellcheck disable=SC1091
 source .env
-: "${LAB_SOURCE_MANIFEST:?Run 'medre-lab docker prepare' first}"
+CURRENT_LOCK_SHA256="$(python3 -c 'import hashlib; from pathlib import Path; print(hashlib.sha256(Path("sources.lock.json").read_bytes()).hexdigest())')"
+[[ ${LAB_SOURCE_LOCK_SHA256:-} == "${CURRENT_LOCK_SHA256}" ]] ||
+	die "Prepared sources differ from sources.lock.json; run medre-lab docker prepare"
+: "${LAB_SOURCE_MANIFEST_OPENHOP:?Run medre-lab docker prepare first}"
 
 for pair in \
 	"${OPENHOP_CORE_SRC}:openhop_core" \

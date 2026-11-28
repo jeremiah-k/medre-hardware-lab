@@ -14,6 +14,7 @@ behavior minus the network.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import shutil
@@ -222,6 +223,21 @@ def make_fake_pins(repos: Path) -> dict:
         head = make_source_repo(repos / key)
         pins[key] = {"url": f"https://github.com/fake/{key}.git", "ref": head}
     return pins
+
+
+def test_prepare_binds_manifests_and_environment_to_one_lock(tmp_path):
+    root = build_lab_root(tmp_path)
+    expected_pins = make_fake_pins(root / "sources")
+    raw = json.dumps(expected_pins).encode()
+    (root / "sources.lock.json").write_bytes(raw)
+    env = rig.prepare(root)
+
+    assert env["LAB_SOURCE_LOCK_SHA256"] == hashlib.sha256(raw).hexdigest()
+    manifest = json.loads(Path(env["LAB_SOURCE_MANIFEST_OPENHOP"]).read_text())
+    for entries in manifest.values():
+        for entry in entries:
+            key = Path(entry["source"]).name
+            assert entry["ref"] == expected_pins[key]["ref"]
 
 
 def write_preset(root: Path, name: str, topology: str, pins: dict, suite: list) -> None:

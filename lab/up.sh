@@ -125,6 +125,14 @@ fi
 # shellcheck disable=SC1091
 source .env
 : "${LAB_SOURCE_MANIFEST:?Run medre-lab docker prepare first}"
+BRINGUP_LOCK_SHA256="$(python3 -c 'import hashlib; from pathlib import Path; print(hashlib.sha256(Path("sources.lock.json").read_bytes()).hexdigest())')"
+if ((WITH_OPENHOP || WITH_OPENHOP_RADIO)); then
+	[[ ${LAB_SOURCE_LOCK_SHA256:-} == "${BRINGUP_LOCK_SHA256}" ]] ||
+		die "Prepared sources differ from sources.lock.json; run medre-lab docker prepare"
+	: "${LAB_SOURCE_MANIFEST_OPENHOP:?Run medre-lab docker prepare first}"
+	python3 lab/check_source_mounts.py "${LAB_SOURCE_MANIFEST_OPENHOP}" --host-only ||
+		die "openHop source provenance check failed"
+fi
 python3 lab/check_source_mounts.py "${LAB_SOURCE_MANIFEST}" --host-only
 export MMRELAY_SRC="${MMRELAY_SRC:-${LAB_ROOT}/sources/mmrelay}"
 
@@ -267,7 +275,6 @@ fi
 # on absent containers, so this is idempotent. (Raw `docker compose` with both
 # profiles active is NOT guarded here - this enforcement is an up.sh
 # orchestration guarantee, not a compose-level one.)
-BRINGUP_LOCK_SHA256="$(python3 -c 'import hashlib; from pathlib import Path; print(hashlib.sha256(Path("sources.lock.json").read_bytes()).hexdigest())')"
 rm -f lab/state/last-bringup.json
 log "Ensuring previous MEDRE owners are DOWN (single-instance rule)"
 docker compose --profile openhop-fault stop medre-openhop-fault >/dev/null
@@ -339,14 +346,6 @@ if ((WITH_OPENHOP)); then
 	echo "  medre (openhop):      ${MEDRE_OPENHOP_SRC} (${MEDRE_OPENHOP_REF})"
 	echo "  adapter_meshcore:     ${MEDRE_MESHCORE_SRC} (${MEDRE_MESHCORE_REF})"
 	echo "  adapter_meshtastic:   ${MEDRE_MESHTASTIC_OPENHOP_SRC} (${MEDRE_MESHTASTIC_OPENHOP_REF})"
-
-	# --- Source provenance guard -------------------------------------------
-	# The openHop manifest names the openHop containers only; it is checked
-	# with live container inspection once the profile is up.
-	if [[ -n ${LAB_SOURCE_MANIFEST_OPENHOP:-} ]]; then
-		python3 lab/check_source_mounts.py "${LAB_SOURCE_MANIFEST_OPENHOP}" --host-only ||
-			die "openHop source provenance check failed"
-	fi
 
 	# --- Build -------------------------------------------------------------
 	if ((! SKIP_BUILD)); then

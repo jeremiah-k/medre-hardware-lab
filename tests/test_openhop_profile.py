@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -260,3 +261,36 @@ def test_scenario_skips_when_the_profile_is_absent(tmp_path):
     )
     assert result.returncode == 2, result.stdout + result.stderr
     assert "SKIP" in (result.stdout + result.stderr)
+
+
+@pytest.mark.parametrize(
+    ("script", "flags"),
+    [
+        ("lab/up.sh", ["--openhop", "--skip-build"]),
+        ("lab/up.sh", ["--openhop-radio", "--skip-build"]),
+        ("lab/openhop-bridge/bridge_up.sh", ["--skip-build"]),
+    ],
+)
+def test_stale_openhop_preparation_stops_before_docker(tmp_path, script, flags):
+    entry = tmp_path / script
+    entry.parent.mkdir(parents=True)
+    shutil.copyfile(ROOT / script, entry)
+    (tmp_path / "sources.lock.json").write_text("{}")
+    (tmp_path / ".env").write_text(
+        "LAB_SOURCE_MANIFEST=unused\nLAB_SOURCE_LOCK_SHA256=stale\n"
+    )
+
+    docker = tmp_path / "docker"
+    docker.write_text("#!/bin/sh\ntouch docker-called\nexit 8\n")
+    docker.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(entry), *flags],
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Prepared sources differ from sources.lock.json" in result.stderr
+    assert not (tmp_path / "docker-called").exists()

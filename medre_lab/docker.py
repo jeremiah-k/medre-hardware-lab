@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -169,8 +170,7 @@ def fetch(root):
     prepare(root)
 
 
-def entries(root):
-    pins = lock(root)
+def entries(root, pins):
     return [
         {
             "source": str(root / "sources" / name),
@@ -185,7 +185,9 @@ def entries(root):
 
 def prepare(root):
     root = root.resolve()
-    selected = entries(root)
+    raw = (root / "sources.lock.json").read_bytes()
+    pins = parse_lock(raw)
+    selected = entries(root, pins)
     spec = importlib.util.spec_from_file_location(
         "source_guard", root / "lab/check_source_mounts.py"
     )
@@ -232,6 +234,7 @@ def prepare(root):
     )
     env = {
         "LAB_ROOT": str(root),
+        "LAB_SOURCE_LOCK_SHA256": hashlib.sha256(raw).hexdigest(),
         "LAB_UID": str(os.getuid()),
         "LAB_GID": str(os.getgid()),
         "LAB_SOURCE_MANIFEST": str(manifest),
@@ -240,18 +243,18 @@ def prepare(root):
     for name, info in SOURCES.items():
         env[info[0]] = str(root / "sources" / name)
     env["MMRELAY_BAKE_CORE_SRC"] = env["MEDRE_CORE_SRC"]
-    env["MEDRE_CORE_REF"] = lock(root)["medre"]["ref"]
+    env["MEDRE_CORE_REF"] = pins["medre"]["ref"]
     env["MMRELAY_BAKE_CORE_REF"] = env["MEDRE_CORE_REF"]
-    env["MEDRE_MATRIX_REF"] = lock(root)["medre-adapter-matrix"]["ref"]
+    env["MEDRE_MATRIX_REF"] = pins["medre-adapter-matrix"]["ref"]
     # The openHop profile carries its own pins; the build args record the
     # exact commits the images were baked from.
-    env["OPENHOP_CORE_REF"] = lock(root)["openhop-core"]["ref"]
-    env["OPENHOP_REPEATER_REF"] = lock(root)["openhop-repeater"]["ref"]
-    env["MEDRE_OPENHOP_REF"] = lock(root)["medre-openhop"]["ref"]
-    env["MEDRE_MESHCORE_REF"] = lock(root)["medre-adapter-meshcore"]["ref"]
-    env["MEDRE_MESHTASTIC_OPENHOP_REF"] = lock(root)[
-        "medre-adapter-meshtastic-openhop"
-    ]["ref"]
+    env["OPENHOP_CORE_REF"] = pins["openhop-core"]["ref"]
+    env["OPENHOP_REPEATER_REF"] = pins["openhop-repeater"]["ref"]
+    env["MEDRE_OPENHOP_REF"] = pins["medre-openhop"]["ref"]
+    env["MEDRE_MESHCORE_REF"] = pins["medre-adapter-meshcore"]["ref"]
+    env["MEDRE_MESHTASTIC_OPENHOP_REF"] = pins["medre-adapter-meshtastic-openhop"][
+        "ref"
+    ]
     # This generated file is authoritative; user hardware config is separate.
     target = root / ".env"
     target.write_text(

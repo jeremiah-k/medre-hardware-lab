@@ -100,8 +100,10 @@ sequential campaign from the lab checkout:
 python lab/tools/openhop_qualify.py --evidence-dir lab/logs/openhop-campaign
 ```
 
-Add `--skip-build` when the selected images already exist. Supply a fresh
-evidence directory. The command requires the shared lab rig to be down,
+Run `medre-lab docker prepare` again whenever `sources.lock.json` changes.
+The openHop launchers refuse stale preparation and mismatched checkouts
+before changing the rig. Add `--skip-build` when the selected images already
+exist and their baked pins match. Supply a fresh evidence directory. The command requires the shared lab rig to be down,
 then runs the lifecycle, packet, bridge, backlog, ordering and fault
 stages. It checks each matrix's recorded source selection after all three
 matrices pass and always attempts teardown when it started a rig. Each
