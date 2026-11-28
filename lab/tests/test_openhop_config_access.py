@@ -47,6 +47,7 @@ def test_a_private_foreign_file_is_not_readable():
 
 def test_an_effective_acl_entry_makes_the_file_readable(tmp_path, monkeypatch):
     path = tmp_path / "config.yaml"
+    reader_uid = path.parent.stat().st_uid + 1
     path.write_text("credentials\n", encoding="utf-8")
     monkeypatch.setattr(access, "stat_readable", lambda _st, _uid: False)
     monkeypatch.setattr(access.shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -55,16 +56,17 @@ def test_an_effective_acl_entry_makes_the_file_readable(tmp_path, monkeypatch):
         assert command == ["/usr/bin/getfacl", "-n", "-p", str(path)]
         return SimpleNamespace(
             returncode=0,
-            stdout=f"user:{access.REPEATER_UID}:rwx\t#effective:r--\n",
+            stdout=f"user:{reader_uid}:rwx\t#effective:r--\n",
             stderr="",
         )
 
     monkeypatch.setattr(access.subprocess, "run", fake_run)
-    assert access.uid_can_read(path)
+    assert access.uid_can_read(path, reader_uid)
 
 
 def test_an_acl_entry_without_effective_read_is_not_readable(tmp_path, monkeypatch):
     path = tmp_path / "config.yaml"
+    reader_uid = path.parent.stat().st_uid + 1
     path.write_text("credentials\n", encoding="utf-8")
     monkeypatch.setattr(access, "stat_readable", lambda _st, _uid: False)
     monkeypatch.setattr(access.shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -72,12 +74,12 @@ def test_an_acl_entry_without_effective_read_is_not_readable(tmp_path, monkeypat
     def fake_run(_command, **_kwargs):
         return SimpleNamespace(
             returncode=0,
-            stdout=f"user:{access.REPEATER_UID}:rwx\t#effective:---\n",
+            stdout=f"user:{reader_uid}:rwx\t#effective:---\n",
             stderr="",
         )
 
     monkeypatch.setattr(access.subprocess, "run", fake_run)
-    assert not access.uid_can_read(path)
+    assert not access.uid_can_read(path, reader_uid)
 
 
 def test_grant_leaves_a_file_the_identity_already_reads(tmp_path, monkeypatch):
@@ -112,6 +114,7 @@ def test_grant_refuses_when_the_acl_tools_are_missing(tmp_path, monkeypatch):
 
 def test_grant_runs_setfacl_and_confirms_the_entry(tmp_path, monkeypatch):
     path = tmp_path / "config.yaml"
+    reader_uid = path.parent.stat().st_uid + 1
     path.write_text("credentials\n", encoding="utf-8")
     os.chmod(path, 0o000)
     monkeypatch.setattr(access.os, "getuid", lambda: 4242)
@@ -122,16 +125,18 @@ def test_grant_runs_setfacl_and_confirms_the_entry(tmp_path, monkeypatch):
     def fake_run(command, **_kwargs):
         commands.append(command)
         if command[0] == "/usr/bin/setfacl":
-            assert command[1:] == ["--set", f"u::---,u:{access.REPEATER_UID}:r--,g::---,m::r--,o::---", str(path)]
+            assert command[1:] == [
+                "--set",
+                f"u::---,u:{reader_uid}:r--,g::---,m::r--,o::---",
+                str(path),
+            ]
             granted["now"] = True
             return SimpleNamespace(returncode=0, stdout="", stderr="")
-        listing = (
-            f"user:{access.REPEATER_UID}:r\t#effective:r--\n" if granted["now"] else ""
-        )
+        listing = f"user:{reader_uid}:r\t#effective:r--\n" if granted["now"] else ""
         return SimpleNamespace(returncode=0, stdout=listing, stderr="")
 
     monkeypatch.setattr(access.subprocess, "run", fake_run)
-    access.grant(path)
+    access.grant(path, reader_uid)
     assert [command[0] for command in commands] == [
         "/usr/bin/getfacl",
         "/usr/bin/setfacl",
