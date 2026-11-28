@@ -162,43 +162,43 @@ def clone_command(name, url, target):
 
 
 def materialize(target):
-    """Complete a blob:none partial clone in place with an unfiltered refetch.
+    """Complete the object store before a checkout can serve an image bake.
 
-    The filter is sticky: a plain fetch re-applies remote.origin
-    .partialclonefilter and the negotiation finds nothing to do for refs it
-    already has. Clear the filter, then --refetch downloads every ref's full
-    closure so the checkout can serve a git+file install. Idempotent: a
-    checkout without the filter (complete clone, or already materialized) is
-    left untouched.
+    Retain the partial-clone marker until the unfiltered fetch succeeds and
+    the checked-out revision has a complete local closure. A failed fetch
+    must not leave the next invocation believing the store is complete.
     """
+    git = ["git", "-C", str(target)]
     partial = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(target),
-            "config",
-            "--get",
-            "remote.origin.partialclonefilter",
-        ],
+        [*git, "config", "--get", "remote.origin.partialclonefilter"],
         capture_output=True,
         text=True,
     )
-    if partial.returncode != 0 or not partial.stdout.strip():
-        return
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            str(target),
-            "config",
-            "--unset",
-            "remote.origin.partialclonefilter",
-        ],
+    if partial.returncode not in (0, 1):
+        partial.check_returncode()
+    filtered = partial.returncode == 0
+    if filtered:
+        subprocess.run(
+            [*git, "fetch", "--refetch", "--no-filter", "origin"], check=True
+        )
+    # Check physical availability, not merely the checkout's HEAD or the
+    # remote configuration. Detached candidate commits may not be reachable
+    # from any remote ref, and a previously interrupted repair may already
+    # have removed the filter. Do not silently lazy-fetch during this check.
+    closure = subprocess.run(
+        [*git, "rev-list", "--objects", "--missing=print", "HEAD"],
+        env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
+        capture_output=True,
+        text=True,
         check=True,
     )
-    subprocess.run(
-        ["git", "-C", str(target), "fetch", "--refetch", "origin"], check=True
-    )
+    if any(line.startswith("?") for line in closure.stdout.splitlines()):
+        raise RuntimeError(f"Incomplete baked source object closure: {target}")
+    if filtered:
+        subprocess.run(
+            [*git, "config", "--unset", "remote.origin.partialclonefilter"],
+            check=True,
+        )
 
 
 def fetch(root):

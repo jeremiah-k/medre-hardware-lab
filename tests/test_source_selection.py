@@ -405,7 +405,9 @@ def test_fetch_repairs_an_existing_partial_baked_checkout(tmp_path, monkeypatch)
     rig.fetch(root)
 
     refetches = [argv for argv in calls if "--refetch" in argv]
-    assert refetches == [["git", "-C", str(checkout), "fetch", "--refetch", "origin"]]
+    assert refetches == [
+        ["git", "-C", str(checkout), "fetch", "--refetch", "--no-filter", "origin"]
+    ]
     assert not (seed_ids - store_ids(checkout))
     assert partial_filter_config(checkout).returncode != 0
     assert run_git(checkout, "rev-parse", "HEAD") == pins["medre-adapter-matrix"]["ref"]
@@ -413,3 +415,34 @@ def test_fetch_repairs_an_existing_partial_baked_checkout(tmp_path, monkeypatch)
         ["git", "clone", "-q", f"file://{checkout}", str(tmp_path / "servable")],
         check=True,
     )
+
+
+
+def test_materialize_failed_fetch_preserves_retry_marker(tmp_path, monkeypatch):
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    run_git(repo, "init", "-q", "-b", "main")
+    run_git(repo, "config", "remote.origin.partialclonefilter", "blob:none")
+    real_run = subprocess.run
+
+    def fail_fetch(argv, **kwargs):
+        if "--refetch" in argv:
+            raise subprocess.CalledProcessError(128, argv)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(rig.subprocess, "run", fail_fetch)
+    with pytest.raises(subprocess.CalledProcessError):
+        rig.materialize(repo)
+    assert partial_filter_config(repo).stdout.strip() == "blob:none"
+
+
+def test_materialize_rejects_missing_objects_without_filter(tmp_path):
+    seeds = tmp_path / "seeds"
+    seeds.mkdir()
+    make_seed_repo(seeds, "seed")
+    repo = seeds / "seed"
+    blob = run_git(repo, "rev-parse", "HEAD:src/medre/core/rendering/text_helpers.py")
+    (repo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+    assert partial_filter_config(repo).returncode != 0
+    with pytest.raises(RuntimeError, match="Incomplete baked source"):
+        rig.materialize(repo)
